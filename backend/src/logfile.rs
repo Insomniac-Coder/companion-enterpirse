@@ -23,7 +23,7 @@ static MODEL_SERVER: OnceLock<RotatingLog> = OnceLock::new();
 
 /// Sends this process's logs to `dir` and marks where this start begins.
 /// Records logged before this (the first lines of a start) reach only the
-/// console and the in-memory tail.
+/// console.
 pub fn init(dir: &Path) {
     if DIR.set(dir.to_path_buf()).is_err() {
         return;
@@ -31,6 +31,11 @@ pub fn init(dir: &Path) {
     if let Some(log) = app() {
         log.append(format!("\n===== Companion started {} =====\n", now()).as_bytes());
     }
+}
+
+/// The folder the logs are written to, once `init` has run.
+pub fn dir() -> Option<&'static Path> {
+    DIR.get().map(PathBuf::as_path)
 }
 
 /// `companion.log`: every record the application logs.

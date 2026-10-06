@@ -571,7 +571,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id", patch(patch_session))
         .route("/api/sessions/recovery", get(sessions_recovery))
         .route("/api/sessions/:id/action", post(session_action))
-        .route("/api/conversations/:id/export", get(export_conversation))
+        .route("/api/logs/archive", get(logs_archive))
         // Stage 28: attachment budget + OCR availability.
         .route(
             "/api/conversations/:id/attachment-budget",
@@ -8680,142 +8680,71 @@ async fn patch_session(
 }
 
 /// Stage 27 portable export (§147): summary, never raw KV state.
-async fn export_conversation(
-    State(s): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let st = s.storage.lock().await;
-    let conv = match st.get_conversation(&id) {
-        Ok(Some(c)) => c,
-        Ok(None) => return Err(ApiError::not_found("conversation not found")),
-        Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
-    };
-    let history = st
-        .messages_for(&id)
-        .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
-    let tools = st.tool_executions_for(&id, 2_000).unwrap_or_default();
-    let activities = st.conversation_activities(&id).unwrap_or_default();
-    let artifacts = st.artifacts_for(&id).unwrap_or_default();
-    let attachments = st.attachments_for(&id).unwrap_or_default();
-    let model_requests = st
-        .model_requests_for(&id, crate::storage::MODEL_REQUEST_ROWS)
-        .unwrap_or_default();
-    // What the log was produced on, so a run read on another machine can be
-    // told apart from one produced there: a small window and a template that
-    // refuses a system turn explain failures that look inexplicable without
-    // them.
-    let runtime_snapshot = {
-        let llama = s.llama.read().await;
-        match llama.running.as_ref() {
-            Some(running) => serde_json::json!({
-                "model_path": running.cfg.model_path.file_name().and_then(|name| name.to_str()),
-                "context": running.cfg.n_ctx,
-                "cache_type_k": running.cfg.kv_cache_type_k,
-                "cache_type_v": running.cfg.kv_cache_type_v,
-                "gpu_layers": running.cfg.n_gpu_layers,
-                "chat_template": {
-                    "system_role": running.cfg.chat_template.system_role,
-                    "strict_alternation": running.cfg.chat_template.strict_alternation,
-                },
-                "policy": running.cfg.runtime_policy,
-                "os": std::env::consts::OS,
-            }),
-            None => serde_json::json!({"os": std::env::consts::OS}),
+/// What this machine is running, for someone reading its logs elsewhere: a
+/// small window or a template that refuses a system turn explains failures
+/// that look inexplicable without it.
+async fn runtime_snapshot(s: &AppState) -> serde_json::Value {
+    let llama = s.llama.read().await;
+    match llama.running.as_ref() {
+        Some(running) => serde_json::json!({
+            "model_file": running.cfg.model_path.file_name().and_then(|name| name.to_str()),
+            "context": running.cfg.n_ctx,
+            "cache_type_k": running.cfg.kv_cache_type_k,
+            "cache_type_v": running.cfg.kv_cache_type_v,
+            "gpu_layers": running.cfg.n_gpu_layers,
+            "chat_template": {
+                "system_role": running.cfg.chat_template.system_role,
+                "strict_alternation": running.cfg.chat_template.strict_alternation,
+            },
+            "policy": running.cfg.runtime_policy,
+        }),
+        None => serde_json::json!({"model": "none loaded"}),
+    }
+}
+
+/// The local logs as one zip to save and share when something failed: the
+/// application's log and the model server's output, each with its older
+/// rotated files, and `about.txt` with what this machine was running. It
+/// replaces the conversation export: who asked what belongs to the audit
+/// records, and these are only the program's own operational logs.
+async fn logs_archive(State(s): State<AppState>) -> Result<Response, ApiError> {
+    let about = format!(
+        "Companion {} on {} ({}), saved {}\n\nRuntime:\n{}\n",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        chrono::Local::now().to_rfc3339(),
+        serde_json::to_string_pretty(&runtime_snapshot(&s).await).unwrap_or_default(),
+    );
+    let zip = logs_zip(crate::logfile::dir(), &about);
+    let name = format!("companion-logs-{}.zip", chrono::Local::now().format("%Y-%m-%d-%H%M"));
+    Response::builder()
+        .header("content-type", "application/zip")
+        .header("content-disposition", format!("attachment; filename=\"{name}\""))
+        .header("content-length", zip.len().to_string())
+        .body(axum::body::Body::from(zip))
+        .map_err(|e| ApiError::internal(format!("response error: {e}")))
+}
+
+/// Every `.log` file in `dir`, oldest name first, plus `about.txt`, as a zip.
+fn logs_zip(dir: Option<&std::path::Path>, about: &str) -> Vec<u8> {
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    if let Some(entries) = dir.and_then(|dir| std::fs::read_dir(dir).ok()) {
+        let mut paths: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file() && path.extension().is_some_and(|extension| extension == "log"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            if let (Some(name), Ok(bytes)) = (path.file_name().and_then(|name| name.to_str()), std::fs::read(&path)) {
+                files.push((name.to_string(), bytes));
+            }
         }
-    };
-    let decisions: Vec<String> = history
-        .iter()
-        .filter(|m| m.role == "assistant")
-        .flat_map(|m| m.content.lines().map(|l| l.to_string()))
-        .filter(|l| {
-            let t = l.trim_start();
-            t.starts_with("Decision:") || t.starts_with("✓") || t.starts_with("Changed:")
-        })
-        .take(30)
-        .collect();
-    let files: Vec<String> = tools
-        .iter()
-        .filter(|t| {
-            ["write_file", "append_file", "edit_file", "create_document"].contains(&t.tool.as_str())
-        })
-        .take(50)
-        .map(|t| {
-            format!(
-                "{} {}",
-                t.tool,
-                t.args.chars().take(160).collect::<String>()
-            )
-        })
-        .collect();
-    Ok(Json(serde_json::json!({
-        "id": conv.id, "title": conv.title, "mode": conv.mode,
-        "model": conv.model_id, "workspace": conv.workspace,
-        "exported_at": now_rfc3339(),
-        "turns": history.len(), "decisions": decisions,
-        "changed_files": files,
-        "tool_calls": tools.len(),
-        "artifacts": artifacts.iter().map(|a| &a.filename).collect::<Vec<_>>(),
-        "attachments": attachments.iter().map(|a| &a.filename).collect::<Vec<_>>(),
-        // The transcript carries its message ids so the journal below can be
-        // matched to the reply it belongs to on another machine.
-        "transcript": history
-            .iter()
-            .map(|m| serde_json::json!({
-                "id": m.id,
-                "role": m.role,
-                "created_at": m.created_at,
-                "content": m.content,
-            }))
-            .collect::<Vec<_>>(),
-        // The execution log: what each action was asked to do and what came
-        // back. Truncated results would defeat the purpose of carrying a
-        // failure to another machine to read, so they travel whole.
-        "executions": tools
-            .iter()
-            .rev()
-            .map(|t| serde_json::json!({
-                "tool": t.tool,
-                "args": t.args,
-                "result": t.result,
-                "approved": t.approved,
-                "created_at": t.created_at,
-            }))
-            .collect::<Vec<_>>(),
-        // The agent's own step-by-step journal, per reply: states, statuses,
-        // thoughts, tool starts and results, and the context measurements.
-        "activity": history
-            .iter()
-            .filter_map(|m| {
-                let events = activities.get(&m.id)?;
-                Some(serde_json::json!({"message_id": m.id, "events": events}))
-            })
-            .collect::<Vec<_>>(),
-        "runtime": runtime_snapshot,
-        // Each model request as sent and what came back (owner decision: kept
-        // by default and exported). The request travels as JSON, not a string.
-        "model_requests": model_requests
-            .iter()
-            .map(|r| serde_json::json!({
-                "owner_id": r.owner_id,
-                "seq": r.seq,
-                "kind": r.kind,
-                "created_at": r.created_at,
-                "outcome": r.outcome,
-                "failure": r.failure,
-                "finish_reason": r.finish_reason,
-                "prompt_tokens": r.prompt_tokens,
-                "cached_tokens": r.cached_tokens,
-                "generated_tokens": r.generated_tokens,
-                "request": serde_json::from_str::<serde_json::Value>(&r.request_json).unwrap_or(serde_json::Value::Null),
-                "output": r.raw_output,
-            }))
-            .collect::<Vec<_>>(),
-        // The application log as it stood at export. Not per-conversation:
-        // the failures worth carrying between machines (a model that will not
-        // load, a template that refuses every request) are logged before any
-        // conversation is involved.
-        "app_log": crate::logbuf::global().recent(1_000),
-    })))
+    }
+    files.push(("about.txt".into(), about.as_bytes().to_vec()));
+    let entries: Vec<(&str, &[u8])> = files.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())).collect();
+    crate::documents::zip_store(&entries)
 }
 
 /// Stage 27 recovery (§83, §103): stale model contexts + live work.
@@ -13028,7 +12957,7 @@ Would you like me to fix it?")]));
             .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
         assert_eq!(body_json(r).await["status"], "noop");
-        // Budget + export shapes.
+        // Budget shape.
         let r = a
             .clone()
             .oneshot(
@@ -13040,16 +12969,28 @@ Would you like me to fix it?")]));
             .await
             .unwrap();
         assert_eq!(body_json(r).await["count"], 0);
-        let r = a
-            .oneshot(
-                Request::builder()
-                    .uri(format!("/api/conversations/{id}/export"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(body_json(r).await.get("transcript").is_some());
+    }
+
+    #[test]
+    fn the_logs_zip_holds_every_log_file_and_a_note_of_the_runtime() {
+        let dir = std::env::temp_dir().join(format!("companion-logs-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("companion.log"), "started\n").unwrap();
+        std::fs::write(dir.join("companion.1.log"), "older\n").unwrap();
+        std::fs::write(dir.join("model-server.log"), "ready\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), "not a log").unwrap();
+        let zip = logs_zip(Some(&dir), "Runtime: none");
+        let path = dir.join("out.zip");
+        std::fs::write(&path, &zip).unwrap();
+        crate::documents::zip_archive_check(std::fs::File::open(&path).unwrap()).unwrap();
+        let text = String::from_utf8_lossy(&zip);
+        for name in ["companion.log", "companion.1.log", "model-server.log", "about.txt", "started", "Runtime: none"] {
+            assert!(text.contains(name), "{name} missing from the zip");
+        }
+        assert!(!text.contains("notes.txt"), "only log files go in");
+        // With no log folder yet, the zip still says what was running.
+        assert!(String::from_utf8_lossy(&logs_zip(None, "Runtime: none")).contains("about.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

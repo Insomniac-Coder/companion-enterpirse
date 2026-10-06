@@ -96,7 +96,7 @@ through the shared gate.
 | "Allow for session" on a page preview covered every local web service on the PC | `permissions.rs` | Fixed: the grant covers only the port it was given for |
 | Fetching a web page on the server accepted any address, including internal ones | `search.rs` `extract_page` | Fixed: the function was never called, and is removed |
 | The settings endpoint sent the web search key to the browser in plain text | `api.rs` `get_settings` | Fixed: the screens get "(saved)"; saving that back keeps the key |
-| A conversation export carries the whole program's log | `api.rs` `export_conversation` | Phase 1, task 8: with one user today the log is that user's own, and it was included on purpose for diagnosing failures; it leaves the export when several people share a server |
+| A conversation export carried the whole program's log | `api.rs` `export_conversation` | Fixed (owner decision): conversation export is removed, since the audit records hold who asked what; "Save logs as a zip" shares the program's own logs |
 | Two attachments with the same name in one conversation overwrote each other on disk | `api.rs` `add_attachment` | Fixed: the second is kept as "name (2).ext" |
 | The tool record said "approved" for every action that ran, without saying how | `agent_runner.rs`, `api.rs` | Fixed: each record says how it was allowed (permission mode, session grant, the user's approval, chat's read-only set) or why it was refused |
 | Commands started without the Windows "no window" flag | `terminal.rs`, `tools.rs` (git), `cdp.rs` | Fixed |

@@ -16,7 +16,9 @@ fork to drop the model weights (Git LFS); commit ids differ from the Companion's
   (summary, design additions, gaps not to carry over) with the raw entries beside it. Next: turn the map into
   the Phase 1 task list and estimate (`docs/enterprise/PHASE1-TASKS.md`, done 2026-10-06), after the owner's
   review. Also 2026-10-06: the unsafe behaviour the map found is fixed (table in the map's README; backend
-  530 passed), including the owner-reported delete bug (a delete naming a line deleted the whole file). The owner's disk is short on space: build
+  530 passed), including the owner-reported delete bug (a delete naming a line deleted the whole file).
+  Owner decision, same day: conversation export removed (audit records cover it); "Save logs as a zip"
+  (`GET /api/logs/archive`) shares the program's own logs. Backend 529 passed, frontend 114. The owner's disk is short on space: build
   with `CARGO_INCREMENTAL=0` and `CARGO_PROFILE_DEV_DEBUG=0` (about 1 GB instead of 14).
 - Everything below this section is the Companion's own handoff, kept as it was at the fork.
 

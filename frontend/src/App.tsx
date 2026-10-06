@@ -35,7 +35,7 @@ import { APPROVE_PLAN_MESSAGE, autoTitle, matchesShortcut, nextPermissionMode, P
 import { Button, Dialog, IconButton, Kbd, Lamp, Notice, PopDivider, PopItem, PopLabel, Popover, Toggle } from './ui/primitives';
 import { Icon, type IconName } from './ui/Icon';
 import {
-  agentRuns, compactConversation, createConversation, deleteConversation, deleteModel, deleteWorkspace, discardStale, editMessage, exportConversation, forkConversation,
+  agentRuns, saveLogsArchive, compactConversation, createConversation, deleteConversation, deleteModel, deleteWorkspace, discardStale, editMessage, forkConversation,
   getContext, getConversationMetrics, getMessages, getRecovery, getPermissionMode, getSettings, inferenceStart,
   inferenceStatus, listCommands, listConversations, listDownloads,
   listModels, listSessions, listTools, listWorkspaces, patchSession, stopAgent,
@@ -1032,23 +1032,12 @@ export default function App() {
     }
   }
 
-  async function doExport(id?: string) {
-    const target = id ?? convId;
-    if (!target) return;
+  async function saveLogs() {
     try {
-      const data = await exportConversation(target);
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `session-${target.slice(0, 8)}.json`;
-      a.click();
-      URL.revokeObjectURL(a.href);
-      const requests = Array.isArray(data?.model_requests) ? data.model_requests.length : 0;
-      notify('success', requests > 0
-        ? `Session exported, including ${requests} model request record${requests === 1 ? '' : 's'}. These can contain file contents the assistant read; check before sharing.`
-        : 'Session exported.');
+      const name = await saveLogsArchive();
+      notify('success', `Logs saved as ${name}. They are the program's own records and can name files and folders on this PC; check them before sharing.`);
     } catch (e: any) {
-      notify('error', e?.message ?? 'Export failed.');
+      notify('error', e?.message ?? 'Could not save the logs.');
     }
   }
 
@@ -1391,7 +1380,6 @@ export default function App() {
           onRename={() => setRenaming({ id: c.id, draft: c.title || '', where: 'list' })}
           onDuplicate={() => { void selectConv(c.id); setTimeout(() => void doFork(c.id), 50); }}
           onTogglePin={() => togglePin(c.id)}
-          onExport={() => void doExport(c.id)}
           onClose={() => doDelete(c.id)}
         />
       </div>
@@ -1733,7 +1721,7 @@ export default function App() {
                   <PopItem icon="pencil" onClick={() => { setSessionMenuOpen(false); if (convId) setRenaming({ id: convId, draft: activeConv?.title ?? '', where: 'head' }); }}>Rename</PopItem>
                   <PopItem icon="fork" onClick={() => { setSessionMenuOpen(false); void doFork(); }}>Duplicate</PopItem>
                   <PopItem icon="share" onClick={() => { setSessionMenuOpen(false); setShowShare(true); }}>Share context…</PopItem>
-                  <PopItem icon="download" onClick={() => { setSessionMenuOpen(false); void doExport(); }}>Export</PopItem>
+                  <PopItem icon="download" onClick={() => { setSessionMenuOpen(false); void saveLogs(); }}>Save logs as a zip</PopItem>
                   <PopDivider />
                   <PopItem icon="layers" disabled={compacting} onClick={() => { setSessionMenuOpen(false); void doCompact(); }}>Compact context</PopItem>
                   <PopItem icon="refresh" onClick={() => { setSessionMenuOpen(false); doClear(); }}>Clear session</PopItem>

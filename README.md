@@ -303,8 +303,10 @@ directories); results carry evidence IDs the model can keep or release as contex
   (`scripts/backup-data.py`).
 - **Settings > Privacy & boundaries > Keep a record of model requests** (on by default) stores what was
   sent to the model and what it returned, capped at the latest 300 requests, for diagnosing wrong or
-  broken answers. The records stay on this PC and are included when you export a conversation; they
-  can contain file contents the assistant read.
+  broken answers. The records stay on this PC and can contain file contents the assistant read.
+- **Save logs as a zip** (Runtime & diagnostics, or the session menu) collects the program's own logs and
+  a note of what was running, to share when something failed. Conversations are not in it; conversation
+  export was removed on 2026-10-06 (the enterprise audit records hold who asked what).
 
 | Variable | Purpose | Default |
 | --- | --- | --- |

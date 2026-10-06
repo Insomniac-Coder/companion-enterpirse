@@ -232,7 +232,7 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-fn zip_store(files: &[(&str, &[u8])]) -> Vec<u8> {
+pub(crate) fn zip_store(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut central = Vec::new();
     for (name, data) in files {
@@ -465,7 +465,7 @@ fn render_pdf(spec: &serde_json::Value) -> Result<(Vec<u8>, String), String> {
 }
 
 /// Minimal zip-central-directory check without a zip dependency.
-fn zip_archive_check(mut f: std::fs::File) -> Result<(), String> {
+pub(crate) fn zip_archive_check(mut f: std::fs::File) -> Result<(), String> {
     use std::io::{Read, Seek, SeekFrom};
     let len = f
         .seek(SeekFrom::End(0))

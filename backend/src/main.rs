@@ -24,7 +24,6 @@ mod hardware;
 mod inference;
 mod inspection_context;
 mod llamaserver;
-mod logbuf;
 mod logfile;
 mod metrics;
 mod models;
@@ -58,15 +57,8 @@ async fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
-        // A second copy of every record, kept in memory so a session export
-        // can carry it to another machine to be read.
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_ansi(false)
-                .with_writer(logbuf::global().clone()),
-        )
-        // And a third on disk (logs/companion.log in the data folder): the
-        // console and the memory tail are both gone after a restart.
+        // And a copy on disk (logs/companion.log in the data folder): the
+        // console is gone after a restart.
         .with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)

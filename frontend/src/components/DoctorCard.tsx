@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { getDoctor, type DoctorCheck } from '../services/api';
+import { getDoctor, saveLogsArchive, type DoctorCheck } from '../services/api';
 import { Badge, Button, Section } from '../ui/primitives';
 import { Icon, type IconName } from '../ui/Icon';
 
@@ -23,6 +23,11 @@ export default function DoctorCard({ notify }: { notify: (k: 'info' | 'error', t
       .finally(() => setRunning(false));
   };
   useEffect(() => { load(); }, []);
+  const saveLogs = () => {
+    saveLogsArchive()
+      .then((name) => notify('info', `Logs saved as ${name}. They can name files and folders on this PC; check them before sharing.`))
+      .catch((e) => notify('error', e.message));
+  };
 
   const failing = checks.filter((check) => check.status !== 'ok').length;
   return (
@@ -31,7 +36,7 @@ export default function DoctorCard({ notify }: { notify: (k: 'info' | 'error', t
         title="Health checks"
         icon="shieldCheck"
         meta={checks.length ? failing ? `${failing} of ${checks.length} need a look` : `All ${checks.length} passed` : undefined}
-        actions={<>{status && <Badge tone={TONE[status] ?? 'neutral'}>{status === 'ok' ? 'Healthy' : status === 'warn' ? 'Warnings' : 'Problems'}</Badge>}<Button size="sm" variant="ghost" icon="refresh" loading={running} onClick={load}>Run again</Button></>}
+        actions={<>{status && <Badge tone={TONE[status] ?? 'neutral'}>{status === 'ok' ? 'Healthy' : status === 'warn' ? 'Warnings' : 'Problems'}</Badge>}<Button size="sm" variant="ghost" icon="download" onClick={saveLogs}>Save logs as a zip</Button><Button size="sm" variant="ghost" icon="refresh" loading={running} onClick={load}>Run again</Button></>}
       >
         <ul className="check-list">
           {checks.map((c) => (

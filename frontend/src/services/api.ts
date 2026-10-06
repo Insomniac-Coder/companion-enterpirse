@@ -920,8 +920,19 @@ export async function patchSession(id: string, patch: { priority?: string; relat
   });
 }
 
-export async function exportConversation(id: string) {
-  return req(`/api/conversations/${id}/export`);
+/** Save the program's own logs as a zip to share when something failed: the
+ * application's log, the model server's output and a note of what was
+ * running. Conversations are not in it (they are in the audit records). */
+export async function saveLogsArchive(): Promise<string> {
+  const r = await fetch('/api/logs/archive');
+  if (!r.ok) throw new Error(`Could not collect the logs (${r.status}).`);
+  const name = /filename="([^"]+)"/.exec(r.headers.get('content-disposition') ?? '')?.[1] ?? 'companion-logs.zip';
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(await r.blob());
+  a.download = name;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  return name;
 }
 
 export interface RecoveryInfo {

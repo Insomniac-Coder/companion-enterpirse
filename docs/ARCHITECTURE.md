@@ -48,7 +48,7 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   `POST .../compact` returns before/after/saved stats; timeline endpoint.
 - Memory: `memory_entries` table, scoped visibility (global + own conv/ws),
   explicit share copies, UI panel with scope picker.
-- Sessions: activity classes, priority + related_to, portable export,
+- Sessions: activity classes, priority + related_to,
   recovery (stale vs loaded model, resume/discard), row actions
   pause/stop/reduce; restart test via recovery endpoint.
 - Attachments: office bytes as base64 → magic sniff (PDF /Count, ZIP entry
@@ -418,11 +418,13 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   `settings.runtime.context_fit` = `fit` (default, shrink the window to keep
   the model on the GPU) or `requested` (keep the saved size and let layers run
   on the CPU); the note says which happened and what it cost.
-- Session export carries the whole record: full transcript with message ids,
-  every tool execution with its arguments and result, the agent journals per
-  reply, the runtime snapshot (window, cache types, template shape, policy)
-  and the tail of the application log (`logbuf::LogTail`, 2,000 lines), so a
-  failure on one machine can be read on another.
+- Conversation export is gone (2026-10-06): the audit records hold who
+  asked what. `GET /api/logs/archive` ("Save logs as a zip") returns the
+  program's own logs, every `.log` file in `logs/` with its rotated copies,
+  plus `about.txt` (version, OS, the runtime snapshot: model file, window,
+  cache types, template shape, policy), so a failure on one machine can be
+  read on another. The in-memory log tail (`logbuf`) that fed the export is
+  removed.
 - Logs on disk (`logfile.rs`), in `logs/` under the data folder, so a restart
   does not erase them: `companion.log` (every record the backend logs) and
   `model-server.log` (the model server's output a line at a time with its

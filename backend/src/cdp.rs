@@ -30,7 +30,7 @@ impl Drop for Browser {
     fn drop(&mut self) {
         let pid = self.child.id();
         #[cfg(windows)]
-        let _ = Command::new("taskkill")
+        let _ = std::os::windows::process::CommandExt::creation_flags(&mut Command::new("taskkill"), 0x0800_0000) // CREATE_NO_WINDOW
             .args(["/T", "/F", "/PID", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())

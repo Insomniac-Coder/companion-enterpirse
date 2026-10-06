@@ -33,7 +33,15 @@ pub struct CommandResult {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    /// Ended early because its task was stopped.
+    pub stopped: bool,
 }
+
+/// Windows: commands never open a console window. A desktop app has no
+/// console of its own, so without this every command, kill and commit would
+/// flash one on the user's screen.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Substrings that are never executed, whatever the approval state.
 /// This is defense-in-depth only — explicit user approval is the real gate.
@@ -126,6 +134,7 @@ fn spawn(cmd: &str, cwd: &Path) -> Result<Child, String> {
     {
         use std::os::windows::process::CommandExt;
         command.raw_arg(format!("/S {flag} \"{cmd}\""));
+        command.creation_flags(CREATE_NO_WINDOW);
     }
     #[cfg(not(windows))]
     command.arg(flag).arg(cmd);
@@ -186,7 +195,9 @@ fn kill_tree(child: &mut Child) {
     let pid = child.id();
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         let _ = Command::new("taskkill")
+            .creation_flags(CREATE_NO_WINDOW)
             .args(["/T", "/F", "/PID", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -206,6 +217,17 @@ fn kill_tree(child: &mut Child) {
 }
 
 pub fn run(cmd: &str, cwd: &Path, timeout_secs: u64) -> Result<CommandResult, String> {
+    run_until(cmd, cwd, timeout_secs, &|| false)
+}
+
+/// `run`, ended early (the whole process tree) as soon as `stop` says so: the
+/// Stop button used to leave a running command going until its own timeout.
+pub fn run_until(
+    cmd: &str,
+    cwd: &Path,
+    timeout_secs: u64,
+    stop: &dyn Fn() -> bool,
+) -> Result<CommandResult, String> {
     if cmd.trim().is_empty() {
         return Err("command is empty".into());
     }
@@ -221,12 +243,14 @@ pub fn run(cmd: &str, cwd: &Path, timeout_secs: u64) -> Result<CommandResult, St
 
     let deadline = Instant::now() + timeout;
     let mut timed_out = false;
+    let mut stopped = false;
     let status = loop {
         match child.try_wait().map_err(|e| format!("wait failed: {e}"))? {
             Some(st) => break Some(st),
             None => {
-                if Instant::now() >= deadline {
-                    timed_out = true;
+                timed_out = Instant::now() >= deadline;
+                stopped = !timed_out && stop();
+                if timed_out || stopped {
                     kill_tree(&mut child);
                     break child.try_wait().ok().flatten();
                 }
@@ -241,6 +265,7 @@ pub fn run(cmd: &str, cwd: &Path, timeout_secs: u64) -> Result<CommandResult, St
         stdout: head_tail(&read_buffer(&stdout), MAX_OUTPUT_CHARS),
         stderr: head_tail(&read_buffer(&stderr), MAX_OUTPUT_CHARS),
         timed_out,
+        stopped,
     })
 }
 
@@ -328,6 +353,8 @@ pub fn start_background(
         }
     }
     let mut child = spawn(cmd, cwd)?;
+    #[cfg(windows)]
+    job::adopt(&child);
     let stdout = collect(child.stdout.take(), BACKGROUND_OUTPUT_CHARS);
     let stderr = collect(child.stderr.take(), BACKGROUND_OUTPUT_CHARS);
     let id = next_id();
@@ -389,6 +416,115 @@ pub fn stop_background_for(owner: &str) -> usize {
         }
     }
     ids.len()
+}
+
+/// Every background command, ended when Companion closes. A crash skips this;
+/// on Windows the job below covers it.
+// ponytail: on Linux and macOS a crash still leaves background commands
+// running (PR_SET_PDEATHSIG fires when the spawning *thread* ends, and the
+// blocking pool retires idle threads); the desktop app's own runner (Phase 3)
+// is where that gets a real fix.
+pub fn stop_all_background() -> usize {
+    let Ok(mut held) = background().lock() else {
+        return 0;
+    };
+    let count = held.len();
+    for (_, mut entry) in held.drain() {
+        kill_tree(&mut entry.child);
+    }
+    count
+}
+
+/// Background commands belong to one Windows job that ends with this process,
+/// so a dev server cannot outlive a crashed or killed Companion and hold its
+/// port. Only background commands join: a program a foreground command opened
+/// for the user (`start` a page in the browser) must stay open after Companion.
+#[cfg(windows)]
+mod job {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+    use std::sync::OnceLock;
+
+    /// JOBOBJECT_BASIC_LIMIT_INFORMATION.
+    #[repr(C)]
+    #[derive(Default)]
+    struct BasicLimits {
+        per_process_user_time: i64,
+        per_job_user_time: i64,
+        flags: u32,
+        minimum_working_set: usize,
+        maximum_working_set: usize,
+        active_processes: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    /// JOBOBJECT_EXTENDED_LIMIT_INFORMATION.
+    #[repr(C)]
+    #[derive(Default)]
+    struct ExtendedLimits {
+        basic: BasicLimits,
+        io_counters: [u64; 6],
+        process_memory: usize,
+        job_memory: usize,
+        peak_process_memory: usize,
+        peak_job_memory: usize,
+    }
+
+    const KILL_ON_JOB_CLOSE: u32 = 0x2000;
+    const EXTENDED_LIMIT_INFORMATION: i32 = 9;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(attributes: *mut c_void, name: *const u16) -> *mut c_void;
+        fn SetInformationJobObject(job: *mut c_void, class: i32, info: *mut c_void, size: u32) -> i32;
+        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+        #[cfg(test)]
+        fn IsProcessInJob(process: *mut c_void, job: *mut c_void, result: *mut i32) -> i32;
+    }
+
+    struct Job(*mut c_void);
+    // The handle is only passed to the OS, which may use it from any thread.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    /// Created once and never closed: the OS closes it when Companion ends,
+    /// which is what ends the commands in it.
+    fn job() -> Option<&'static Job> {
+        static JOB: OnceLock<Option<Job>> = OnceLock::new();
+        JOB.get_or_init(|| unsafe {
+            let handle = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+            if handle.is_null() {
+                return None;
+            }
+            let mut limits = ExtendedLimits::default();
+            limits.basic.flags = KILL_ON_JOB_CLOSE;
+            let set = SetInformationJobObject(
+                handle,
+                EXTENDED_LIMIT_INFORMATION,
+                &mut limits as *mut ExtendedLimits as *mut c_void,
+                std::mem::size_of::<ExtendedLimits>() as u32,
+            );
+            (set != 0).then_some(Job(handle))
+        })
+        .as_ref()
+    }
+
+    /// Best effort: a command that cannot join still runs, and is still
+    /// stopped when its task ends or Companion closes normally.
+    pub(super) fn adopt(child: &std::process::Child) -> bool {
+        job().is_some_and(|job| unsafe {
+            AssignProcessToJobObject(job.0, child.as_raw_handle() as *mut c_void) != 0
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains(child: &std::process::Child) -> bool {
+        let Some(job) = job() else { return false };
+        let mut inside = 0;
+        unsafe { IsProcessInJob(child.as_raw_handle() as *mut c_void, job.0, &mut inside) != 0 && inside != 0 }
+    }
 }
 
 pub fn background_commands() -> Vec<(u32, String)> {
@@ -477,6 +613,9 @@ pub fn format_result(cmd: &str, r: &CommandResult) -> String {
             "\n(still running at the timeout and stopped; what it printed until then is below. A command meant to keep running, such as a dev server, belongs in the background: add \"background\": true.)\n",
         );
     }
+    if r.stopped {
+        out.push_str("\n(stopped because the task was stopped; what it printed until then is below.)\n");
+    }
     let section = |name: &str, text: &str| {
         format!(
             "\n--- {name} ---\n{}",
@@ -562,6 +701,7 @@ mod tests {
             stdout: "x".repeat(60_000),
             stderr: "error: boom".into(),
             timed_out: false,
+            stopped: false,
         };
         let text = format_result("cargo build", &failed);
         assert!(text.find("--- stderr ---").unwrap() < text.find("--- stdout ---").unwrap());
@@ -570,9 +710,37 @@ mod tests {
             stdout: "done".into(),
             stderr: String::new(),
             timed_out: false,
+            stopped: false,
         };
         let text = format_result("cargo build", &ok);
         assert!(text.find("--- stdout ---").unwrap() < text.find("--- stderr ---").unwrap());
+    }
+
+    #[test]
+    fn stop_ends_a_running_command_and_its_children() {
+        // The Stop button used to leave a command running until its timeout.
+        let cmd = if cfg!(windows) { "ping -n 30 127.0.0.1" } else { "sleep 30" };
+        let started = Instant::now();
+        let r = run_until(cmd, &std::env::temp_dir(), 60, &|| started.elapsed() > Duration::from_millis(300)).unwrap();
+        assert!(r.stopped && !r.timed_out, "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+        assert!(format_result(cmd, &r).contains("stopped because the task was stopped"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn background_commands_end_with_companion() {
+        let status = start_background(
+            "ping -n 30 127.0.0.1",
+            &std::env::temp_dir(),
+            "test:background-job",
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(status.running, "{status:?}");
+        let inside = background().lock().unwrap().get(&status.id).map(|entry| job::contains(&entry.child));
+        stop_background(status.id);
+        assert_eq!(inside, Some(true), "a background command must be in the job that ends with Companion");
     }
 
     #[test]

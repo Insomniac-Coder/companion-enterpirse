@@ -113,7 +113,7 @@ dl.gloss dd { margin: 0; }
   </div>
 </div>
 
-<p class="lede">We will turn the Local LLM PC Companion, today a one-person app on one PC, into a shared company service. People use a desktop app, signed in with their company account. A server, which can run on one machine or across many, hosts our own open-weight models and can also pass requests to OpenAI, Anthropic or Google. It answers from company documents with citations, connects to Jira and Outlook, gives each team only the tools it is allowed, and records who asked what in an audit log. A separate dashboard lets the team running it manage models, users, tools, rules and costs.</p>
+<p class="lede">We will turn the Local LLM PC Companion, today a one-person app on one PC, into a shared company service. People use a desktop app, signed in with their company account. A server, which can run on one machine or across many, hosts our own open-weight models and can also pass requests to OpenAI, Anthropic or Google. It answers from company documents with citations (RAG), connects to Jira and Outlook, gives each team only the tools it is allowed, and records who asked what in an audit log. A separate dashboard lets the team running it manage models, users, tools, rules and costs.</p>
 
 <div class="cards">
   <div class="card">
@@ -121,6 +121,7 @@ dl.gloss dd { margin: 0; }
     <ul>
       <li>Install an app, sign in with the company account</li>
       <li>Pick from the models the company approved</li>
+      <li>Get answers from company documents, with the sources named (RAG)</li>
       <li>Switch on the plugins their team is allowed</li>
       <li>Connect their own Jira and Outlook</li>
       <li>The coding agent works on files on their own PC</li>
@@ -146,7 +147,7 @@ dl.gloss dd { margin: 0; }
   </div>
 </div>
 
-<section class="avoid">
+<section>
   <h2><span class="n">01</span>Decisions so far</h2>
   <table>
     <thead><tr><th style="width:24%">Topic</th><th>Decision</th><th style="width:13%">Status</th></tr></thead>
@@ -155,6 +156,8 @@ dl.gloss dd { margin: 0; }
       <tr><td>Coding agent</td><td class="plain">The agent's thinking runs on the server; reading and writing files and running commands happen on the user's PC, through the desktop app.</td><td><span class="tag ok">Decided</span></td></tr>
       <tr><td>Where it runs</td><td class="plain">Our own servers or AWS. The design covers both, plus a one-machine version.</td><td><span class="tag open">Open</span></td></tr>
       <tr><td>Running it on a laptop</td><td class="plain">Install the same server on the laptop and point the app at it. No separate offline mode inside the app.</td><td><span class="tag ok">Decided</span></td></tr>
+      <tr><td>Document search (RAG)</td><td class="plain">Answers from company documents with citations, searched by meaning and keywords; access rights applied at search time; collections can be kept away from outside providers.</td><td><span class="tag ok">Decided</span></td></tr>
+      <tr><td>Plug-in tools (MCP)</td><td class="plain">Tools are MCP servers that admins add or remove and give to the teams that need them; users switch on what they are allowed.</td><td><span class="tag ok">Decided</span></td></tr>
       <tr><td>Email</td><td class="plain">Outlook first; Gmail later.</td><td><span class="tag ok">Decided</span></td></tr>
       <tr><td>Jira</td><td class="plain">Jira Cloud.</td><td><span class="tag ok">Decided</span></td></tr>
       <tr><td>Company sign-in</td><td class="plain">Microsoft Entra ID (the company's Microsoft 365 accounts), following from Outlook.</td><td><span class="tag assumed">To confirm</span></td></tr>
@@ -262,7 +265,7 @@ dl.gloss dd { margin: 0; }
       <rect x="380" y="240" width="250" height="100" rx="10" class="box"/>
       <text x="395" y="264" class="t">Workers (1…n)</text>
       <text x="395" y="288" class="s">• agent runs</text>
-      <text x="395" y="308" class="s">• reading documents in</text>
+      <text x="395" y="308" class="s">• reading documents in (RAG)</text>
       <text x="395" y="328" class="s">• scheduled jobs</text>
       <line x1="505" y1="218" x2="505" y2="240" class="ln" marker-end="url(#ah)"/>
 
@@ -271,7 +274,7 @@ dl.gloss dd { margin: 0; }
       <rect x="660" y="48" width="310" height="78" rx="10" class="box"/>
       <text x="675" y="72" class="t">PostgreSQL + pgvector</text>
       <text x="675" y="94" class="s">records, settings, audit log,</text>
-      <text x="675" y="112" class="s">document search</text>
+      <text x="675" y="112" class="s">document search (RAG)</text>
       <rect x="660" y="138" width="310" height="62" rx="10" class="box"/>
       <text x="675" y="162" class="t">Redis</text>
       <text x="675" y="184" class="s">live streams between servers, counters</text>
@@ -324,7 +327,7 @@ dl.gloss dd { margin: 0; }
       <tr><td>Desktop app</td><td class="plain">Chat and code screens; saved servers, connection test, sign-in; runs file and command tools on the user's PC</td><td class="plain">Today's React screens in Tauri; the Companion's file, command and preview tools move into a shared library the app uses</td></tr>
       <tr><td>Admin dashboard</td><td class="plain">Models, providers, users and groups, settings and locks, plugins, documents, rules, audit log, usage</td><td class="plain">New React web app sharing the same UI parts</td></tr>
       <tr><td>API servers</td><td class="plain">Sign-in, permission checks, settings, model gateway, guards, streaming replies, audit records. Keep nothing in their own memory, so copies can be added freely</td><td class="plain">The Companion's backend, reworked</td></tr>
-      <tr><td>Workers</td><td class="plain">Agent runs, reading documents into the search index, scheduled jobs</td><td class="plain">The same program in a second role: one program to build and ship</td></tr>
+      <tr><td>Workers</td><td class="plain">Agent runs, reading documents into the search index (RAG), scheduled jobs</td><td class="plain">The same program in a second role: one program to build and ship</td></tr>
       <tr><td>Model pools</td><td class="plain">Each model runs as a group of copies; copies are added or removed with demand</td><td class="plain">llama.cpp (any machine, even without a GPU) or vLLM (many users on large GPU servers)</td></tr>
       <tr><td>Shared storage</td><td class="plain">Everything that must last, document search, live streams between servers, files</td><td class="plain">PostgreSQL + pgvector, Redis (only with 2+ servers), S3 / MinIO / a folder</td></tr>
     </tbody>
@@ -431,6 +434,7 @@ dl.gloss dd { margin: 0; }
     <li><b>Searching:</b> by meaning and keywords together, best matches first, with citations in the answer.</li>
     <li><b>Access rights at search time:</b> a person only gets passages from documents they may open.</li>
     <li><b>Labels:</b> a collection marked "never send outside" is only used with our own models; an "answer only from sources, or say you don't know" mode per assistant.</li>
+    <li><b>Sources:</b> uploads and shared folders first; Jira and other company systems later, through the same connectors as the tools.</li>
   </ul>
 
   <h2 style="margin-top:14px"><span class="n">10</span>Guards and the audit log</h2>
@@ -532,7 +536,7 @@ dl.gloss dd { margin: 0; }
     <div class="ph"><b>3</b>Desktop app</div>
     <div class="ph"><b>4</b>Plugins and MCP</div>
     <div class="ph"><b>5</b>Jira and Outlook</div>
-    <div class="ph pilot"><b>6</b>Document search · pilot</div>
+    <div class="ph pilot"><b>6</b>RAG: document search · pilot</div>
     <div class="ph"><b>7</b>Guards and audit</div>
     <div class="ph"><b>8</b>Many servers</div>
     <div class="ph"><b>9</b>Hardening</div>
@@ -547,7 +551,7 @@ dl.gloss dd { margin: 0; }
       <tr><td>3. Desktop app</td><td class="plain">Tauri app; saved servers and connection test; sign-in through the system browser; tools moved into the shared library; device channel; pause and resume; signed installers and automatic updates.</td><td class="plain">Install the app, point it at the server, and the coding agent edits a local project.</td></tr>
       <tr><td>4. Plugins and MCP</td><td class="plain">Plugin description format, catalogue, group access, user switches, ability check in the app and on the server, approval rules.</td><td class="plain">An admin adds an MCP server; only the chosen group sees it; a model that cannot use it shows it greyed out.</td></tr>
       <tr><td>5. Jira and Outlook</td><td class="plain">Encrypted store for people's account connections; Jira Cloud; our Outlook connector; approval before sending or changing anything.</td><td class="plain">"Summarise my open tickets" and "draft a reply to this email" work; sending asks first.</td></tr>
-      <tr><td>6. Document search</td><td class="plain">Collections, upload, reading in, search by meaning and keywords, access rights, citations, "sources only" mode, "never send outside" label.</td><td class="plain">The pilot can start on one server.</td></tr>
+      <tr><td>6. Document search (RAG)</td><td class="plain">Collections, upload, reading in, search by meaning and keywords, access rights, citations, "sources only" mode, "never send outside" label.</td><td class="plain">The pilot can start on one server.</td></tr>
       <tr><td>7. Guards and audit</td><td class="plain">Outgoing-data scan, untrusted-text rule, answer checks, tamper-evident chain, retention, export, viewer, auditor role.</td><td class="plain">An auditor can rebuild how any answer was produced.</td></tr>
       <tr><td>8. Many servers</td><td class="plain">Containers, Kubernetes package, Redis between servers, scaling rules, GPU pools, health checks and metrics, load test, and the one-command Windows start.</td><td class="plain">Stopping a server mid-reply does not break a user's session; added load brings new copies up.</td></tr>
       <tr><td>9. Hardening</td><td class="plain">Security review, a set of real test questions run on every change, guides for users and admins.</td><td class="plain">Ready for a wider rollout.</td></tr>

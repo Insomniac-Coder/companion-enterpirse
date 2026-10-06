@@ -260,6 +260,9 @@ impl AppState {
             }
         }
         let _ = self.generations.write().await.cancel_current(&self.storage).await;
+        // Dev servers and watchers the tasks left running would otherwise keep
+        // their ports after Companion has gone.
+        crate::terminal::stop_all_background();
         self.llama.write().await.stop().await;
         self.inference.write().await.unload();
     }
@@ -3158,6 +3161,7 @@ async fn run_chat_tool_round(
             args: serde_json::to_string(&call.args).unwrap_or_default(),
             result: output.chars().take(2000).collect(),
             approved: false,
+            approval: "chat (read-only tools)".into(),
             created_at: chrono::Utc::now().to_rfc3339(),
         });
     }
@@ -5021,6 +5025,33 @@ async fn list_attachments(
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))
 }
 
+/// Store an attachment under a name not yet used in its conversation's
+/// folder and return that name: a second "report.pdf" is kept as
+/// "report (2).pdf". Two files of the same name used to overwrite each other
+/// on disk while both stayed listed, so the first one opened the second.
+fn store_attachment(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<String, ApiError> {
+    use std::io::Write;
+    let failed = |e: std::io::Error| ApiError::internal(format!("cannot store attachment: {e}"));
+    std::fs::create_dir_all(dir).map_err(failed)?;
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => (stem, format!(".{extension}")),
+        _ => (name, String::new()),
+    };
+    for n in 1u32.. {
+        let candidate = if n == 1 { name.to_string() } else { format!("{stem} ({n}){extension}") };
+        // Claimed atomically: two uploads of one name at once get two names.
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(dir.join(&candidate)) {
+            Ok(mut file) => {
+                file.write_all(bytes).map_err(failed)?;
+                return Ok(candidate);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(failed(e)),
+        }
+    }
+    unreachable!("names run out only after u32::MAX files")
+}
+
 async fn add_attachment(
     State(s): State<AppState>,
     Path(id): Path<String>,
@@ -5078,11 +5109,7 @@ async fn add_attachment(
         let (w, h) = image::load_from_memory(&bytes)
             .map(|i| (i.width(), i.height()))
             .unwrap_or((0, 0));
-        let dir = s.attachments_dir.join(&id);
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| ApiError::internal(format!("cannot store attachment: {e}")))?;
-        std::fs::write(dir.join(&safe), &bytes)
-            .map_err(|e| ApiError::internal(format!("cannot store attachment: {e}")))?;
+        let safe = store_attachment(&s.attachments_dir.join(&id), &safe, &bytes)?;
         let a = crate::storage::Attachment {
             id: uuid::Uuid::new_v4().to_string(),
             conversation_id: id,
@@ -5122,11 +5149,7 @@ async fn add_attachment(
             ));
         }
         let (kind, status, excerpt_full) = sniff_office(&safe, &bytes);
-        let dir = s.attachments_dir.join(&id);
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| ApiError::internal(format!("cannot store attachment: {e}")))?;
-        std::fs::write(dir.join(&safe), &bytes)
-            .map_err(|e| ApiError::internal(format!("cannot store attachment: {e}")))?;
+        let safe = store_attachment(&s.attachments_dir.join(&id), &safe, &bytes)?;
         let excerpt: String = excerpt_full.chars().take(EXCERPT_CHARS).collect();
         let a = crate::storage::Attachment {
             id: uuid::Uuid::new_v4().to_string(),
@@ -5159,11 +5182,7 @@ async fn add_attachment(
             "Large documents are chunked and retrieved section-wise in Phase 2 (§69).",
         ));
     }
-    let dir = s.attachments_dir.join(&id);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| ApiError::internal(format!("cannot store attachment: {e}")))?;
-    std::fs::write(dir.join(&safe), &req.content)
-        .map_err(|e| ApiError::internal(format!("cannot store attachment: {e}")))?;
+    let safe = store_attachment(&s.attachments_dir.join(&id), &safe, req.content.as_bytes())?;
     let excerpt: String = req.content.chars().take(EXCERPT_CHARS).collect();
     let a = crate::storage::Attachment {
         id: uuid::Uuid::new_v4().to_string(),
@@ -5301,64 +5320,28 @@ async fn execute_tool(
     State(s): State<AppState>,
     Json(req): Json<ExecuteToolReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    use crate::permissions::{PermissionDecision, RiskLevel};
-
     if req.tool.trim().is_empty() {
         return Err(ApiError::bad(
             "tool is empty",
             "Pick a tool from GET /api/tools.",
         ));
     }
-    let ws_root = std::path::PathBuf::from(&req.workspace);
-    if !ws_root.is_dir() {
-        return Err(ApiError::bad(
-            format!("workspace not found: {}", req.workspace),
-            "Select an existing workspace folder first (§27).",
-        ));
-    }
+    let ws_root = saved_project_folder(&s, &req.workspace).await?;
     let ws_key = ws_root
         .canonicalize()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| req.workspace.clone());
     let ws = crate::workspace::WorkspaceManager::new(ws_root);
-    let risk = tools::risk_of(&req.tool);
-
-    // --- Gate ---
-    // approved_via reports how this call passed: explicit once, or automatic
-    // (mode policy / session grant recorded earlier).
-    let via: &'static str = {
-        let mut pm = s.permissions.write().await;
-        // Session grants are recorded only alongside an explicit approval.
-        if req.grant_session && req.approved_once && risk == RiskLevel::Moderate {
-            pm.grant_session(&req.tool, &ws_key);
-        }
-        match pm.decide_call(&req.tool, &req.args, risk, true, Some(&ws_key)) {
-            PermissionDecision::Allow => "auto",
-            PermissionDecision::RequireApproval { .. } if req.approved_once => "once",
-            PermissionDecision::RequireApproval { reason } => {
-                audit(
-                    &s,
-                    &req,
-                    false,
-                    &format!("denied, approval required: {reason}"),
-                )
-                .await;
-                return Err(ApiError::new(
-                    StatusCode::FORBIDDEN,
-                    format!("'{}' needs approval: {reason}", req.tool),
-                    "Call again with approved_once:true, or grant_session:true for the session.",
-                ));
-            }
-            PermissionDecision::Deny { reason } => {
-                audit(&s, &req, false, &format!("denied: {reason}")).await;
-                return Err(ApiError::new(
-                    StatusCode::FORBIDDEN,
-                    format!("'{}' is not allowed: {reason}", req.tool),
-                    "Switch agent mode or perform this step manually.",
-                ));
-            }
-        }
-    };
+    let (via, approval) = gate_tool_call(
+        &s,
+        &record_target(&req.conversation_id),
+        &req.tool,
+        &req.args,
+        &ws_key,
+        req.approved_once,
+        req.grant_session,
+    )
+    .await?;
 
     // --- Execute ---
     // Stage 20: create_document renders through the async document pipeline.
@@ -5377,13 +5360,13 @@ async fn execute_tool(
         .await
         {
             Ok(r) => {
-                audit(&s, &req, true, &r.output).await;
+                audit(&s, &req, approval, true, &r.output).await;
                 Ok(Json(
                     serde_json::json!({"ok": true, "output": r.output, "exit_code": Option::<i32>::None, "approved_via": "once"}),
                 ))
             }
             Err(e) => {
-                audit(&s, &req, false, &e.to_string()).await;
+                audit(&s, &req, approval, false, &e.to_string()).await;
                 Err(ApiError::bad(
                     e.to_string(),
                     "Fix the filename/spec and retry.",
@@ -5398,6 +5381,7 @@ async fn execute_tool(
             audit(
                 &s,
                 &req,
+                "refused: Search is off for this request",
                 false,
                 "denied, approval required: enable Search for this request",
             )
@@ -5446,6 +5430,7 @@ async fn execute_tool(
                     args: req.args.to_string().chars().take(4000).collect(),
                     result: out.to_string().chars().take(4000).collect(),
                     approved: true,
+                    approval: approval.into(),
                     created_at: chrono::Utc::now().to_rfc3339(),
                 });
                 Ok(Json(
@@ -5453,7 +5438,7 @@ async fn execute_tool(
                 ))
             }
             Err(e) => {
-                audit(&s, &req, false, &e).await;
+                audit(&s, &req, approval, false, &e).await;
                 Err(ApiError::bad(
                     format!("Internet search failed: {e}"),
                     "Retry, or continue without web — the local model still works (§125).",
@@ -5471,7 +5456,7 @@ async fn execute_tool(
         Ok(r) => (r.ok, r.output.clone(), r.exit_code),
         Err(e) => (false, e.to_string(), None),
     };
-    audit(&s, &req, ok, &output).await;
+    audit(&s, &req, approval, ok, &output).await;
     match result {
         Ok(_) => Ok(Json(serde_json::json!({
             "ok": ok, "output": output, "exit_code": exit_code,
@@ -5488,22 +5473,121 @@ async fn execute_tool(
     }
 }
 
-async fn audit(s: &AppState, req: &ExecuteToolReq, ok: bool, result: &str) {
-    let conv = if req.conversation_id.trim().is_empty() {
-        "direct"
-    } else {
-        req.conversation_id.trim()
-    };
+async fn audit(s: &AppState, req: &ExecuteToolReq, approval: &str, ok: bool, result: &str) {
+    record_tool_call(s, &record_target(&req.conversation_id), &req.tool, &req.args, approval, ok, result).await;
+}
+
+/// Where a direct tool call is recorded: its conversation, or "direct".
+fn record_target(conversation_id: &str) -> String {
+    match conversation_id.trim() {
+        "" => "direct".into(),
+        id => id.into(),
+    }
+}
+
+/// One record per tool call, saying how it was allowed (or why it was not).
+async fn record_tool_call(
+    s: &AppState,
+    conversation_id: &str,
+    tool: &str,
+    args: &serde_json::Value,
+    approval: &str,
+    ok: bool,
+    result: &str,
+) {
     let st = s.storage.lock().await;
     let _ = st.record_tool_execution(&crate::storage::ToolExecution {
         id: uuid::Uuid::new_v4().to_string(),
-        conversation_id: conv.into(),
-        tool: req.tool.clone(),
-        args: req.args.to_string().chars().take(4000).collect(),
+        conversation_id: conversation_id.into(),
+        tool: tool.into(),
+        args: args.to_string().chars().take(4000).collect(),
         result: result.chars().take(4000).collect(),
         approved: ok,
+        approval: approval.into(),
         created_at: chrono::Utc::now().to_rfc3339(),
     });
+}
+
+/// The folder a direct tool call may work in: a saved project, or a folder
+/// inside one. Any existing path used to be enough, so a caller could list,
+/// read or change any folder on the machine.
+async fn saved_project_folder(s: &AppState, requested: &str) -> Result<std::path::PathBuf, ApiError> {
+    let wanted = std::path::Path::new(requested).canonicalize().map_err(|_| {
+        ApiError::bad(
+            format!("workspace not found: {requested}"),
+            "Select an existing workspace folder first (§27).",
+        )
+    })?;
+    let projects = s
+        .storage
+        .lock()
+        .await
+        .list_workspaces()
+        .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
+    let inside = projects
+        .iter()
+        .filter_map(|project| std::path::Path::new(&project.path).canonicalize().ok())
+        .any(|root| wanted.starts_with(&root));
+    if !inside {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            format!("{requested} is not one of your projects"),
+            "Add the folder as a project first: tools run only inside saved projects.",
+        ));
+    }
+    Ok(std::path::PathBuf::from(requested))
+}
+
+/// The one permission gate for direct tool calls (the tools endpoint and
+/// plugin runs): the permission mode's rules, "Allow for session" grants and
+/// "Allow once". Returns how the call was allowed, as `approved_via` for the
+/// response and in words for the record; a refusal is recorded and returned.
+async fn gate_tool_call(
+    s: &AppState,
+    record_as: &str,
+    tool: &str,
+    args: &serde_json::Value,
+    ws_key: &str,
+    approved_once: bool,
+    grant_session: bool,
+) -> Result<(&'static str, &'static str), ApiError> {
+    use crate::permissions::{PermissionDecision, RiskLevel};
+    let risk = tools::risk_of(tool);
+    let (decision, by_grant, granted_now) = {
+        let mut pm = s.permissions.write().await;
+        // Session grants are recorded only alongside an explicit approval.
+        let granted_now = grant_session && approved_once && risk == RiskLevel::Moderate;
+        if granted_now {
+            pm.grant_session(&crate::permissions::grant_key(tool, args), ws_key);
+        }
+        (
+            pm.decide_call(tool, args, risk, true, Some(ws_key)),
+            pm.allowed_by_grant(tool, args, ws_key),
+            granted_now,
+        )
+    };
+    match decision {
+        PermissionDecision::Allow if granted_now => Ok(("auto", "approved by the user for the session")),
+        PermissionDecision::Allow if by_grant => Ok(("auto", "allowed by a session grant")),
+        PermissionDecision::Allow => Ok(("auto", "allowed by the permission mode")),
+        PermissionDecision::RequireApproval { .. } if approved_once => Ok(("once", "approved by the user")),
+        PermissionDecision::RequireApproval { reason } => {
+            record_tool_call(s, record_as, tool, args, "refused: needs approval", false, &format!("denied, approval required: {reason}")).await;
+            Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                format!("'{tool}' needs approval: {reason}"),
+                "Call again with approved_once:true, or grant_session:true for the session.",
+            ))
+        }
+        PermissionDecision::Deny { reason } => {
+            record_tool_call(s, record_as, tool, args, "refused by the permission mode", false, &format!("denied: {reason}")).await;
+            Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                format!("'{tool}' is not allowed: {reason}"),
+                "Switch agent mode or perform this step manually.",
+            ))
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -7863,37 +7947,34 @@ async fn run_plugin_command(
         let ws = load_workspace(&s, req.workspace_id.trim()).await?;
         resolve_workspace_root(&s, &ws)?
     };
+    let ws_key = ws_root
+        .canonicalize()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| ws_root.to_string_lossy().into_owned());
     let ws = crate::workspace::WorkspaceManager::new(ws_root);
+    // The same gate as every other direct tool call: a plugin used to run
+    // whatever its caller said was approved, whatever the permission mode.
+    let record_as = format!("plugin:{id}");
+    let (_, approval) = gate_tool_call(&s, &record_as, &req.tool, &req.args, &ws_key, req.approved, false).await?;
     let tool_req = crate::tools::ToolRequest {
         name: req.tool.clone(),
         args: req.args.clone(),
-        approved: req.approved,
+        approved: true,
     };
-    match crate::tools::execute(&tool_req, &ws, req.approved) {
+    match crate::tools::execute(&tool_req, &ws, true) {
         Ok(r) => {
-            let st = s.storage.lock().await;
-            let _ = st.record_tool_execution(&crate::storage::ToolExecution {
-                id: uuid::Uuid::new_v4().to_string(),
-                conversation_id: format!("plugin:{id}"),
-                tool: req.tool.clone(),
-                args: serde_json::to_string(&req.args).unwrap_or_default(),
-                result: r.output.chars().take(2000).collect(),
-                approved: req.approved,
-                created_at: chrono::Utc::now().to_rfc3339(),
-            });
+            record_tool_call(&s, &record_as, &req.tool, &req.args, approval, r.ok, &r.output).await;
             Ok(Json(
                 serde_json::json!({"ok": r.ok, "output": r.output, "exit_code": r.exit_code}),
             ))
         }
-        Err(crate::tools::ToolError::PermissionRequired { reason, .. }) => Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            format!("Permission required for '{}': {reason}", req.tool),
-            "Retry with approved=true after user confirmation.",
-        )),
-        Err(e) => Err(ApiError::bad(
-            format!("{e}"),
-            "Check tool arguments and retry.",
-        )),
+        Err(e) => {
+            record_tool_call(&s, &record_as, &req.tool, &req.args, approval, false, &e.to_string()).await;
+            Err(ApiError::bad(
+                format!("{e}"),
+                "Check tool arguments and retry.",
+            ))
+        }
     }
 }
 
@@ -8854,8 +8935,21 @@ async fn session_action(
     }
 }
 
+/// Sent to the screens in place of a saved secret (the web search key): the
+/// settings endpoint used to send the key itself, in plain text. Saving the
+/// settings back with this placeholder keeps the key that is saved.
+const SAVED_SECRET: &str = "(saved)";
+
+/// The settings as a screen may see them: secrets replaced by `SAVED_SECRET`.
+fn without_secrets(mut settings: AppSettings) -> AppSettings {
+    if !settings.search.brave_key.is_empty() {
+        settings.search.brave_key = SAVED_SECRET.into();
+    }
+    settings
+}
+
 async fn get_settings(State(s): State<AppState>) -> Json<AppSettings> {
-    Json(s.settings.read().await.clone())
+    Json(without_secrets(s.settings.read().await.clone()))
 }
 
 #[derive(Deserialize, Default)]
@@ -9051,7 +9145,10 @@ async fn put_settings(
     // cannot each reconcile against a version the other has replaced.
     let _update = s.settings_update.lock().await;
     let previous = s.settings.read().await.clone();
-    let next = next.reconciled_with(&previous);
+    let mut next = next.reconciled_with(&previous);
+    if next.search.brave_key == SAVED_SECRET {
+        next.search.brave_key = previous.search.brave_key.clone();
+    }
     if next.inference.context_size == 0 || next.inference.context_size > 1_048_576 {
         return Err(ApiError::bad(
             "context_size must be > 0",
@@ -9165,7 +9262,7 @@ async fn put_settings(
     {
         spawn_fit_preparation(&s, std::time::Duration::from_secs(3));
     }
-    Ok(Json(next))
+    Ok(Json(without_secrets(next)))
 }
 
 async fn system_info(State(s): State<AppState>) -> Json<serde_json::Value> {
@@ -10794,7 +10891,7 @@ Would you like me to fix it?")]));
                 .permissions
                 .write()
                 .await
-                .grant_session("git_commit", "project");
+                .grant_session("write_file", "project");
         }
         {
             let state = AppState::new_with_storage(
@@ -10827,7 +10924,7 @@ Would you like me to fix it?")]));
             ));
             assert!(matches!(
                 policy.decide_in(
-                    "git_commit",
+                    "write_file",
                     crate::permissions::RiskLevel::Moderate,
                     true,
                     Some("project")
@@ -10852,7 +10949,7 @@ Would you like me to fix it?")]));
             assert_eq!(state.settings.read().await.inference.temperature, 0.35);
             for (tool, risk) in [
                 ("execute_command", crate::permissions::RiskLevel::Dangerous),
-                ("git_commit", crate::permissions::RiskLevel::Moderate),
+                ("write_file", crate::permissions::RiskLevel::Moderate),
             ] {
                 assert!(
                     matches!(
@@ -12015,6 +12112,64 @@ Would you like me to fix it?")]));
         dir.to_string_lossy().into_owned()
     }
 
+    /// A router whose state has `path` saved as a project, as the screens do
+    /// before any tool runs in it.
+    fn app_with_project(path: &str) -> Router {
+        let state = AppState::new_stub();
+        state
+            .storage
+            .try_lock()
+            .unwrap()
+            .create_workspace(&crate::storage::Workspace {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "project".into(),
+                path: path.into(),
+                build_system: String::new(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        router(state)
+    }
+
+    #[tokio::test]
+    async fn tools_run_only_inside_saved_projects() {
+        let outside = tool_ws();
+        let r = app()
+            .oneshot(json_req(
+                "POST",
+                "/api/tools/execute",
+                exec_body(&outside, "read_file", serde_json::json!({"path": "a.txt"}), serde_json::json!({})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        assert!(body_json(r).await["error"].as_str().unwrap().contains("not one of your projects"));
+        // A folder inside a saved project is fine.
+        let project = tool_ws();
+        std::fs::create_dir_all(std::path::Path::new(&project).join("src")).unwrap();
+        std::fs::write(std::path::Path::new(&project).join("src").join("b.txt"), "inside").unwrap();
+        let inner = std::path::Path::new(&project).join("src").to_string_lossy().into_owned();
+        let a = app_with_project(&project);
+        let r = a
+            .clone()
+            .oneshot(json_req(
+                "POST",
+                "/api/tools/execute",
+                exec_body(&inner, "read_file", serde_json::json!({"path": "b.txt"}), serde_json::json!({})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert!(body_json(r).await["output"].as_str().unwrap().contains("inside"));
+        // The record says how the call was allowed, not just "approved".
+        let r = a
+            .oneshot(Request::builder().uri("/api/tools/executions?conversation_id=direct").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let records = body_json(r).await;
+        assert_eq!(records[0]["approval"], "allowed by the permission mode", "{records}");
+    }
+
     fn exec_body(
         ws: &str,
         tool: &str,
@@ -12033,10 +12188,41 @@ Would you like me to fix it?")]));
         serde_json::Value::Object(m)
     }
 
+    #[test]
+    fn attachments_with_the_same_name_keep_their_own_files() {
+        let dir = std::env::temp_dir().join(format!("companion-attach-{}", uuid::Uuid::new_v4().simple()));
+        assert_eq!(store_attachment(&dir, "report.pdf", b"first").unwrap(), "report.pdf");
+        assert_eq!(store_attachment(&dir, "report.pdf", b"second").unwrap(), "report (2).pdf");
+        assert_eq!(store_attachment(&dir, "notes", b"third").unwrap(), "notes");
+        assert_eq!(store_attachment(&dir, "notes", b"fourth").unwrap(), "notes (2)");
+        assert_eq!(std::fs::read(dir.join("report.pdf")).unwrap(), b"first");
+        assert_eq!(std::fs::read(dir.join("report (2).pdf")).unwrap(), b"second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_search_key_never_reaches_a_screen_and_survives_a_save() {
+        let state = AppState::new_stub();
+        let mut settings = state.settings.read().await.clone();
+        settings.search.brave_key = "secret-key-123".into();
+        let _ = put_settings(State(state.clone()), Json(settings)).await.unwrap();
+        let shown = get_settings(State(state.clone())).await.0;
+        assert_eq!(shown.search.brave_key, SAVED_SECRET);
+        // The screen saves what it was shown: the real key stays.
+        let saved = put_settings(State(state.clone()), Json(shown)).await.unwrap().0;
+        assert_eq!(saved.search.brave_key, SAVED_SECRET);
+        assert_eq!(state.settings.read().await.search.brave_key, "secret-key-123");
+        // Clearing the field removes it.
+        let mut cleared = get_settings(State(state.clone())).await.0;
+        cleared.search.brave_key.clear();
+        let _ = put_settings(State(state.clone()), Json(cleared)).await.unwrap();
+        assert_eq!(state.settings.read().await.search.brave_key, "");
+    }
+
     #[tokio::test]
     async fn tool_gate_requires_approval_then_allows_once() {
-        let a = app();
         let ws = tool_ws();
+        let a = app_with_project(&ws);
         // The default Ask mode runs a read without asking (as Claude Code
         // does) and asks before a file edit.
         let r = a
@@ -12106,8 +12292,8 @@ Would you like me to fix it?")]));
 
     #[tokio::test]
     async fn tool_session_grant_and_audit() {
-        let a = app();
         let ws = tool_ws();
+        let a = app_with_project(&ws);
         // Grant session for write_file (MODERATE) with an approval.
         let r = a.clone().oneshot(json_req("POST", "/api/tools/execute",
             exec_body(&ws, "write_file", serde_json::json!({"path": "s.txt", "content": "v"}),
@@ -12261,8 +12447,8 @@ Would you like me to fix it?")]));
 
     #[tokio::test]
     async fn web_search_tool_needs_consent() {
-        let a = app();
         let ws = tool_ws();
+        let a = app_with_project(&ws);
         let r = a
             .oneshot(json_req(
                 "POST",

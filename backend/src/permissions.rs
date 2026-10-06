@@ -49,6 +49,24 @@ pub fn autonomy_for_mode(mode: &str) -> AutonomyLevel {
     }
 }
 
+/// What an "Allow for session" grant covers: the tool in this project, except
+/// a page preview, which is granted per port. "Preview the dev server" must
+/// not become "read any local web service on this PC" (an admin console,
+/// another app's page) for the rest of the session.
+pub fn grant_key(tool: &str, args: &serde_json::Value) -> String {
+    if tool == "preview_page" {
+        let port = args
+            .get("url")
+            .and_then(|url| url.as_str())
+            .and_then(|url| crate::preview::parse_local_url(url).ok())
+            .and_then(|(_, authority, _)| authority.rsplit_once(':').map(|(_, port)| port.to_string()));
+        if let Some(port) = port {
+            return format!("{tool} port {port}");
+        }
+    }
+    tool.to_string()
+}
+
 #[derive(Debug, Clone)]
 pub enum PermissionDecision {
     Allow,
@@ -104,15 +122,24 @@ impl PermissionManager {
         )
     }
 
-    /// Record an "Allow for session" grant (MODERATE tools only).
-    pub fn grant_session(&mut self, tool: &str, workspace: &str) {
+    /// Record an "Allow for session" grant (MODERATE tools only). `key` comes
+    /// from `grant_key`: the tool, or the tool and its target.
+    pub fn grant_session(&mut self, key: &str, workspace: &str) {
         self.grants
-            .insert((tool.to_string(), workspace.to_string()));
+            .insert((key.to_string(), workspace.to_string()));
     }
 
-    fn session_granted(&self, tool: &str, workspace: &str) -> bool {
+    fn session_granted(&self, key: &str, workspace: &str) -> bool {
         self.grants
-            .contains(&(tool.to_string(), workspace.to_string()))
+            .contains(&(key.to_string(), workspace.to_string()))
+    }
+
+    /// This call would run because of an "Allow for session" grant (for the
+    /// record of how an action was allowed).
+    pub fn allowed_by_grant(&self, tool: &str, args: &serde_json::Value, workspace: &str) -> bool {
+        self.autonomy != AutonomyLevel::Autonomous
+            && crate::tools::risk_of(tool) == RiskLevel::Moderate
+            && self.session_granted(&grant_key(tool, args), workspace)
     }
 
     /// Central gate: LLM -> ToolRequest -> PermissionManager -> Tool -> OS (§92).
@@ -136,12 +163,23 @@ impl PermissionManager {
                 reason: format!("'{tool}' edits a file inside .git, where git keeps commands it runs; this asks even in Accept edits mode."),
             };
         }
-        self.decide_in(tool, risk, in_workspace, workspace)
+        self.decide_keyed(tool, &grant_key(tool, args), risk, in_workspace, workspace)
     }
 
     pub fn decide_in(
         &self,
         tool: &str,
+        risk: RiskLevel,
+        in_workspace: bool,
+        workspace: Option<&str>,
+    ) -> PermissionDecision {
+        self.decide_keyed(tool, tool, risk, in_workspace, workspace)
+    }
+
+    fn decide_keyed(
+        &self,
+        tool: &str,
+        grant: &str,
         risk: RiskLevel,
         in_workspace: bool,
         workspace: Option<&str>,
@@ -174,7 +212,7 @@ impl PermissionManager {
         // Session grants auto-allow MODERATE tools in their workspace.
         if risk == RiskLevel::Moderate && in_workspace {
             if let Some(ws) = workspace {
-                if self.session_granted(tool, ws) {
+                if self.session_granted(grant, ws) {
                     return PermissionDecision::Allow;
                 }
             }
@@ -311,6 +349,34 @@ mod tests {
         assert_eq!(autonomy_for_mode("plan"), AutonomyLevel::WorkspaceAgent);
         assert_eq!(autonomy_for_mode("auto"), AutonomyLevel::Autonomous);
         assert_eq!(autonomy_for_mode("anything else"), AutonomyLevel::WorkspaceAgent);
+    }
+
+    #[test]
+    fn a_preview_grant_covers_only_the_port_it_was_given_for() {
+        let mut pm = PermissionManager::new(autonomy_for_mode("ask"));
+        let dev = serde_json::json!({"url": "http://localhost:5173/"});
+        let same_port = serde_json::json!({"url": "127.0.0.1:5173/about"});
+        let other = serde_json::json!({"url": "http://localhost:8080/admin"});
+        pm.grant_session(&grant_key("preview_page", &dev), "C:/ws");
+        let decide = |args: &serde_json::Value| pm.decide_call("preview_page", args, RiskLevel::Moderate, true, Some("C:/ws"));
+        assert!(matches!(decide(&dev), PermissionDecision::Allow));
+        assert!(matches!(decide(&same_port), PermissionDecision::Allow));
+        assert!(matches!(decide(&other), PermissionDecision::RequireApproval { .. }), "another local service asks again");
+        assert!(pm.allowed_by_grant("preview_page", &dev, "C:/ws"));
+        assert!(!pm.allowed_by_grant("preview_page", &other, "C:/ws"));
+    }
+
+    #[test]
+    fn commits_and_opening_files_ask_every_time_like_commands() {
+        let mut pm = PermissionManager::new(autonomy_for_mode("accept_edits"));
+        for tool in ["git_commit", "open_path"] {
+            assert_eq!(crate::tools::risk_of(tool), RiskLevel::Dangerous, "{tool}");
+            pm.grant_session(tool, "C:/ws");
+            assert!(
+                matches!(pm.decide_call(tool, &serde_json::json!({}), crate::tools::risk_of(tool), true, Some("C:/ws")), PermissionDecision::RequireApproval { .. }),
+                "{tool} must not be covered by a session grant"
+            );
+        }
     }
 
     #[test]

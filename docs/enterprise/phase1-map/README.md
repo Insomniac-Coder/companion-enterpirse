@@ -79,24 +79,30 @@ These follow from decisions already made; none needs a new decision, but the pla
 
 ## Gaps that must not be carried over
 
-Found by the agents and confirmed in the code unless marked.
+Found by the agents and confirmed in the code. "Fixed" means fixed in this repository on 2026-10-06
+(backend 530 passed, 7 skipped on purpose). New tests cover Stop, background commands, the preview
+grant, commit and open asking every time, the delete fix, the run list, the search key, same-name
+attachments, saved projects and how a call was allowed; the plugin endpoint's existing test now runs
+through the shared gate.
 
-| Gap | Where |
-|---|---|
-| The plugin run endpoint never asks the permission rules; it trusts the caller's "approved" flag | `api.rs` `run_plugin_command` |
-| Running a tool through the API takes any folder path the caller sends (the permission rules are asked, the folder is not checked) | `api.rs` `execute_tool` |
-| Stop does not stop a command that is already running; it runs until its own timeout (up to 30 minutes) | `agent_runner.rs` `execute_local_tool`, `terminal::run` |
-| The run list forgets the oldest run after 20, even while it is still working | `agent_runner.rs` `AgentRegistry::insert` |
-| `git commit` runs the repository's own hook programs, so it is really a command; it is rated moderate | `tools.rs` git_commit (agent finding, code confirmed) |
-| Opening a path can start a program (a .bat or .exe written by the agent), rated moderate | `tools.rs` open_path (agent finding) |
-| Page preview can read any local web service on the PC, not only the project's own server | `preview.rs` (agent finding) |
-| Fetching a web page on the server accepts any address, including internal ones | `search.rs` `extract_page` |
-| The settings endpoint sends the web search key to the browser in plain text | `api.rs` `get_settings` |
-| A conversation export carries the whole program's log, not only that conversation | `api.rs` `export_conversation` |
-| Two attachments with the same name in one conversation overwrite each other on disk | `api.rs` `add_attachment` |
-| The tool record says "approved" for every action that ran, without saying who or how (by mode, by the user, by a session grant) | `agent_runner.rs` `audit_tool` |
-| Commands start without the Windows "no window" flag; inside a desktop app each would flash a console window | `terminal.rs` (agent finding, code confirmed) |
-| Background commands are not stopped when the program crashes or closes outside a run's end | `terminal.rs` (agent finding) |
+| Gap | Where | Status |
+|---|---|---|
+| The plugin run endpoint never asked the permission rules; it trusted the caller's "approved" flag | `api.rs` `run_plugin_command` | Fixed: plugins go through the same permission gate as every direct tool call (`gate_tool_call`) |
+| Running a tool through the API took any folder path the caller sent | `api.rs` `execute_tool` | Fixed: only a saved project, or a folder inside one (`saved_project_folder`) |
+| Stop did not stop a command that was already running; it ran until its own timeout (up to 30 minutes) | `agent_runner.rs`, `terminal.rs`, `project_check.rs` | Fixed: a running command or project check watches the run's stop flag and its whole process tree is ended |
+| The run list forgot the oldest run after 20, even while it was still working | `AgentRegistry::insert` | Fixed: only finished runs are forgotten |
+| `git commit` runs the repository's own hook programs, so it is really a command; it was rated moderate | `tools.rs` | Fixed: rated like a command (asks every time, never an "Allow for session") |
+| Opening a path could start a program (a .bat or .exe the agent wrote), rated moderate | `tools.rs` | Fixed: rated like a command |
+| "Allow for session" on a page preview covered every local web service on the PC | `permissions.rs` | Fixed: the grant covers only the port it was given for |
+| Fetching a web page on the server accepted any address, including internal ones | `search.rs` `extract_page` | Fixed: the function was never called, and is removed |
+| The settings endpoint sent the web search key to the browser in plain text | `api.rs` `get_settings` | Fixed: the screens get "(saved)"; saving that back keeps the key |
+| A conversation export carries the whole program's log | `api.rs` `export_conversation` | Phase 1, task 8: with one user today the log is that user's own, and it was included on purpose for diagnosing failures; it leaves the export when several people share a server |
+| Two attachments with the same name in one conversation overwrote each other on disk | `api.rs` `add_attachment` | Fixed: the second is kept as "name (2).ext" |
+| The tool record said "approved" for every action that ran, without saying how | `agent_runner.rs`, `api.rs` | Fixed: each record says how it was allowed (permission mode, session grant, the user's approval, chat's read-only set) or why it was refused |
+| Commands started without the Windows "no window" flag | `terminal.rs`, `tools.rs` (git), `cdp.rs` | Fixed |
+| Background commands outlived a crashed or closed program | `terminal.rs` | Fixed on Windows (they belong to a job the system ends with the program) and on every system for a normal close; a crash on Linux or macOS is left to the desktop app (Phase 3) |
+| A delete that named a line (`{"path": ..., "line": 12}`) deleted the whole file, permanently (owner report, 2026-10-06) | `tools.rs` `delete_file` | Fixed: any argument besides the path is refused and nothing is deleted; the message points to the line tools |
+| Tool ratings were kept in two lists that could disagree | `tools.rs` `registry`, `risk_of` | Fixed: the tool list reads the one rating the permission gate uses |
 
 ## Checked by hand
 
@@ -110,4 +116,4 @@ Each large entry and each surprise was read against the code it cites. Three cla
 - "Starting a model copy can kill its sibling copies": only copies whose parent process has gone.
 
 Phase 0 checks on this copy (2026-10-06): backend 521 passed, 7 skipped on purpose; frontend 114
-passed; frontend build passes.
+passed; frontend build passes. After the fixes above: backend 530 passed, 7 skipped.

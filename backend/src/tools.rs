@@ -75,132 +75,134 @@ impl std::fmt::Display for ToolError {
     }
 }
 
+/// Each tool's risk comes from `risk_of`, the rating the permission gate uses,
+/// so what the screens show can never differ from what is enforced.
 pub fn registry() -> Vec<ToolDescriptor> {
     vec![
         ToolDescriptor {
             name: "list_directory",
             description: "List files in a workspace directory",
-            risk: RiskLevel::Safe,
+            risk: risk_of("list_directory"),
             permission_required: "workspace read",
         },
         ToolDescriptor {
             name: "read_file",
             description: "Read a numbered text chunk: path, optional 1-based start_line/end_line (200 lines default, 500 max). Any line is accessible; follow the returned continuation for more. Optional start_column continues an unusually long line.",
-            risk: RiskLevel::Safe,
+            risk: risk_of("read_file"),
             permission_required: "workspace read",
         },
         ToolDescriptor {
             name: "write_file",
             description: "Create or overwrite a workspace file",
-            risk: RiskLevel::Moderate,
+            risk: risk_of("write_file"),
             permission_required: "explicit",
         },
         ToolDescriptor {
             name: "append_file",
             description: "Add text to the end of a workspace file, creating it if absent",
-            risk: RiskLevel::Moderate,
+            risk: risk_of("append_file"),
             permission_required: "explicit",
         },
         ToolDescriptor {
             name: "edit_file",
             description: "Replace exact existing text: old (copied from the file, without the line-number labels) becomes new and must occur once. replace_lines is easier when you know the line numbers.",
-            risk: RiskLevel::Moderate,
+            risk: risk_of("edit_file"),
             permission_required: "explicit",
         },
         ToolDescriptor {
             name: "replace_lines",
             description: "Replace lines by number, as read_file shows them",
-            risk: RiskLevel::Moderate,
+            risk: risk_of("replace_lines"),
             permission_required: "explicit",
         },
         ToolDescriptor {
             name: "outline",
             description: "What a file defines, or what a folder holds",
-            risk: RiskLevel::Safe,
+            risk: risk_of("outline"),
             permission_required: "none",
         },
         ToolDescriptor {
             name: "project_check",
             description: "Run this project's own build and tests and report what failed",
-            risk: RiskLevel::Dangerous,
+            risk: risk_of("project_check"),
             permission_required: "explicit",
         },
         ToolDescriptor {
             name: "delete_file",
-            description: "Delete a workspace file",
-            risk: RiskLevel::Dangerous,
+            description: "Delete a whole file",
+            risk: risk_of("delete_file"),
             permission_required: "explicit",
         },
         ToolDescriptor {
             name: "search_text",
             description: "Regex search in a workspace directory or individual file. Returns matching line numbers; use read_file start_line/end_line for surrounding code. Narrow path/query when results are capped.",
-            risk: RiskLevel::Safe,
+            risk: risk_of("search_text"),
             permission_required: "workspace read",
         },
         ToolDescriptor {
             name: "execute_command",
             description: "Run a shell command with captured output",
-            risk: RiskLevel::Dangerous,
+            risk: risk_of("execute_command"),
             permission_required: "explicit",
         },
         ToolDescriptor {
             name: "changes",
             description: "Every file this task has created, changed or deleted, with its size now",
-            risk: RiskLevel::Safe,
+            risk: risk_of("changes"),
             permission_required: "none",
         },
         ToolDescriptor {
             name: "remember",
             description: "Keep one short fact in front of you (it survives summarizing)",
-            risk: RiskLevel::Safe,
+            risk: risk_of("remember"),
             permission_required: "none",
         },
         ToolDescriptor {
             name: "preview_page",
             description: "Open a page this project serves; reports what it renders and logs",
-            risk: RiskLevel::Moderate,
+            risk: risk_of("preview_page"),
             permission_required: "explicit",
         },
         ToolDescriptor {
             name: "web_search",
             description: "Search the web (explicit opt-in per request)",
-            risk: RiskLevel::Moderate,
+            risk: risk_of("web_search"),
             permission_required: "explicit (Search toggle)",
         },
         ToolDescriptor {
             name: "create_document",
             description: "Generate txt/md/json/csv/html/xlsx/docx/pdf/pptx from a JSON spec",
-            risk: RiskLevel::Moderate,
+            risk: risk_of("create_document"),
             permission_required: "explicit",
         },
         ToolDescriptor {
             name: "system_info",
             description: "OS/CPU/RAM/GPU summary",
-            risk: RiskLevel::Safe,
+            risk: risk_of("system_info"),
             permission_required: "none",
         },
         ToolDescriptor {
             name: "git_commit",
             description: "Commit staged workspace changes with a message",
-            risk: RiskLevel::Moderate,
+            risk: risk_of("git_commit"),
             permission_required: "explicit",
         },
         ToolDescriptor {
             name: "list_processes",
             description: "List running OS processes (name + pid)",
-            risk: RiskLevel::Safe,
+            risk: risk_of("list_processes"),
             permission_required: "none",
         },
         ToolDescriptor {
             name: "present_plan",
             description: "Plan runs only: present the finished plan for the user to approve. Ends the run.",
-            risk: RiskLevel::Safe,
+            risk: risk_of("present_plan"),
             permission_required: "none",
         },
         ToolDescriptor {
             name: "open_path",
             description: "Open a workspace file/folder with the OS default app",
-            risk: RiskLevel::Moderate,
+            risk: risk_of("open_path"),
             permission_required: "explicit",
         },
     ]
@@ -210,8 +212,13 @@ pub fn risk_of(name: &str) -> RiskLevel {
     match name {
         "execute_command" | "delete_file" => RiskLevel::Dangerous,
         "project_check" => RiskLevel::Dangerous,
+        // A commit runs the repository's own hook programs, and opening a file
+        // with its default app runs it when it is a program or a script (one the
+        // agent may have just written): both are commands in all but name, so
+        // they ask every time, like commands, and are never granted for a session.
+        "git_commit" | "open_path" => RiskLevel::Dangerous,
         "write_file" | "append_file" | "edit_file" | "replace_lines" | "web_search"
-        | "create_document" | "git_commit" | "open_path" | "preview_page" => RiskLevel::Moderate,
+        | "create_document" | "preview_page" => RiskLevel::Moderate,
         _ => RiskLevel::Safe,
     }
 }
@@ -376,6 +383,17 @@ pub fn execute(
     req: &ToolRequest,
     ws: &WorkspaceManager,
     approved: bool,
+) -> Result<ToolResult, ToolError> {
+    execute_until(req, ws, approved, &|| false)
+}
+
+/// `execute` for a task that can be stopped: a command or a project check
+/// still running when `stop` says so is ended, with its whole process tree.
+pub fn execute_until(
+    req: &ToolRequest,
+    ws: &WorkspaceManager,
+    approved: bool,
+    stop: &dyn Fn() -> bool,
 ) -> Result<ToolResult, ToolError> {
     match req.name.as_str() {
         "list_directory" => {
@@ -698,13 +716,22 @@ pub fn execute(
                 .and_then(|v| v.as_u64())
                 .unwrap_or_else(|| crate::project_check::default_timeout().as_secs())
                 .clamp(5, crate::terminal::MAX_TIMEOUT_SECS);
-            Ok(ToolResult::ok(crate::project_check::run(&root, timeout)))
+            Ok(ToolResult::ok(crate::project_check::run_until(&root, timeout, stop)))
         }
         "delete_file" => {
             require_approved(req, approved, "File deletion needs explicit approval.")?;
             let rel = req.args.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
                 ToolError::InvalidArgs("delete_file requires {\"path\": \"...\"}".into())
             })?;
+            // It removes a whole file. A call that also names lines or text
+            // (`line`, `from`, `old`...) meant something smaller, and used to
+            // delete the whole file anyway: any argument besides the path is
+            // refused, so nothing is deleted on a misunderstanding.
+            if let Some(extra) = req.args.as_object().and_then(|args| args.keys().find(|key| key.as_str() != "path")) {
+                return Err(ToolError::InvalidArgs(format!(
+                    "delete_file removes the whole file and takes only {{\"path\"}}; \"{extra}\" was also sent, so nothing was deleted. To remove lines from a file, use replace_lines with an empty text, or edit_file with those lines as old and an empty new."
+                )));
+            }
             let p = ws.resolve(rel).map_err(ToolError::Workspace)?;
             if !p.exists() {
                 return Err(missing_path(ws, rel, std::io::ErrorKind::NotFound.into()));
@@ -800,7 +827,7 @@ pub fn execute(
                     Err(e) => Err(ToolError::InvalidArgs(e)),
                 };
             }
-            match crate::terminal::run(cmd, &cwd, timeout) {
+            match crate::terminal::run_until(cmd, &cwd, timeout, stop) {
                 Ok(r) => {
                     let mut output = crate::terminal::format_result(cmd, &r);
                     // A background command stopped as if it were a shell
@@ -845,7 +872,13 @@ pub fn execute(
                 return Err(ToolError::InvalidArgs("commit message must be a single plain line".into()));
             }
             let root = ws.root().to_path_buf();
-            let status = std::process::Command::new("git")
+            let mut git = std::process::Command::new("git");
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                git.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            }
+            let status = git
                 .args(["-C", &root.to_string_lossy(), "commit", "-m", msg.trim()])
                 .output()
                 .map_err(ToolError::Io)?;
@@ -857,7 +890,7 @@ pub fn execute(
             }
         }
         // Stage 37: automation primitives. list_processes is read-only (SAFE);
-        // open_path launches the OS default handler (MODERATE, approval).
+        // open_path launches the OS default handler (DANGEROUS: it can run what it opens).
         "list_processes" => {
             let mut sys = sysinfo::System::new_all();
             sys.refresh_processes();
@@ -1943,6 +1976,23 @@ mod tests {
     }
 
     #[test]
+    fn a_delete_that_names_lines_deletes_nothing() {
+        // "Delete line 3" sent as delete_file used to remove the whole file.
+        let w = wsfresh("del-lines");
+        std::fs::write(w.root().join("app.py"), "a\nb\nc\n").unwrap();
+        for extra in [
+            serde_json::json!({"path": "app.py", "line": 3}),
+            serde_json::json!({"path": "app.py", "from": 2, "to": 3}),
+            serde_json::json!({"path": "app.py", "old": "c"}),
+        ] {
+            let req = ToolRequest { name: "delete_file".into(), args: extra.clone(), approved: true };
+            let error = execute(&req, &w, true).unwrap_err().to_string();
+            assert!(error.contains("nothing was deleted") && error.contains("replace_lines"), "{extra}: {error}");
+            assert_eq!(std::fs::read_to_string(w.root().join("app.py")).unwrap(), "a\nb\nc\n", "{extra}");
+        }
+    }
+
+    #[test]
     fn chat_safe_set_is_read_only() {
         for t in [
             "list_directory",
@@ -1989,7 +2039,7 @@ mod tests {
             execute(&evil, &w, true).unwrap_err(),
             ToolError::InvalidArgs(_)
         ));
-        assert_eq!(risk_of("git_commit"), RiskLevel::Moderate);
+        assert_eq!(risk_of("git_commit"), RiskLevel::Dangerous);
     }
 
     #[test]

@@ -193,6 +193,11 @@ fn tail(output: &str) -> String {
 /// Run a project's own build and tests and report what failed. The build runs
 /// first: there is nothing to learn from a test run that could not compile.
 pub fn run(root: &Path, timeout_secs: u64) -> String {
+    run_until(root, timeout_secs, &|| false)
+}
+
+/// `run`, ended as soon as `stop` says so (the task was stopped).
+pub fn run_until(root: &Path, timeout_secs: u64, stop: &dyn Fn() -> bool) -> String {
     let Some(plan) = plan(root) else {
         return "No build or test command was found here: no package.json with a build or test script, no Cargo.toml, no go.mod, and no Python tests. Run the project's own command with execute_command, or say what should be run.".to_string();
     };
@@ -206,11 +211,15 @@ pub fn run(root: &Path, timeout_secs: u64) -> String {
             continue;
         }
         let started = Instant::now();
-        let result = crate::terminal::run(&step.command, root, timeout_secs);
+        let result = crate::terminal::run_until(&step.command, root, timeout_secs, stop);
         let seconds = started.elapsed().as_secs_f32();
         match result {
             Err(error) => {
                 report.push_str(&format!("\n{} ({}): could not run: {error}\n", step.command, step.kind));
+                break;
+            }
+            Ok(outcome) if outcome.stopped => {
+                report.push_str(&format!("\n{} ({}): stopped after {seconds:.1} s because the task was stopped.\n", step.command, step.kind));
                 break;
             }
             Ok(outcome) => {

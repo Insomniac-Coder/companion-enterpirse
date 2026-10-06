@@ -2520,14 +2520,23 @@ impl AgentRegistry {
         Self::default()
     }
 
+    /// Keeps the 20 most recent finished runs. A run still working is never
+    /// dropped: forgetting it took away its Stop, its approvals and its events
+    /// while it went on changing the project.
     pub fn insert(&mut self, run: Arc<LiveRun>) {
         self.order.push_back(run.id.clone());
-        if self.order.len() > 20 {
-            if let Some(old) = self.order.pop_front() {
+        self.runs.insert(run.id.clone(), run);
+        while self.order.len() > 20 {
+            let finished = self.order.iter().position(|id| {
+                self.runs.get(id).map_or(true, |run| {
+                    matches!(run.state(), AgentState::Completed | AgentState::Failed | AgentState::Cancelled)
+                })
+            });
+            let Some(at) = finished else { break };
+            if let Some(old) = self.order.remove(at) {
                 self.runs.remove(&old);
             }
         }
-        self.runs.insert(run.id.clone(), run);
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<LiveRun>> {
@@ -3748,14 +3757,18 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         // Chat is refused at spawn; the shared PermissionManager decides.
         // Drop the policy read lock before awaiting a user decision. Otherwise
         // switching Ask → Auto cannot acquire the write lock to release it.
-        let decision =
-            state
-                .permissions
-                .read()
-                .await
-                .decide_call(&call.name, &call.args, risk, true, Some(&ws_key));
-        let approved = match decision {
-            PermissionDecision::Allow => true,
+        let (decision, by_grant) = {
+            let policy = state.permissions.read().await;
+            (
+                policy.decide_call(&call.name, &call.args, risk, true, Some(&ws_key)),
+                policy.allowed_by_grant(&call.name, &call.args, &ws_key),
+            )
+        };
+        // How the action was allowed, for the record: the record used to say
+        // "approved" for everything that ran, whoever or whatever allowed it.
+        let approval: &'static str = match decision {
+            PermissionDecision::Allow if by_grant => "allowed by a session grant",
+            PermissionDecision::Allow => "allowed by the permission mode",
             PermissionDecision::Deny { reason } => {
                 answer_call(
                     &mut transcript,
@@ -3777,9 +3790,13 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                                 .permissions
                                 .write()
                                 .await
-                                .grant_session(&call.name, &ws_key);
+                                .grant_session(&crate::permissions::grant_key(&call.name, &call.args), &ws_key);
                         }
-                        true
+                        if session {
+                            "approved by the user for the session"
+                        } else {
+                            "approved by the user"
+                        }
                     }
                     Some(ApprovalDecision::Denied) | None => {
                         answer_call(
@@ -3828,7 +3845,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                     kept
                 }
             };
-            audit_tool(&state, &run, &call, &text).await;
+            audit_tool(&state, &run, &call, approval, &text).await;
             text
         } else if call.name == "create_document" {
             let conv = if run.spec.conversation_id.trim().is_empty() {
@@ -3845,7 +3862,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             .await
             {
                 Ok(r) => {
-                    audit_tool(&state, &run, &call, &r.output).await;
+                    audit_tool(&state, &run, &call, approval, &r.output).await;
                     r.output
                 }
                 Err(e) => format!("(document failed: {e})"),
@@ -3861,7 +3878,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                     == crate::permissions::AutonomyLevel::Autonomous;
                 match settings.search.autonomous.as_str() {
                     "deny" => "(web search is disabled by policy for autonomous runs)".to_string(),
-                    _ if global_auto => execute_web_search(&state, &run, &call).await,
+                    _ if global_auto => execute_web_search(&state, &run, &call, "allowed by Auto with Search on").await,
                     _ => {
                         match await_approval(
                             &state,
@@ -3873,7 +3890,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                         .await
                         {
                             Some(ApprovalDecision::Approved { .. }) => {
-                                execute_web_search(&state, &run, &call).await
+                                execute_web_search(&state, &run, &call, "approved by the user").await
                             }
                             _ => "(the user denied web search — continue from local knowledge)"
                                 .to_string(),
@@ -3882,7 +3899,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                 }
             }
         } else {
-            let mut output = execute_local_tool(&state, &run, &ws, &call, approved).await;
+            let mut output = execute_local_tool(&state, &run, &ws, &call, approval).await;
             // A missing path is the most common argument slip; the file the
             // model was just working on is almost always the one it meant.
             if output.starts_with("(tool error")
@@ -4774,20 +4791,23 @@ async fn execute_local_tool(
     run: &LiveRun,
     ws: &crate::workspace::WorkspaceManager,
     call: &ToolCall,
-    approved: bool,
+    approval: &str,
 ) -> String {
     let tool_req = crate::tools::ToolRequest {
         name: call.name.clone(),
         args: call.args.clone(),
-        approved,
+        approved: true,
     };
     // Commands can run for minutes and searches walk whole trees: blocking
     // work belongs on the blocking pool, not on an async worker that also
     // serves other sessions' streams.
     let blocking_ws = ws.clone();
     let blocking_req = tool_req.clone();
+    // Stop reaches a command that is already running: aborting this task
+    // cannot end blocking work, so the command watches the run's own flag.
+    let cancel = run.cancel.clone();
     let executed = tokio::task::spawn_blocking(move || {
-        crate::tools::execute(&blocking_req, &blocking_ws, true)
+        crate::tools::execute_until(&blocking_req, &blocking_ws, true, &|| cancel.is_cancelled())
     })
     .await
     .unwrap_or_else(|error| {
@@ -4820,7 +4840,7 @@ async fn execute_local_tool(
             _ => format!("(tool error, do not retry identically)\n{e}"),
         },
     };
-    audit_tool(state, run, call, &output).await;
+    audit_tool(state, run, call, approval, &output).await;
     output
 }
 
@@ -4828,6 +4848,7 @@ async fn execute_web_search(
     state: &crate::api::AppState,
     run: &LiveRun,
     call: &ToolCall,
+    approval: &str,
 ) -> String {
     let query = call
         .args
@@ -4876,6 +4897,7 @@ async fn execute_web_search(
                 args: call.args.to_string().chars().take(4000).collect(),
                 result: text.chars().take(4000).collect(),
                 approved: true,
+                approval: approval.into(),
                 created_at: chrono::Utc::now().to_rfc3339(),
             });
             text
@@ -5084,7 +5106,7 @@ fn unified_hunks(old: &str, new: &str, context: usize) -> String {
     out
 }
 
-async fn audit_tool(state: &crate::api::AppState, run: &LiveRun, call: &ToolCall, output: &str) {
+async fn audit_tool(state: &crate::api::AppState, run: &LiveRun, call: &ToolCall, approval: &str, output: &str) {
     let conv = if run.spec.conversation_id.trim().is_empty() {
         format!("agent:{}", run.id)
     } else {
@@ -5098,6 +5120,7 @@ async fn audit_tool(state: &crate::api::AppState, run: &LiveRun, call: &ToolCall
         args: call.args.to_string().chars().take(4000).collect(),
         result: output.chars().take(4000).collect(),
         approved: true,
+        approval: approval.into(),
         created_at: chrono::Utc::now().to_rfc3339(),
     });
 }
@@ -5391,6 +5414,43 @@ CONTENT>>>
         );
         assert!(!reply.is_truncated());
         assert!(parse_action_response(&reply.text).is_some());
+    }
+
+    #[test]
+    fn the_run_list_never_forgets_a_run_that_is_still_working() {
+        let run_in = |state: AgentState| {
+            let (activity_tx, _) = tokio::sync::mpsc::unbounded_channel();
+            Arc::new(LiveRun {
+                id: uuid::Uuid::new_v4().to_string(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                spec: AgentSpec {
+                    workspace: std::env::temp_dir(),
+                    task: "registry fixture".into(),
+                    mode: AgentMode::Agent,
+                    conversation_id: String::new(),
+                    search_enabled: false,
+                    reasoning: false,
+                },
+                cancel: CancelToken::new(),
+                events: Mutex::new(vec![AgentEvent::new(state, "fixture".into(), 1)]),
+                broadcaster: broadcast::channel(8).0,
+                activity_tx,
+                pending: Mutex::new(None),
+                pending_tx: Mutex::new(None),
+                handle: Mutex::new(None),
+            })
+        };
+        let mut registry = AgentRegistry::new();
+        let working = run_in(AgentState::ExecutingTool);
+        registry.insert(working.clone());
+        let finished: Vec<_> = (0..24).map(|_| run_in(AgentState::Completed)).collect();
+        for run in &finished {
+            registry.insert(run.clone());
+        }
+        assert!(registry.get(&working.id).is_some(), "the oldest run is still working");
+        assert_eq!(registry.summaries().len(), 20);
+        assert!(registry.get(&finished[0].id).is_none(), "the oldest finished runs go first");
+        assert!(registry.get(&finished[23].id).is_some());
     }
 
     async fn approval_race_fixture(state: &crate::api::AppState) -> Arc<LiveRun> {
@@ -6631,6 +6691,7 @@ CONTENT>>>
             args: args.to_string(),
             result: result.into(),
             approved: true,
+            approval: String::new(),
             created_at: String::new(),
         };
         let executions = vec![

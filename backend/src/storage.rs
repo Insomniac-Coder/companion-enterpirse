@@ -177,6 +177,11 @@ pub struct ToolExecution {
     pub args: String,
     pub result: String,
     pub approved: bool,
+    /// How the action was allowed: by the permission mode, a session grant,
+    /// the user's approval, or chat's read-only set (or why it was refused).
+    /// Empty in records written before this was kept.
+    #[serde(default)]
+    pub approval: String,
     pub created_at: String,
 }
 
@@ -341,6 +346,11 @@ impl Storage {
                 "tool_executions",
                 "approved",
                 "ALTER TABLE tool_executions ADD COLUMN approved INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "tool_executions",
+                "approval",
+                "ALTER TABLE tool_executions ADD COLUMN approval TEXT NOT NULL DEFAULT ''",
             ),
             (
                 "conversations",
@@ -826,8 +836,8 @@ impl Storage {
 
     pub fn record_tool_execution(&self, t: &ToolExecution) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO tool_executions(id,conversation_id,tool,args,result,approved,created_at) VALUES(?,?,?,?,?,?,?)",
-            params![t.id, t.conversation_id, t.tool, t.args, t.result, t.approved as i32, t.created_at],
+            "INSERT INTO tool_executions(id,conversation_id,tool,args,result,approved,approval,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            params![t.id, t.conversation_id, t.tool, t.args, t.result, t.approved as i32, t.approval, t.created_at],
         )?;
         Ok(())
     }
@@ -838,7 +848,7 @@ impl Storage {
         limit: usize,
     ) -> rusqlite::Result<Vec<ToolExecution>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id,conversation_id,tool,args,result,approved,created_at FROM tool_executions WHERE conversation_id=? ORDER BY rowid DESC LIMIT ?",
+            "SELECT id,conversation_id,tool,args,result,approved,approval,created_at FROM tool_executions WHERE conversation_id=? ORDER BY rowid DESC LIMIT ?",
         )?;
         let rows = stmt.query_map(params![conv, limit as i64], |r| {
             Ok(ToolExecution {
@@ -848,7 +858,8 @@ impl Storage {
                 args: r.get(3)?,
                 result: r.get(4)?,
                 approved: r.get::<_, i32>(5)? != 0,
-                created_at: r.get(6)?,
+                approval: r.get(6)?,
+                created_at: r.get(7)?,
             })
         })?;
         rows.collect()
@@ -1891,6 +1902,7 @@ mod tests {
             args: "{}".into(),
             result: "ok".into(),
             approved: true,
+            approval: String::new(),
             created_at: "2026-01-01T00:00:06Z".into(),
         })
         .unwrap();

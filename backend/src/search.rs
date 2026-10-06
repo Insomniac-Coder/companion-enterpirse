@@ -213,26 +213,6 @@ pub async fn run_search(
     }
 }
 
-/// Fetch a page and extract readable text (§119 open_page, basic form).
-/// Same explicit-consent boundary as search itself.
-pub async fn extract_page(url: &str, timeout_secs: u64) -> Result<String, String> {
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err("only http(s) pages can be opened".into());
-    }
-    let client = http_client(timeout_secs)?;
-    let html = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("page unreachable: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("page error: {e}"))?
-        .text()
-        .await
-        .map_err(|e| format!("read failed: {e}"))?;
-    Ok(html_to_text(&html))
-}
-
 pub(crate) fn html_to_text(html: &str) -> String {
     // NB: the `regex` crate has no backreferences — close with alternation.
     let drop = regex::Regex::new(

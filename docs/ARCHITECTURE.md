@@ -94,12 +94,12 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   keyword retrieval into code chats with citations; embeddings staged.
 - Telemetry: `generation_metrics` table recorded per turn, `.../metrics`
   endpoint with excerpts; bubbles keep Avg tok/s after reload.
-- Git: read-only status/log/branch endpoint + card; `git_commit` MODERATE
-  tool (single-line message, approval + confirm); destructive git refused
+- Git: read-only status/log/branch endpoint + card; `git_commit` DANGEROUS
+  tool, like a command, because it runs the repository's hooks (single-line message, approval + confirm); destructive git refused
   in the terminal denylist.
 - Office output: std-only docx/pptx (stored-zip) + PDF writers, validated
   by reopen (zip check / %PDF magic); `create_document` covers 9 formats.
-- Automation: `list_processes` (SAFE), `open_path` (MODERATE, OS handler);
+- Automation: `list_processes` (SAFE), `open_path` (DANGEROUS, like a command: the OS handler runs a program or script it opens);
   screenshots honestly unavailable (no capture backend).
 - Plugins: `plugins/*/plugin.json` registry, declared-tool cross-check
   (unknown ignored), `.../run` executes through the same permission gate

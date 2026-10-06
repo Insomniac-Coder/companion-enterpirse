@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Companion Enterprise: proposal</title>
+<style>
+/* Fonts are local files (fonts/), so printing never depends on the network. */
+@font-face { font-family: "Bricolage Grotesque"; font-weight: 500 800; src: url(fonts/bricolage.woff2) format("woff2"); }
+@font-face { font-family: "IBM Plex Sans"; font-weight: 100 700; src: url(fonts/plexsans.woff2) format("woff2"); }
+@font-face { font-family: "IBM Plex Sans"; font-style: italic; font-weight: 400; src: url(fonts/plexsans-italic.woff2) format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; font-weight: 400; src: url(fonts/plexmono-400.woff2) format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; font-weight: 500; src: url(fonts/plexmono-500.woff2) format("woff2"); }
+:root {
+  --bg: #f5f7fa; --paper: #ffffff; --wash: #edf1f6; --line: #dce2ea; --line-2: #c3ccd8;
+  --ink: #0b1a2c; --ink-2: #33425a; --muted: #5f6f86; --faint: #97a3b4;
+  --ours: #059669; --ours-ink: #047857; --ours-soft: #d3f4e6;
+  --warn: #b42318; --warn-soft: #fde8e6; --amber-soft: #fef3c7; --amber-ink: #92400e;
+  --display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", Consolas, monospace;
+}
+@page {
+  size: A4;
+  margin: 15mm 15mm 17mm 15mm;
+  @bottom-left { content: "Companion Enterprise · Architecture and action plan · Initial draft, 6 October 2026"; font-family: "IBM Plex Sans", "Segoe UI", sans-serif; font-size: 7.5pt; color: #97a3b4; }
+  @bottom-right { content: counter(page) " / " counter(pages); font-family: "IBM Plex Sans", "Segoe UI", sans-serif; font-size: 7.5pt; color: #97a3b4; }
+}
+* { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+html, body { margin: 0; padding: 0; background: var(--paper); }
+body { font-family: var(--sans); font-size: 9.4pt; line-height: 1.5; color: var(--ink-2); }
+h1, h2, h3 { font-family: var(--display); color: var(--ink); margin: 0; line-height: 1.15; }
+h1 { font-size: 30pt; font-weight: 800; letter-spacing: -0.01em; }
+h2 { font-size: 15.5pt; font-weight: 700; margin: 0 0 8px; display: flex; gap: 10px; align-items: baseline; break-after: avoid; }
+h2 .n { color: var(--ours); font-size: 12pt; font-weight: 700; min-width: 20px; }
+h3 { font-size: 10.6pt; font-weight: 700; margin: 12px 0 4px; break-after: avoid; }
+p { margin: 0 0 7px; }
+b, strong { color: var(--ink); font-weight: 600; }
+ul, ol { margin: 0 0 8px; padding-left: 18px; }
+li { margin: 0 0 3px; }
+code { font-family: var(--mono); font-size: 8.3pt; background: var(--wash); padding: 0 3px; border-radius: 3px; color: var(--ink); }
+section { margin: 0 0 18px; }
+.page-break { break-before: page; }
+.avoid { break-inside: avoid; }
+
+/* title block */
+.eyebrow { font-size: 8pt; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ours-ink); margin-bottom: 6px; }
+.title { border-bottom: 2px solid var(--ink); padding-bottom: 12px; margin-bottom: 14px; }
+.subtitle { font-family: var(--display); font-size: 14pt; font-weight: 600; color: var(--ink-2); margin-top: 4px; }
+.meta { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 10px; font-size: 8.3pt; color: var(--muted); }
+.meta span::before { content: "■ "; color: var(--ours); font-size: 7pt; }
+.lede { font-size: 10.6pt; line-height: 1.55; color: var(--ink); margin-bottom: 12px; }
+
+/* cards */
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; margin: 6px 0 14px; }
+.card { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; break-inside: avoid; }
+.card h3 { margin-top: 0; font-size: 10pt; }
+.card ul { padding-left: 15px; margin: 4px 0 0; font-size: 8.7pt; }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.keep { border-left: 3px solid var(--ours); }
+.change { border-left: 3px solid var(--amber-ink); }
+.note { background: var(--ours-soft); border-radius: 8px; padding: 8px 12px; font-size: 8.8pt; color: var(--ink); margin: 8px 0 10px; break-inside: avoid; }
+.note b { color: var(--ours-ink); }
+.warnnote { background: var(--amber-soft); border-radius: 8px; padding: 8px 12px; font-size: 8.8pt; color: var(--ink); margin: 8px 0 10px; break-inside: avoid; }
+
+/* tables */
+table { width: 100%; border-collapse: collapse; font-size: 8.6pt; line-height: 1.42; margin: 4px 0 10px; }
+thead { display: table-header-group; }
+th { text-align: left; font-weight: 600; color: var(--ink); background: var(--wash); padding: 5px 7px; border-bottom: 1px solid var(--line-2); }
+td { padding: 5px 7px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr { break-inside: avoid; }
+td:first-child { color: var(--ink); font-weight: 600; }
+td.plain { font-weight: 400; color: var(--ink-2); }
+.tag { display: inline-block; font-size: 7.4pt; font-weight: 600; padding: 1px 6px; border-radius: 10px; white-space: nowrap; }
+.tag.ok { background: var(--ours-soft); color: var(--ours-ink); }
+.tag.open { background: var(--amber-soft); color: var(--amber-ink); }
+.tag.assumed { background: var(--wash); color: var(--muted); }
+
+/* figure */
+figure { margin: 4px 0 8px; break-inside: avoid; }
+figure svg { width: 100%; height: auto; display: block; }
+figcaption { font-size: 8.2pt; color: var(--muted); margin-top: 4px; }
+
+/* steps */
+ol.steps { list-style: none; padding: 0; counter-reset: s; margin: 4px 0 10px; }
+ol.steps li { counter-increment: s; position: relative; padding-left: 26px; margin-bottom: 5px; break-inside: avoid; }
+ol.steps li::before { content: counter(s); position: absolute; left: 0; top: 1px; width: 17px; height: 17px; border-radius: 50%; background: var(--ink); color: #fff; font-size: 7.6pt; font-weight: 600; display: flex; align-items: center; justify-content: center; }
+ol.steps.green li::before { background: var(--ours); }
+
+/* roadmap */
+.roadmap { display: grid; grid-template-columns: repeat(10, 1fr); gap: 4px; margin: 8px 0 6px; }
+.ph { background: var(--wash); border-radius: 6px; padding: 6px 5px 7px; text-align: center; font-size: 7.4pt; line-height: 1.25; color: var(--ink); min-height: 50px; }
+.ph b { display: block; font-family: var(--display); font-size: 12pt; color: var(--ours-ink); margin-bottom: 2px; }
+.ph.pilot { background: var(--ours); color: #fff; }
+.ph.pilot b { color: #fff; }
+.roadlegend { font-size: 8pt; color: var(--muted); margin-bottom: 10px; }
+
+dl.gloss { display: grid; grid-template-columns: 30mm 1fr; gap: 3px 12px; font-size: 8.6pt; margin: 4px 0; }
+dl.gloss dt { font-weight: 600; color: var(--ink); }
+dl.gloss dd { margin: 0; }
+</style>
+
+<style>
+@page {
+  @bottom-left { content: "Companion Enterprise · Proposal · 6 October 2026"; }
+}
+.lede { font-size: 11pt; }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 8px 0 4px; }
+.stat { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.stat b { display: block; font-family: var(--display); font-size: 20pt; font-weight: 800; color: var(--ours-ink); line-height: 1.1; }
+.stat span { font-size: 8.2pt; color: var(--ink-2); line-height: 1.35; display: block; margin-top: 2px; }
+.caption-line { font-size: 8pt; color: var(--muted); margin-bottom: 8px; }
+.adds { display: grid; grid-template-columns: 1fr 1fr; gap: 7px 14px; margin-top: 4px; }
+.adds div { padding: 7px 10px; border-left: 3px solid var(--ours); background: var(--bg); border-radius: 0 6px 6px 0; font-size: 9pt; break-inside: avoid; }
+.stages { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 6px 0 8px; }
+.stages div { background: var(--wash); border-radius: 8px; padding: 8px 10px; font-size: 8.6pt; }
+.stages div b { display: block; font-family: var(--display); font-size: 11pt; color: var(--ink); margin-bottom: 3px; }
+.stages div.pilot { background: var(--ours); color: #fff; }
+.stages div.pilot b { color: #fff; }
+.needs { columns: 2; column-gap: 20px; font-size: 9pt; }
+</style>
+
+</head>
+<body>
+<div class="title">
+  <div class="eyebrow">Proposal · for discussion</div>
+  <h1>Companion Enterprise</h1>
+  <div class="subtitle">One AI assistant for the whole company, on our terms</div>
+  <div class="meta">
+    <span>6 October 2026</span>
+    <span>Working title</span>
+    <span>Builds on the Local LLM PC Companion</span>
+  </div>
+</div>
+
+<section>
+  <h2><span class="n">01</span>The goal</h2>
+  <p class="lede">One AI assistant that everyone in the company can use for everyday work: asking questions, getting answers from our own documents with the sources named (RAG), writing and reviewing code, and working with Jira and Outlook. It runs on AI models we host ourselves, or on approved outside providers such as OpenAI, Anthropic and Google, always under the company's rules and with a record of how it is used.</p>
+</section>
+
+<section>
+  <h2><span class="n">02</span>Where it comes from: the Local LLM PC Companion</h2>
+  <p>The Local LLM PC Companion is a working proof of concept built in-house. It runs open-weight AI models entirely on a laptop. It offers chat, answers questions about code, and has an agent that reads and writes project files, runs commands and checks its own work. Permission modes decide what the agent may do without asking, memory is managed automatically on long tasks, and everything is logged.</p>
+  <div class="stats">
+    <div class="stat"><b>91</b><span>tokens per second from a mid-size model on a laptop graphics card: many times faster than anyone reads</span></div>
+    <div class="stat"><b>3 s</b><span>to read a 12-page document</span></div>
+    <div class="stat"><b>13</b><span>tokens per second with no graphics card at all</span></div>
+    <div class="stat"><b>0</b><span>bytes sent outside the machine while web search is off</span></div>
+  </div>
+  <p class="caption-line">Measured on a laptop with a 12 GB graphics card, September 2026.</p>
+  <p>It proves that the core works, on modest hardware. What it lacks is what a company needs around it: today it serves one person, runs one model at a time, and lives on one PC.</p>
+</section>
+
+<section>
+  <h2><span class="n">03</span>What the enterprise version adds</h2>
+  <div class="adds">
+    <div><b>Company sign-in.</b> People use their Microsoft 365 account; teams and roles come from the company directory.</div>
+    <div><b>Many people, many models.</b> Several models served to everyone at once; servers are added or removed as demand changes.</div>
+    <div><b>Our models or outside providers.</b> Open-weight models on our own hardware, or OpenAI, Anthropic and Google through one gateway, behind the same rules.</div>
+    <div><b>Answers from our documents (RAG).</b> The assistant first finds the relevant passages in company, team or personal document collections, then answers from them and names its sources; each person only gets passages from documents they are allowed to open.</div>
+    <div><b>Jira and Outlook.</b> Each person connects their own account; sending an email or changing a ticket always asks first.</div>
+    <div><b>Tools that IT controls (MCP).</b> Plug-in tools are MCP servers, the open standard for connecting AI to other systems; IT adds or removes them and gives them to the teams that need them, and the system checks that a model can actually use a tool before offering it.</div>
+    <div><b>Guards and an audit log.</b> Rules on what may leave the company, approval before actions, spending limits, and a tamper-evident record of who asked what.</div>
+    <div><b>A desktop app and an admin dashboard.</b> An installable app for everyone, and a separate dashboard for the team that runs the service.</div>
+  </div>
+</section>
+
+<section>
+  <h2><span class="n">04</span>How it fits together</h2>
+  <figure>
+    <svg viewBox="0 0 1000 595" xmlns="http://www.w3.org/2000/svg" font-family="IBM Plex Sans, Segoe UI, sans-serif" role="img" aria-label="Architecture overview">
+      <defs>
+        <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5f6f86"/></marker>
+        <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker>
+        <style>
+          .box { fill: #ffffff; stroke: #c3ccd8; stroke-width: 1.3; }
+          .t { font-size: 15.5px; font-weight: 600; fill: #0b1a2c; }
+          .s { font-size: 13px; fill: #33425a; }
+          .cap { font-size: 11.5px; font-weight: 600; letter-spacing: 1.4px; fill: #5f6f86; }
+          .ln { stroke: #5f6f86; stroke-width: 1.4; fill: none; }
+        </style>
+      </defs>
+
+      <!-- company boundary -->
+      <rect x="262" y="14" width="723" height="456" rx="14" fill="#f5f7fa" stroke="#97a3b4" stroke-width="1.2" stroke-dasharray="6 5"/>
+      <text x="380" y="36" class="cap">COMPANY SERVERS · OUR OWN OR AWS</text>
+
+      <!-- people and software -->
+      <text x="15" y="36" class="cap">PEOPLE AND SOFTWARE</text>
+      <rect x="15" y="48" width="200" height="150" rx="10" class="box"/>
+      <text x="28" y="72" class="t">Desktop app</text>
+      <text x="28" y="92" class="s">chat and code screens</text>
+      <rect x="25" y="106" width="180" height="82" rx="8" fill="#d3f4e6" stroke="#059669" stroke-width="1.3"/>
+      <text x="36" y="128" class="t" style="font-size:14px; fill:#047857">Local tool runner</text>
+      <text x="36" y="148" class="s">files, commands and page</text>
+      <text x="36" y="166" class="s">preview on the user's PC</text>
+
+      <rect x="15" y="212" width="200" height="56" rx="10" class="box"/>
+      <text x="28" y="236" class="t">Browser</text>
+      <text x="28" y="256" class="s">same screens, no PC tools</text>
+
+      <rect x="15" y="282" width="200" height="56" rx="10" class="box"/>
+      <text x="28" y="306" class="t">Admin dashboard</text>
+      <text x="28" y="326" class="s">for the team running it</text>
+
+      <rect x="15" y="352" width="200" height="66" rx="10" class="box"/>
+      <text x="28" y="376" class="t">Other software</text>
+      <text x="28" y="396" class="s">OpenAI format + company key</text>
+
+      <!-- load balancer -->
+      <rect x="290" y="55" width="60" height="363" rx="10" class="box"/>
+      <text transform="translate(325 236) rotate(-90)" text-anchor="middle" class="t" style="font-size:14px">Load balancer · HTTPS</text>
+      <line x1="215" y1="75" x2="290" y2="75" class="ln" marker-end="url(#ah)"/>
+      <line x1="215" y1="240" x2="290" y2="240" class="ln" marker-end="url(#ah)"/>
+      <line x1="215" y1="310" x2="290" y2="310" class="ln" marker-end="url(#ah)"/>
+      <line x1="215" y1="385" x2="290" y2="385" class="ln" marker-end="url(#ah)"/>
+
+      <!-- device channel -->
+      <line x1="205" y1="150" x2="380" y2="150" stroke="#059669" stroke-width="2" stroke-dasharray="6 4" marker-start="url(#ahg)" marker-end="url(#ahg)"/>
+      <text x="223" y="128" style="font-size:11.5px; font-weight:600; fill:#047857">device</text>
+      <text x="223" y="142" style="font-size:11.5px; font-weight:600; fill:#047857">channel</text>
+
+      <!-- API servers -->
+      <rect x="380" y="48" width="250" height="170" rx="10" class="box"/>
+      <text x="395" y="72" class="t">API servers (1…n)</text>
+      <text x="395" y="96" class="s">• sign-in and permissions</text>
+      <text x="395" y="116" class="s">• settings and locks</text>
+      <text x="395" y="136" class="s">• model gateway</text>
+      <text x="395" y="156" class="s">• guards</text>
+      <text x="395" y="176" class="s">• streaming replies</text>
+      <text x="395" y="196" class="s">• audit log writer</text>
+      <line x1="350" y1="100" x2="380" y2="100" class="ln" marker-end="url(#ah)"/>
+
+      <!-- workers -->
+      <rect x="380" y="240" width="250" height="100" rx="10" class="box"/>
+      <text x="395" y="264" class="t">Workers (1…n)</text>
+      <text x="395" y="288" class="s">• agent runs</text>
+      <text x="395" y="308" class="s">• reading documents in (RAG)</text>
+      <text x="395" y="328" class="s">• scheduled jobs</text>
+      <line x1="505" y1="218" x2="505" y2="240" class="ln" marker-end="url(#ah)"/>
+
+      <!-- storage -->
+      <text x="660" y="36" class="cap" style="visibility:hidden">.</text>
+      <rect x="660" y="48" width="310" height="78" rx="10" class="box"/>
+      <text x="675" y="72" class="t">PostgreSQL + pgvector</text>
+      <text x="675" y="94" class="s">records, settings, audit log,</text>
+      <text x="675" y="112" class="s">document search (RAG)</text>
+      <rect x="660" y="138" width="310" height="62" rx="10" class="box"/>
+      <text x="675" y="162" class="t">Redis</text>
+      <text x="675" y="184" class="s">live streams between servers, counters</text>
+      <rect x="660" y="212" width="310" height="62" rx="10" class="box"/>
+      <text x="675" y="236" class="t">File storage</text>
+      <text x="675" y="258" class="s">S3, MinIO, or a folder on one machine</text>
+      <line x1="630" y1="88" x2="660" y2="88" class="ln" marker-end="url(#ah)"/>
+      <line x1="630" y1="170" x2="660" y2="170" class="ln" marker-end="url(#ah)"/>
+      <line x1="630" y1="258" x2="660" y2="258" class="ln" marker-end="url(#ah)"/>
+
+      <!-- our MCP servers -->
+      <rect x="660" y="288" width="310" height="54" rx="10" class="box"/>
+      <text x="675" y="311" class="t">Our MCP servers</text>
+      <text x="675" y="331" class="s">Outlook connector, internal tools</text>
+      <line x1="630" y1="318" x2="660" y2="318" class="ln" marker-end="url(#ah)"/>
+
+      <!-- model pools -->
+      <rect x="380" y="372" width="590" height="84" rx="10" class="box"/>
+      <text x="395" y="396" class="t">Model pools <tspan class="s" style="font-weight:400">· one per model; copies added and removed with demand</tspan></text>
+      <rect x="395" y="410" width="175" height="32" rx="16" fill="#edf1f6"/>
+      <text x="482" y="431" text-anchor="middle" class="s">Model A × 3 · vLLM</text>
+      <rect x="585" y="410" width="185" height="32" rx="16" fill="#edf1f6"/>
+      <text x="677" y="431" text-anchor="middle" class="s">Model B × 1 · llama.cpp</text>
+      <rect x="785" y="410" width="170" height="32" rx="16" fill="#edf1f6"/>
+      <text x="870" y="431" text-anchor="middle" class="s">Embedding model</text>
+      <line x1="505" y1="340" x2="505" y2="372" class="ln" marker-end="url(#ah)"/>
+
+      <!-- gateway trunk: API servers to pools and outside providers -->
+      <path d="M380,205 H366 V546 H380" class="ln" marker-end="url(#ah)"/>
+      <line x1="366" y1="414" x2="380" y2="414" class="ln" marker-end="url(#ah)"/>
+
+      <!-- outside -->
+      <text x="380" y="498" class="cap">OUTSIDE THE COMPANY</text>
+      <rect x="380" y="510" width="290" height="72" rx="10" class="box" style="stroke-dasharray:5 4"/>
+      <text x="395" y="534" class="t">Outside AI providers</text>
+      <text x="395" y="556" class="s">OpenAI · Anthropic · Google</text>
+      <rect x="690" y="510" width="280" height="72" rx="10" class="box" style="stroke-dasharray:5 4"/>
+      <text x="705" y="534" class="t">Outside services</text>
+      <text x="705" y="555" class="s">Jira Cloud (Atlassian's MCP server)</text>
+      <text x="705" y="573" class="s">Microsoft 365 mail (Graph)</text>
+      <path d="M970,315 H978 V546 H970" class="ln" marker-end="url(#ah)"/>
+    </svg>
+    <figcaption>People use the desktop app (or a browser). Company servers handle sign-in, rules, the AI models and the record of use, and grow by adding copies. Our own models run in pools on our GPUs; outside providers and services are reached only through the same rules. The green dashed line is the link that lets the coding agent work on files on the user's own PC, inside folders the user allowed.</figcaption>
+  </figure>
+
+  <h2 style="margin-top:12px"><span class="n">05</span>From proof of concept to company service</h2>
+  <table>
+    <thead><tr><th style="width:17%"></th><th style="width:38%">Local LLM PC Companion (today)</th><th>Companion Enterprise</th></tr></thead>
+    <tbody>
+      <tr><td>People</td><td class="plain">One person</td><td class="plain">Everyone, with company sign-in, teams and roles</td></tr>
+      <tr><td>Models</td><td class="plain">One at a time, on that PC</td><td class="plain">Several at once, shared, scaling with demand</td></tr>
+      <tr><td>Where it runs</td><td class="plain">One laptop</td><td class="plain">Our own servers or AWS; a single server for the pilot</td></tr>
+      <tr><td>AI providers</td><td class="plain">Our own models only</td><td class="plain">Our own models, plus OpenAI, Anthropic and Google through one gateway</td></tr>
+      <tr><td>Documents</td><td class="plain">Keyword search in the files of one project</td><td class="plain">RAG over company, team and personal collections, with access rights and citations</td></tr>
+      <tr><td>Tools</td><td class="plain">Built in</td><td class="plain">Plug-in tools (MCP servers) managed by IT per team, including Jira and Outlook</td></tr>
+      <tr><td>Records</td><td class="plain">Logs on the PC</td><td class="plain">A tamper-evident audit log with retention rules</td></tr>
+      <tr><td>App</td><td class="plain">A page in the browser</td><td class="plain">A desktop app, plus an admin dashboard</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="avoid">
+  <h2><span class="n">06</span>The plan</h2>
+  <div class="stages">
+    <div><b>Foundations</b><span>Company sign-in, users and teams, a shared database, several models at once, outside providers.</span></div>
+    <div><b>Everyday use</b><span>The desktop app, plug-in tools (MCP), Jira and Outlook.</span></div>
+    <div class="pilot"><b>Pilot</b><span>RAG: answers from that department's documents. One department, 20 to 30 people, on one server.</span></div>
+    <div><b>Company-ready</b><span>Guards and audit complete, many servers with automatic scaling, a security review.</span></div>
+  </div>
+  <p>Each step ends with a review before the next one starts. <b>Where we are (6 October 2026):</b> the Companion has been copied as the base with all its existing checks passing, and every part of its code has been mapped onto this design. Time estimates follow from that map.</p>
+</section>
+
+<section class="avoid">
+  <h2><span class="n">07</span>What we need from the company</h2>
+  <ul class="needs">
+    <li>A Microsoft Entra ID app registration, for sign-in and Outlook</li>
+    <li>Accounts with the outside providers we want to offer</li>
+    <li>One GPU server (or the AWS equivalent) and a pilot department</li>
+    <li>A code-signing certificate for the desktop app</li>
+    <li>A decision on hosting: our own servers or AWS</li>
+  </ul>
+</section>
+
+</body>
+</html>

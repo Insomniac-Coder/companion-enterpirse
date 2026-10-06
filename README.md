@@ -1,4 +1,13 @@
-# Local LLM PC Companion
+# Companion Enterprise
+
+The company version of the [Local LLM PC Companion](https://github.com/Insomniac-Coder/local-llm-companion),
+in progress: many users and models, servers that scale, local models or OpenAI / Anthropic / Google
+behind one gateway, document search, MCP plugins, Jira and Outlook, guards and an audit log, and a
+desktop app. The plan and the architecture draft are in `docs/enterprise/` (start with
+`Companion-Enterprise-Draft-Plan.pdf`).
+
+Until the first enterprise phase lands, the code is the Companion as forked on 2026-10-06, and the
+instructions below run it the way the Companion runs: one person, one PC.
 
 A privacy-first AI assistant that runs entirely on your PC: chat, code questions and agent tasks on
 local GGUF models, served by [llama.cpp](https://github.com/ggml-org/llama.cpp). No cloud API key is
@@ -14,12 +23,12 @@ More documentation: `docs/ARCHITECTURE.md`, `docs/PERFORMANCE.md`, and the audit
 ## Layout
 
 ```
-local-llm-companion/
+companion-enterprise/
   backend/    Rust (Axum) API: chat, models, tools, agent, search, vision, documents, memory
   frontend/   React + TypeScript + Vite UI, served by the backend
   runtime/    llama.cpp.lock.json (the pinned commit); bin/ is built here (not in Git)
   scripts/    build-runtime.ps1 / build-runtime.sh, benchmarks, backups, end-to-end checks
-  models/     your GGUF models, one folder per model; two come with the repository (Git LFS); modeldownloader.py
+  models/     your GGUF models, one folder per model (none are kept in Git); modeldownloader.py
   plugins/    plugin manifests
   docs/       architecture, performance, research and validation records
   run.ps1     build (first run) and start the app on Windows (PowerShell)
@@ -67,8 +76,8 @@ macOS builds Metal automatically. Start the app with `run.sh` (see "Run" below).
 ## 2. Get the project
 
 ```powershell
-git clone https://github.com/Insomniac-Coder/local-llm-companion.git
-cd local-llm-companion
+git clone https://github.com/Insomniac-Coder/companion-enterpirse.git companion-enterprise
+cd companion-enterprise
 ```
 
 Run the remaining commands from this directory.
@@ -123,22 +132,7 @@ To use a llama.cpp you built or installed elsewhere, set `COMPANION_LLAMA_SERVER
 
 ## 4. Add models
 
-Two models come with the repository, split into parts under 2 GB and stored with Git LFS: Gemma 4 E4B
-(`models/gemma-4-e4b-it-qat/`, 4.2 GB) and Gemma 4 E2B (`models/gemma-4-e2b-it/`, 3.1 GB). Install
-[Git LFS](https://git-lfs.com) (`git lfs install`) before cloning, or Git fetches small placeholder files
-instead of the models. Every download counts against the repository owner's monthly Git LFS bandwidth, so
-fetch only the model you need:
-
-```
-git clone -c "lfs.fetchinclude=models/gemma-4-e4b-it-qat/*" <repository URL>
-git lfs pull --include "models/gemma-4-e2b-it/*"
-```
-
-The first line clones with only the E4B; the second, run later inside the clone, fetches the E2B. In an
-existing clone, `git config lfs.fetchinclude "models/gemma-4-e4b-it-qat/*"` before `git pull` does the
-same. The app does not list a model whose folder holds only placeholders.
-
-Put each model in its own folder under `models/`, e.g. `models/my-model/my-model-Q4_K_M.gguf`.
+Model weights are not kept in this repository. Put each model in its own folder under `models/`, e.g. `models/my-model/my-model-Q4_K_M.gguf`.
 Split GGUF files need all their parts in the same folder; a vision model's projector (`mmproj-*.gguf`)
 goes in the same folder as its weights.
 

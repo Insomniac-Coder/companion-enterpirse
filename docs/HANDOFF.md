@@ -1,3 +1,20 @@
+# Companion Enterprise — start here
+
+This repository is the company version of the Local LLM PC Companion, forked on 2026-10-06 from the
+Companion's `main` plus its uncommitted tool fixes (decision 72). The history was rewritten once at the
+fork to drop the model weights (Git LFS); commit ids differ from the Companion's.
+
+- **The plan:** `docs/enterprise/Companion-Enterprise-Draft-Plan.pdf` (architecture + action plan, initial
+  draft; source and print script in `docs/enterprise/plan-source/`). Phases 0-9; each phase ends with a
+  review by the owner before the next one starts.
+- **Owner decisions so far:** the coding agent's loop runs on the server and its file/command tools run on
+  the user's PC through the desktop app; hosting is undecided (own servers or AWS), so the design targets
+  Kubernetes plus a one-machine version that must also run on a Windows laptop; Outlook first, then Gmail;
+  Jira Cloud; "local" means the server installed on the laptop (no separate offline mode in the app).
+- **State:** Phase 0 (fork) done; the Phase 1 code map runs next (read-only agents, at most 2 at a time;
+  results in `docs/enterprise/phase1-map/`).
+- Everything below this section is the Companion's own handoff, kept as it was at the fork.
+
 # Handoff — start here
 
 Last updated 2026-09-16 night, mid-audit. Everything below the "Uncommitted work" heading is **not

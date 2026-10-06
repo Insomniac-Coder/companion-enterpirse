@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Companion Enterprise: architecture and action plan (initial draft)</title>
+<style>
+/* Fonts are local files (fonts/), so printing never depends on the network. */
+@font-face { font-family: "Bricolage Grotesque"; font-weight: 500 800; src: url(fonts/bricolage.woff2) format("woff2"); }
+@font-face { font-family: "IBM Plex Sans"; font-weight: 100 700; src: url(fonts/plexsans.woff2) format("woff2"); }
+@font-face { font-family: "IBM Plex Sans"; font-style: italic; font-weight: 400; src: url(fonts/plexsans-italic.woff2) format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; font-weight: 400; src: url(fonts/plexmono-400.woff2) format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; font-weight: 500; src: url(fonts/plexmono-500.woff2) format("woff2"); }
+:root {
+  --bg: #f5f7fa; --paper: #ffffff; --wash: #edf1f6; --line: #dce2ea; --line-2: #c3ccd8;
+  --ink: #0b1a2c; --ink-2: #33425a; --muted: #5f6f86; --faint: #97a3b4;
+  --ours: #059669; --ours-ink: #047857; --ours-soft: #d3f4e6;
+  --warn: #b42318; --warn-soft: #fde8e6; --amber-soft: #fef3c7; --amber-ink: #92400e;
+  --display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+  --sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", Consolas, monospace;
+}
+@page {
+  size: A4;
+  margin: 15mm 15mm 17mm 15mm;
+  @bottom-left { content: "Companion Enterprise · Architecture and action plan · Initial draft, 6 October 2026"; font-family: "IBM Plex Sans", "Segoe UI", sans-serif; font-size: 7.5pt; color: #97a3b4; }
+  @bottom-right { content: counter(page) " / " counter(pages); font-family: "IBM Plex Sans", "Segoe UI", sans-serif; font-size: 7.5pt; color: #97a3b4; }
+}
+* { box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+html, body { margin: 0; padding: 0; background: var(--paper); }
+body { font-family: var(--sans); font-size: 9.4pt; line-height: 1.5; color: var(--ink-2); }
+h1, h2, h3 { font-family: var(--display); color: var(--ink); margin: 0; line-height: 1.15; }
+h1 { font-size: 30pt; font-weight: 800; letter-spacing: -0.01em; }
+h2 { font-size: 15.5pt; font-weight: 700; margin: 0 0 8px; display: flex; gap: 10px; align-items: baseline; break-after: avoid; }
+h2 .n { color: var(--ours); font-size: 12pt; font-weight: 700; min-width: 20px; }
+h3 { font-size: 10.6pt; font-weight: 700; margin: 12px 0 4px; break-after: avoid; }
+p { margin: 0 0 7px; }
+b, strong { color: var(--ink); font-weight: 600; }
+ul, ol { margin: 0 0 8px; padding-left: 18px; }
+li { margin: 0 0 3px; }
+code { font-family: var(--mono); font-size: 8.3pt; background: var(--wash); padding: 0 3px; border-radius: 3px; color: var(--ink); }
+section { margin: 0 0 18px; }
+.page-break { break-before: page; }
+.avoid { break-inside: avoid; }
+
+/* title block */
+.eyebrow { font-size: 8pt; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ours-ink); margin-bottom: 6px; }
+.title { border-bottom: 2px solid var(--ink); padding-bottom: 12px; margin-bottom: 14px; }
+.subtitle { font-family: var(--display); font-size: 14pt; font-weight: 600; color: var(--ink-2); margin-top: 4px; }
+.meta { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 10px; font-size: 8.3pt; color: var(--muted); }
+.meta span::before { content: "■ "; color: var(--ours); font-size: 7pt; }
+.lede { font-size: 10.6pt; line-height: 1.55; color: var(--ink); margin-bottom: 12px; }
+
+/* cards */
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; margin: 6px 0 14px; }
+.card { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; break-inside: avoid; }
+.card h3 { margin-top: 0; font-size: 10pt; }
+.card ul { padding-left: 15px; margin: 4px 0 0; font-size: 8.7pt; }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.keep { border-left: 3px solid var(--ours); }
+.change { border-left: 3px solid var(--amber-ink); }
+.note { background: var(--ours-soft); border-radius: 8px; padding: 8px 12px; font-size: 8.8pt; color: var(--ink); margin: 8px 0 10px; break-inside: avoid; }
+.note b { color: var(--ours-ink); }
+.warnnote { background: var(--amber-soft); border-radius: 8px; padding: 8px 12px; font-size: 8.8pt; color: var(--ink); margin: 8px 0 10px; break-inside: avoid; }
+
+/* tables */
+table { width: 100%; border-collapse: collapse; font-size: 8.6pt; line-height: 1.42; margin: 4px 0 10px; }
+thead { display: table-header-group; }
+th { text-align: left; font-weight: 600; color: var(--ink); background: var(--wash); padding: 5px 7px; border-bottom: 1px solid var(--line-2); }
+td { padding: 5px 7px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr { break-inside: avoid; }
+td:first-child { color: var(--ink); font-weight: 600; }
+td.plain { font-weight: 400; color: var(--ink-2); }
+.tag { display: inline-block; font-size: 7.4pt; font-weight: 600; padding: 1px 6px; border-radius: 10px; white-space: nowrap; }
+.tag.ok { background: var(--ours-soft); color: var(--ours-ink); }
+.tag.open { background: var(--amber-soft); color: var(--amber-ink); }
+.tag.assumed { background: var(--wash); color: var(--muted); }
+
+/* figure */
+figure { margin: 4px 0 8px; break-inside: avoid; }
+figure svg { width: 100%; height: auto; display: block; }
+figcaption { font-size: 8.2pt; color: var(--muted); margin-top: 4px; }
+
+/* steps */
+ol.steps { list-style: none; padding: 0; counter-reset: s; margin: 4px 0 10px; }
+ol.steps li { counter-increment: s; position: relative; padding-left: 26px; margin-bottom: 5px; break-inside: avoid; }
+ol.steps li::before { content: counter(s); position: absolute; left: 0; top: 1px; width: 17px; height: 17px; border-radius: 50%; background: var(--ink); color: #fff; font-size: 7.6pt; font-weight: 600; display: flex; align-items: center; justify-content: center; }
+ol.steps.green li::before { background: var(--ours); }
+
+/* roadmap */
+.roadmap { display: grid; grid-template-columns: repeat(10, 1fr); gap: 4px; margin: 8px 0 6px; }
+.ph { background: var(--wash); border-radius: 6px; padding: 6px 5px 7px; text-align: center; font-size: 7.4pt; line-height: 1.25; color: var(--ink); min-height: 50px; }
+.ph b { display: block; font-family: var(--display); font-size: 12pt; color: var(--ours-ink); margin-bottom: 2px; }
+.ph.pilot { background: var(--ours); color: #fff; }
+.ph.pilot b { color: #fff; }
+.roadlegend { font-size: 8pt; color: var(--muted); margin-bottom: 10px; }
+
+dl.gloss { display: grid; grid-template-columns: 30mm 1fr; gap: 3px 12px; font-size: 8.6pt; margin: 4px 0; }
+dl.gloss dt { font-weight: 600; color: var(--ink); }
+dl.gloss dd { margin: 0; }
+</style>
+</head>
+<body>
+
+<!-- ============================================================ PAGE 1 -->
+<div class="title">
+  <div class="eyebrow">Initial draft for discussion</div>
+  <h1>Companion Enterprise</h1>
+  <div class="subtitle">Architecture and action plan</div>
+  <div class="meta">
+    <span>6 October 2026</span>
+    <span>Working title</span>
+    <span>Built on the Local LLM PC Companion</span>
+  </div>
+</div>
+
+<p class="lede">We will turn the Local LLM PC Companion, today a one-person app on one PC, into a shared company service. People use a desktop app, signed in with their company account. A server, which can run on one machine or across many, hosts our own open-weight models and can also pass requests to OpenAI, Anthropic or Google. It answers from company documents with citations, connects to Jira and Outlook, gives each team only the tools it is allowed, and records who asked what in an audit log. A separate dashboard lets the team running it manage models, users, tools, rules and costs.</p>
+
+<div class="cards">
+  <div class="card">
+    <h3>For people using it</h3>
+    <ul>
+      <li>Install an app, sign in with the company account</li>
+      <li>Pick from the models the company approved</li>
+      <li>Switch on the plugins their team is allowed</li>
+      <li>Connect their own Jira and Outlook</li>
+      <li>The coding agent works on files on their own PC</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3>For the team running it</h3>
+    <ul>
+      <li>One dashboard: models, providers, users and groups, tools, documents, rules, audit log, usage</li>
+      <li>Settings set and locked centrally</li>
+      <li>Add a model or a provider without touching the apps</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h3>For the company</h3>
+    <ul>
+      <li>With our own models, nothing leaves the building</li>
+      <li>Outside providers only through our rules</li>
+      <li>A complete, tamper-evident audit trail</li>
+      <li>Costs visible per person and team</li>
+      <li>Grows by adding servers</li>
+    </ul>
+  </div>
+</div>
+
+<section class="avoid">
+  <h2><span class="n">01</span>Decisions so far</h2>
+  <table>
+    <thead><tr><th style="width:24%">Topic</th><th>Decision</th><th style="width:13%">Status</th></tr></thead>
+    <tbody>
+      <tr><td>Starting point</td><td class="plain">A copy of the Local LLM PC Companion, including its latest tool fixes, becomes the new project.</td><td><span class="tag ok">Decided</span></td></tr>
+      <tr><td>Coding agent</td><td class="plain">The agent's thinking runs on the server; reading and writing files and running commands happen on the user's PC, through the desktop app.</td><td><span class="tag ok">Decided</span></td></tr>
+      <tr><td>Where it runs</td><td class="plain">Our own servers or AWS. The design covers both, plus a one-machine version.</td><td><span class="tag open">Open</span></td></tr>
+      <tr><td>Running it on a laptop</td><td class="plain">Install the same server on the laptop and point the app at it. No separate offline mode inside the app.</td><td><span class="tag ok">Decided</span></td></tr>
+      <tr><td>Email</td><td class="plain">Outlook first; Gmail later.</td><td><span class="tag ok">Decided</span></td></tr>
+      <tr><td>Jira</td><td class="plain">Jira Cloud.</td><td><span class="tag ok">Decided</span></td></tr>
+      <tr><td>Company sign-in</td><td class="plain">Microsoft Entra ID (the company's Microsoft 365 accounts), following from Outlook.</td><td><span class="tag assumed">To confirm</span></td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="avoid">
+  <h2><span class="n">02</span>Where we start</h2>
+  <p>The Companion is one program on one PC: a Rust backend that does the work, React screens in the browser, a llama.cpp model server it starts and tunes itself, and one database file. About 34,000 lines of backend code (48,000 with tests), 12,000 lines of screens, and more than 600 automated tests.</p>
+  <div class="two">
+    <div class="card keep">
+      <h3>What we keep</h3>
+      <ul>
+        <li>The coding agent: reads, writes, runs and checks project files, and stops itself when it is stuck in a loop</li>
+        <li>Permission modes: ask, accept edits, plan, auto</li>
+        <li>The test that checks whether a model can really call tools and write files intact</li>
+        <li>Memory management for long tasks</li>
+        <li>llama.cpp tuning: memory fit and per-model calibration</li>
+        <li>Full logs and session export</li>
+      </ul>
+    </div>
+    <div class="card change">
+      <h3>What has to change</h3>
+      <ul>
+        <li>Nothing knows who is asking: there is one user</li>
+        <li>One loaded model at a time</li>
+        <li>One database file on one PC</li>
+        <li>One settings file shared by everything</li>
+        <li>The agent's tools assume the files are on the same machine as the server</li>
+        <li>It only accepts connections from the same PC</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ ARCHITECTURE -->
+<section>
+  <h2><span class="n">03</span>Architecture at a glance</h2>
+  <figure>
+    <svg viewBox="0 0 1000 595" xmlns="http://www.w3.org/2000/svg" font-family="IBM Plex Sans, Segoe UI, sans-serif" role="img" aria-label="Architecture overview">
+      <defs>
+        <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#5f6f86"/></marker>
+        <marker id="ahg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker>
+        <style>
+          .box { fill: #ffffff; stroke: #c3ccd8; stroke-width: 1.3; }
+          .t { font-size: 15.5px; font-weight: 600; fill: #0b1a2c; }
+          .s { font-size: 13px; fill: #33425a; }
+          .cap { font-size: 11.5px; font-weight: 600; letter-spacing: 1.4px; fill: #5f6f86; }
+          .ln { stroke: #5f6f86; stroke-width: 1.4; fill: none; }
+        </style>
+      </defs>
+
+      <!-- company boundary -->
+      <rect x="262" y="14" width="723" height="456" rx="14" fill="#f5f7fa" stroke="#97a3b4" stroke-width="1.2" stroke-dasharray="6 5"/>
+      <text x="380" y="36" class="cap">COMPANY SERVERS · OUR OWN OR AWS</text>
+
+      <!-- people and software -->
+      <text x="15" y="36" class="cap">PEOPLE AND SOFTWARE</text>
+      <rect x="15" y="48" width="200" height="150" rx="10" class="box"/>
+      <text x="28" y="72" class="t">Desktop app</text>
+      <text x="28" y="92" class="s">chat and code screens</text>
+      <rect x="25" y="106" width="180" height="82" rx="8" fill="#d3f4e6" stroke="#059669" stroke-width="1.3"/>
+      <text x="36" y="128" class="t" style="font-size:14px; fill:#047857">Local tool runner</text>
+      <text x="36" y="148" class="s">files, commands and page</text>
+      <text x="36" y="166" class="s">preview on the user's PC</text>
+
+      <rect x="15" y="212" width="200" height="56" rx="10" class="box"/>
+      <text x="28" y="236" class="t">Browser</text>
+      <text x="28" y="256" class="s">same screens, no PC tools</text>
+
+      <rect x="15" y="282" width="200" height="56" rx="10" class="box"/>
+      <text x="28" y="306" class="t">Admin dashboard</text>
+      <text x="28" y="326" class="s">for the team running it</text>
+
+      <rect x="15" y="352" width="200" height="66" rx="10" class="box"/>
+      <text x="28" y="376" class="t">Other software</text>
+      <text x="28" y="396" class="s">OpenAI format + company key</text>
+
+      <!-- load balancer -->
+      <rect x="290" y="55" width="60" height="363" rx="10" class="box"/>
+      <text transform="translate(325 236) rotate(-90)" text-anchor="middle" class="t" style="font-size:14px">Load balancer · HTTPS</text>
+      <line x1="215" y1="75" x2="290" y2="75" class="ln" marker-end="url(#ah)"/>
+      <line x1="215" y1="240" x2="290" y2="240" class="ln" marker-end="url(#ah)"/>
+      <line x1="215" y1="310" x2="290" y2="310" class="ln" marker-end="url(#ah)"/>
+      <line x1="215" y1="385" x2="290" y2="385" class="ln" marker-end="url(#ah)"/>
+
+      <!-- device channel -->
+      <line x1="205" y1="150" x2="380" y2="150" stroke="#059669" stroke-width="2" stroke-dasharray="6 4" marker-start="url(#ahg)" marker-end="url(#ahg)"/>
+      <text x="223" y="128" style="font-size:11.5px; font-weight:600; fill:#047857">device</text>
+      <text x="223" y="142" style="font-size:11.5px; font-weight:600; fill:#047857">channel</text>
+
+      <!-- API servers -->
+      <rect x="380" y="48" width="250" height="170" rx="10" class="box"/>
+      <text x="395" y="72" class="t">API servers (1…n)</text>
+      <text x="395" y="96" class="s">• sign-in and permissions</text>
+      <text x="395" y="116" class="s">• settings and locks</text>
+      <text x="395" y="136" class="s">• model gateway</text>
+      <text x="395" y="156" class="s">• guards</text>
+      <text x="395" y="176" class="s">• streaming replies</text>
+      <text x="395" y="196" class="s">• audit log writer</text>
+      <line x1="350" y1="100" x2="380" y2="100" class="ln" marker-end="url(#ah)"/>
+
+      <!-- workers -->
+      <rect x="380" y="240" width="250" height="100" rx="10" class="box"/>
+      <text x="395" y="264" class="t">Workers (1…n)</text>
+      <text x="395" y="288" class="s">• agent runs</text>
+      <text x="395" y="308" class="s">• reading documents in</text>
+      <text x="395" y="328" class="s">• scheduled jobs</text>
+      <line x1="505" y1="218" x2="505" y2="240" class="ln" marker-end="url(#ah)"/>
+
+      <!-- storage -->
+      <text x="660" y="36" class="cap" style="visibility:hidden">.</text>
+      <rect x="660" y="48" width="310" height="78" rx="10" class="box"/>
+      <text x="675" y="72" class="t">PostgreSQL + pgvector</text>
+      <text x="675" y="94" class="s">records, settings, audit log,</text>
+      <text x="675" y="112" class="s">document search</text>
+      <rect x="660" y="138" width="310" height="62" rx="10" class="box"/>
+      <text x="675" y="162" class="t">Redis</text>
+      <text x="675" y="184" class="s">live streams between servers, counters</text>
+      <rect x="660" y="212" width="310" height="62" rx="10" class="box"/>
+      <text x="675" y="236" class="t">File storage</text>
+      <text x="675" y="258" class="s">S3, MinIO, or a folder on one machine</text>
+      <line x1="630" y1="88" x2="660" y2="88" class="ln" marker-end="url(#ah)"/>
+      <line x1="630" y1="170" x2="660" y2="170" class="ln" marker-end="url(#ah)"/>
+      <line x1="630" y1="258" x2="660" y2="258" class="ln" marker-end="url(#ah)"/>
+
+      <!-- our MCP servers -->
+      <rect x="660" y="288" width="310" height="54" rx="10" class="box"/>
+      <text x="675" y="311" class="t">Our MCP servers</text>
+      <text x="675" y="331" class="s">Outlook connector, internal tools</text>
+      <line x1="630" y1="318" x2="660" y2="318" class="ln" marker-end="url(#ah)"/>
+
+      <!-- model pools -->
+      <rect x="380" y="372" width="590" height="84" rx="10" class="box"/>
+      <text x="395" y="396" class="t">Model pools <tspan class="s" style="font-weight:400">· one per model; copies added and removed with demand</tspan></text>
+      <rect x="395" y="410" width="175" height="32" rx="16" fill="#edf1f6"/>
+      <text x="482" y="431" text-anchor="middle" class="s">Model A × 3 · vLLM</text>
+      <rect x="585" y="410" width="185" height="32" rx="16" fill="#edf1f6"/>
+      <text x="677" y="431" text-anchor="middle" class="s">Model B × 1 · llama.cpp</text>
+      <rect x="785" y="410" width="170" height="32" rx="16" fill="#edf1f6"/>
+      <text x="870" y="431" text-anchor="middle" class="s">Embedding model</text>
+      <line x1="505" y1="340" x2="505" y2="372" class="ln" marker-end="url(#ah)"/>
+
+      <!-- gateway trunk: API servers to pools and outside providers -->
+      <path d="M380,205 H366 V546 H380" class="ln" marker-end="url(#ah)"/>
+      <line x1="366" y1="414" x2="380" y2="414" class="ln" marker-end="url(#ah)"/>
+
+      <!-- outside -->
+      <text x="380" y="498" class="cap">OUTSIDE THE COMPANY</text>
+      <rect x="380" y="510" width="290" height="72" rx="10" class="box" style="stroke-dasharray:5 4"/>
+      <text x="395" y="534" class="t">Outside AI providers</text>
+      <text x="395" y="556" class="s">OpenAI · Anthropic · Google</text>
+      <rect x="690" y="510" width="280" height="72" rx="10" class="box" style="stroke-dasharray:5 4"/>
+      <text x="705" y="534" class="t">Outside services</text>
+      <text x="705" y="555" class="s">Jira Cloud (Atlassian's MCP server)</text>
+      <text x="705" y="573" class="s">Microsoft 365 mail (Graph)</text>
+      <path d="M970,315 H978 V546 H970" class="ln" marker-end="url(#ah)"/>
+    </svg>
+    <figcaption>The green dashed line is the <b>device channel</b>: when an agent run needs to read a file or run a command, the server sends the request down this live connection, and the desktop app does it on the user's PC, inside folders the user allowed, then sends the result back. Dashed boxes are outside the company.</figcaption>
+  </figure>
+
+  <h3>The pieces</h3>
+  <table>
+    <thead><tr><th style="width:19%">Piece</th><th>What it does</th><th style="width:33%">Built from</th></tr></thead>
+    <tbody>
+      <tr><td>Desktop app</td><td class="plain">Chat and code screens; saved servers, connection test, sign-in; runs file and command tools on the user's PC</td><td class="plain">Today's React screens in Tauri; the Companion's file, command and preview tools move into a shared library the app uses</td></tr>
+      <tr><td>Admin dashboard</td><td class="plain">Models, providers, users and groups, settings and locks, plugins, documents, rules, audit log, usage</td><td class="plain">New React web app sharing the same UI parts</td></tr>
+      <tr><td>API servers</td><td class="plain">Sign-in, permission checks, settings, model gateway, guards, streaming replies, audit records. Keep nothing in their own memory, so copies can be added freely</td><td class="plain">The Companion's backend, reworked</td></tr>
+      <tr><td>Workers</td><td class="plain">Agent runs, reading documents into the search index, scheduled jobs</td><td class="plain">The same program in a second role: one program to build and ship</td></tr>
+      <tr><td>Model pools</td><td class="plain">Each model runs as a group of copies; copies are added or removed with demand</td><td class="plain">llama.cpp (any machine, even without a GPU) or vLLM (many users on large GPU servers)</td></tr>
+      <tr><td>Shared storage</td><td class="plain">Everything that must last, document search, live streams between servers, files</td><td class="plain">PostgreSQL + pgvector, Redis (only with 2+ servers), S3 / MinIO / a folder</td></tr>
+    </tbody>
+  </table>
+  <div class="note"><b>Simplified on purpose.</b> One company per installation (serving several companies from one installation is not planned). One backend program with two roles instead of many small services. Background jobs are queued in PostgreSQL itself, with no separate queue product until measurements say otherwise.</div>
+</section>
+
+<!-- ============================================================ FLOWS -->
+<section>
+  <h2><span class="n">04</span>How a request travels</h2>
+  <div class="two">
+    <div>
+      <h3 style="margin-top:0">A chat message</h3>
+      <ol class="steps">
+        <li>The app sends the message with the person's sign-in token. The server knows who they are, their groups and their settings.</li>
+        <li>Checks: is this model allowed for them, and is there budget left?</li>
+        <li>If document search is on, it finds passages, only from documents this person may open.</li>
+        <li>It builds the request with the conversation's start kept unchanged, so the model does not re-read it (the Companion's speed trick).</li>
+        <li>If the model is outside the company, the request is scanned for secrets and personal data, and collections marked "never send outside" are left out.</li>
+        <li>The same conversation always goes to the same copy of a local model, so that copy reuses what it already read.</li>
+        <li>The reply streams back; if the person is connected to another server, Redis carries it across.</li>
+        <li>An audit record and the usage count are written.</li>
+      </ol>
+    </div>
+    <div>
+      <h3 style="margin-top:0">A coding-agent task</h3>
+      <ol class="steps green">
+        <li>The user starts a task in the desktop app on a folder of their PC.</li>
+        <li>A worker takes the task and runs the Companion's agent loop: ask the model, carry out its next step, repeat.</li>
+        <li>Steps that touch the PC (read or write a file, run a command, preview a page) go to the app over the device channel. The app checks the folder is allowed, asks the user when the mode requires it, does the work and returns the result.</li>
+        <li>Steps that live on the server (document search, Jira, Outlook, web search) run in the worker.</li>
+        <li>The host's own looks at the project (project summary, instructions file, git status, notes) also go through the app.</li>
+        <li>If the app disconnects, the task pauses and waits instead of failing.</li>
+        <li>Every step is recorded on the server.</li>
+      </ol>
+    </div>
+  </div>
+
+  <h2 style="margin-top:14px"><span class="n">05</span>People, sign-in and settings</h2>
+  <p>People sign in with their company account through Microsoft Entra ID, so the server never stores passwords, and groups come from the company directory, so joining or leaving a team takes effect without extra work. Other software uses API keys issued in the dashboard.</p>
+  <table>
+    <thead><tr><th style="width:19%">Role</th><th>Can do</th></tr></thead>
+    <tbody>
+      <tr><td>User</td><td class="plain">Chat, run tasks, use approved models and plugins, connect their own accounts, see their own history</td></tr>
+      <tr><td>Team admin</td><td class="plain">Manage their team's documents, plugins and limits within what the platform admin allows</td></tr>
+      <tr><td>Platform admin</td><td class="plain">Everything in the dashboard: models, providers, servers, rules, company-wide settings</td></tr>
+      <tr><td>Auditor</td><td class="plain">Read and export the audit log; cannot change anything</td></tr>
+    </tbody>
+  </table>
+  <p><b>Settings have three levels:</b> a company default, an optional override for a group, and the user's own choice. Any setting can be locked by the admin; a locked setting shows as locked in the app with the reason, and the server enforces it as well.</p>
+  <table>
+    <thead><tr><th style="width:50%">Stays with the user (unless locked)</th><th>Moves to the admin dashboard</th></tr></thead>
+    <tbody>
+      <tr><td class="plain">Theme, density, reduce motion, shortcuts, language</td><td class="plain">Performance and tuning: threads, GPU layers, cache precision, batch sizes, speculative decoding, context size</td></tr>
+      <tr><td class="plain">Which model to use, from the allowed list</td><td class="plain">Which models exist, downloads, calibration</td></tr>
+      <tr><td class="plain">Reasoning on or off</td><td class="plain">Web search provider and its keys, network policy</td></tr>
+      <tr><td class="plain">Permission mode, up to the admin's maximum</td><td class="plain">Allowed and blocked folders, file size limits, command time limit</td></tr>
+      <tr><td class="plain">Which allowed plugins are switched on</td><td class="plain">What is recorded, log level, how long records are kept</td></tr>
+      <tr><td class="plain">Their own Jira and Outlook connections, saved servers</td><td class="plain">Memory management defaults for long tasks</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ MODELS, TOOLS -->
+<section>
+  <h2><span class="n">06</span>Models: our own and outside providers</h2>
+  <ul>
+    <li><b>One model list.</b> Each entry is either a local model or a provider's model, with: engine, the smallest and largest number of copies, which groups may use it, and its abilities.</li>
+    <li><b>Two engines for our own models.</b> llama.cpp runs anywhere, including laptops and machines without a GPU, and keeps the Companion's tuning. vLLM serves many people at once from large GPU servers (Linux).</li>
+    <li><b>Outside providers through two small adapters.</b> One speaks the OpenAI format, which covers OpenAI, Azure OpenAI, vLLM, llama.cpp and Google Gemini's compatible endpoint; one speaks Anthropic's own format, which handles tools better for Claude.</li>
+    <li><b>Linking a provider takes four steps in the dashboard:</b> add it (type, address, key), test the connection, pick which of its models to offer, and give them company names. A name such as "company-default" can point at any model and be moved later without touching the apps.</li>
+    <li><b>Abilities are measured, not assumed.</b> Today the Companion tests each model once: can it call a tool, and can it write a file intact? Every model gets this test, outside ones included, and the result is recorded with its context size, vision and reasoning.</li>
+    <li><b>Limits.</b> Tokens and money per person, team and model; usage shown in the dashboard.</li>
+  </ul>
+
+  <h2 style="margin-top:14px"><span class="n">07</span>Tools, plugins and MCP</h2>
+  <p>MCP is an open standard for connecting AI apps to tools. An MCP server is a small program or web address that offers a set of tools, such as "search Jira issues" or "draft an email". Many services now publish one.</p>
+  <ul>
+    <li><b>One plugin format.</b> A plugin is an MCP server plus a short description: its name, each tool's risk (reads, writes, or dangerous), what it needs from the model, and which account it needs. The Companion's own file and command tools are described the same way.</li>
+    <li><b>Three levels of control.</b> The admin's catalogue decides which groups get each plugin, which actions always need approval, and whether it may be used with outside models. Users switch on what they are allowed. Each request offers the model only tools that are switched on, allowed, and usable by that model.</li>
+    <li><b>Can this model use it?</b> Each plugin states what it needs (tool calling, writing, a minimum context, vision). A plugin the chosen model cannot use is greyed out with the reason, and the server refuses it anyway. Models with no tool support get chat and reading only.</li>
+    <li><b>Adding one.</b> Remote MCP servers are added by address. MCP servers that run as programs are installed by admins only.</li>
+  </ul>
+
+  <h2 style="margin-top:14px"><span class="n">08</span>Jira and Outlook</h2>
+  <table>
+    <thead><tr><th style="width:17%">Service</th><th>How we connect</th></tr></thead>
+    <tbody>
+      <tr><td>Jira Cloud</td><td class="plain">Atlassian's official MCP server (generally available since February 2026). It respects each person's own Jira permissions.</td></tr>
+      <tr><td>Outlook</td><td class="plain">Our own small MCP server over Microsoft Graph, Microsoft's standard interface to mail and calendar. Microsoft's official mail server is a preview that needs a Microsoft 365 Copilot licence. Read, search and draft first; sending only after the user approves.</td></tr>
+      <tr><td>Gmail (later)</td><td class="plain">Google's official Gmail MCP server is a developer preview that reads and drafts but cannot send; reviewed when Gmail is scheduled.</td></tr>
+    </tbody>
+  </table>
+  <p>Each person connects their own account through the usual "Sign in with Microsoft / Atlassian" screen, so the model can only see and do what that person can; their sign-in tokens are stored encrypted on the server. Sending an email or changing a ticket always asks first, whatever mode the user is in, because an email is the easiest way to slip instructions to a model; text from emails is treated as information, never as orders.</p>
+</section>
+
+<!-- ============================================================ RAG, GUARDS, AUDIT -->
+<section>
+  <h2><span class="n">09</span>Document search (RAG)</h2>
+  <p>RAG hands the model the right passages from company documents at the moment a question is asked, so it answers from them and cites them. Today the Companion searches one project's files by keyword.</p>
+  <ul>
+    <li><b>Collections:</b> company-wide, team and personal, each with group access.</li>
+    <li><b>Reading in:</b> upload or connect a source; a worker pulls the text out, splits it into passages and gives each a "meaning fingerprint" (an embedding) using a local model.</li>
+    <li><b>Searching:</b> by meaning and keywords together, best matches first, with citations in the answer.</li>
+    <li><b>Access rights at search time:</b> a person only gets passages from documents they may open.</li>
+    <li><b>Labels:</b> a collection marked "never send outside" is only used with our own models; an "answer only from sources, or say you don't know" mode per assistant.</li>
+  </ul>
+
+  <h2 style="margin-top:14px"><span class="n">10</span>Guards and the audit log</h2>
+  <table>
+    <thead><tr><th style="width:19%">Guard</th><th>What it does</th></tr></thead>
+    <tbody>
+      <tr><td>Identity</td><td class="plain">Every request carries who is asking.</td></tr>
+      <tr><td>Access</td><td class="plain">Document search only returns what that person may open.</td></tr>
+      <tr><td>Tools</td><td class="plain">An allowed list per group; write actions need approval; the admin can make some approvals mandatory in every mode; the app only touches folders the user allowed.</td></tr>
+      <tr><td>Outgoing data</td><td class="plain">Requests to outside providers are scanned for secrets and personal data; the policy decides block, mask or allow.</td></tr>
+      <tr><td>Untrusted text</td><td class="plain">Text from documents, emails, web pages and tool results is information, never orders; a write action that follows such text always asks.</td></tr>
+      <tr><td>Answers</td><td class="plain">"Sources only" mode; a check for leaked secrets in replies.</td></tr>
+      <tr><td>Spend</td><td class="plain">Token and money limits per person, team and model.</td></tr>
+      <tr><td>Agent runs</td><td class="plain">The Companion's existing checks that stop stuck or looping runs.</td></tr>
+    </tbody>
+  </table>
+  <table>
+    <thead><tr><th style="width:19%">Audit log</th><th>Detail</th></tr></thead>
+    <tbody>
+      <tr><td>What is recorded</td><td class="plain">Who (person, API key or admin), when, from which device, the action, model or provider, documents used, tool calls and results, approvals, guard decisions, tokens and cost, sign-ins, and every admin change.</td></tr>
+      <tr><td>Content</td><td class="plain">Full, masked or none, as the retention policy says; records are deleted when their time is up.</td></tr>
+      <tr><td>Tamper evidence</td><td class="plain">Each record carries a fingerprint of the one before it, so an edited or deleted record shows. The server can only add records, never change them.</td></tr>
+      <tr><td>Use</td><td class="plain">A viewer with filters in the dashboard for the auditor role; export to the company's security monitoring system.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 style="margin-top:14px"><span class="n">11</span>Ways to connect</h2>
+  <table>
+    <thead><tr><th style="width:19%">Who</th><th style="width:36%">Address</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td>Apps</td><td class="plain"><code>/api/v1/…</code></td><td class="plain">Chat, tasks, plugins, connections, collections</td></tr>
+      <tr><td>Admins</td><td class="plain"><code>/api/admin/v1/…</code></td><td class="plain">Everything the dashboard does, so it can also be scripted</td></tr>
+      <tr><td>Other software</td><td class="plain"><code>/v1/chat/completions</code>, <code>/v1/models</code>, <code>/v1/embeddings</code></td><td class="plain">OpenAI format: most AI tools work with a company key, still through the rules and the audit log</td></tr>
+      <tr><td>Desktop app</td><td class="plain"><code>/api/v1/devices/connect</code></td><td class="plain">The device channel</td></tr>
+      <tr><td>Operations</td><td class="plain"><code>/healthz</code>, <code>/readyz</code>, <code>/metrics</code></td><td class="plain">Health checks and measurements for the servers' monitoring</td></tr>
+      <tr><td>Anyone linking</td><td class="plain"><code>/api/openapi.json</code></td><td class="plain">A machine-readable description of every endpoint</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ DEPLOYMENT, TECH -->
+<section>
+  <h2><span class="n">12</span>Installing and scaling</h2>
+  <div class="two">
+    <div class="card">
+      <h3 style="margin-top:0">One machine (laptop or one server)</h3>
+      <ul>
+        <li>One start script, including on a Windows laptop</li>
+        <li>The server, PostgreSQL, and llama.cpp model processes, as the Companion runs them today</li>
+        <li>No Redis; files in a folder</li>
+        <li>Used for the pilot and for running models locally</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Many servers (our own or AWS)</h3>
+      <ul>
+        <li>Packaged as containers: sealed bundles that run the same on any server</li>
+        <li>Run by Kubernetes, which starts copies across servers, replaces failed ones and adds or removes copies</li>
+        <li>One install package (a Helm chart) for both our own servers and AWS</li>
+      </ul>
+    </div>
+  </div>
+  <table>
+    <thead><tr><th style="width:19%">What scales</th><th style="width:40%">Signal</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>API servers</td><td class="plain">Requests and CPU load</td><td class="plain">Cheap to add; hold no state</td></tr>
+      <tr><td>Workers</td><td class="plain">Jobs waiting in the queue</td><td class="plain">Agent runs and document reading</td></tr>
+      <tr><td>Model pools</td><td class="plain">Requests waiting for that model (both engines report it)</td><td class="plain">Not CPU: a GPU server is full long before its CPU is busy</td></tr>
+    </tbody>
+  </table>
+  <div class="warnnote"><b>Limits worth knowing.</b> On our own servers, scaling can only share out the GPUs we own between models; in AWS it can add GPU machines. A model can be set to switch off when idle, but the next request then waits for it to load, which can take minutes for a large model.</div>
+
+  <h2 style="margin-top:14px"><span class="n">13</span>Technology choices</h2>
+  <table>
+    <thead><tr><th style="width:19%">Area</th><th style="width:30%">Choice</th><th>Why</th></tr></thead>
+    <tbody>
+      <tr><td>Backend</td><td class="plain">Rust (kept from the Companion)</td><td class="plain">Reuses the existing code; fast; same language as the desktop app's core</td></tr>
+      <tr><td>Database</td><td class="plain">PostgreSQL + pgvector</td><td class="plain">One database for records and document search</td></tr>
+      <tr><td>Between servers</td><td class="plain">Redis</td><td class="plain">Standard and simple; not needed on one machine</td></tr>
+      <tr><td>Files</td><td class="plain">S3, MinIO, or a folder</td><td class="plain">S3 in AWS, MinIO on our own servers</td></tr>
+      <tr><td>Model engines</td><td class="plain">llama.cpp and vLLM</td><td class="plain">Small machines and large GPU servers</td></tr>
+      <tr><td>Sign-in</td><td class="plain">OpenID Connect with Microsoft Entra ID</td><td class="plain">The standard way to use company accounts; other directories can be added later</td></tr>
+      <tr><td>MCP</td><td class="plain">The official Rust MCP library</td><td class="plain">Maintained with the standard itself</td></tr>
+      <tr><td>Desktop app</td><td class="plain">Tauri</td><td class="plain">Reuses the React screens; Rust core shares the tools code; small installers because it uses the browser engine built into the operating system</td></tr>
+      <tr><td>Admin dashboard</td><td class="plain">React</td><td class="plain">Same as today's screens; shared UI parts</td></tr>
+      <tr><td>Running servers</td><td class="plain">Containers, Kubernetes, Helm, KEDA</td><td class="plain">KEDA is the Kubernetes add-on that scales on signals like waiting requests</td></tr>
+      <tr><td>Monitoring</td><td class="plain">OpenTelemetry and Prometheus-format metrics</td><td class="plain">Works with the monitoring tools most companies already run</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ============================================================ ACTION PLAN -->
+<section>
+  <h2><span class="n">14</span>Action plan</h2>
+  <div class="roadmap">
+    <div class="ph"><b>0</b>Fork</div>
+    <div class="ph"><b>1</b>Foundations</div>
+    <div class="ph"><b>2</b>Models and gateway</div>
+    <div class="ph"><b>3</b>Desktop app</div>
+    <div class="ph"><b>4</b>Plugins and MCP</div>
+    <div class="ph"><b>5</b>Jira and Outlook</div>
+    <div class="ph pilot"><b>6</b>Document search · pilot</div>
+    <div class="ph"><b>7</b>Guards and audit</div>
+    <div class="ph"><b>8</b>Many servers</div>
+    <div class="ph"><b>9</b>Hardening</div>
+  </div>
+  <p class="roadlegend">Each phase ends with a review before the next one starts. The pilot (one department, its documents, 20–30 people) can start after phase 6 on one server. The design works across several servers from phase 1; phase 8 packages it and proves it under load.</p>
+  <table>
+    <thead><tr><th style="width:17%">Phase</th><th style="width:47%">Key work</th><th>Done when</th></tr></thead>
+    <tbody>
+      <tr><td>0. Fork</td><td class="plain">Copy the Companion with its history (without the large model files), including its latest tool fixes; rename; all tests passing; this plan saved in the project.</td><td class="plain">The new project builds and every test passes.</td></tr>
+      <tr><td>1. Foundations</td><td class="plain">A map of every part of the current code and where it goes. PostgreSQL, with a one-off import of old history. Microsoft sign-in; users, groups, roles, API keys; an owner on every record. Settings with locks. Audit records from day one. The screens split into user app, admin dashboard and shared parts.</td><td class="plain">Two colleagues share one server and each sees only their own work; the admin locks a setting and the user sees it locked.</td></tr>
+      <tr><td>2. Models and gateway</td><td class="plain">Model list; several models at once; vLLM as a second engine; OpenAI, Anthropic and Google; the ability test for every model; same-conversation routing; the OpenAI-format address with keys; usage and limits.</td><td class="plain">Our models, Claude, GPT and Gemini in one list; a script with a company key works; limits stop overspending.</td></tr>
+      <tr><td>3. Desktop app</td><td class="plain">Tauri app; saved servers and connection test; sign-in through the system browser; tools moved into the shared library; device channel; pause and resume; signed installers and automatic updates.</td><td class="plain">Install the app, point it at the server, and the coding agent edits a local project.</td></tr>
+      <tr><td>4. Plugins and MCP</td><td class="plain">Plugin description format, catalogue, group access, user switches, ability check in the app and on the server, approval rules.</td><td class="plain">An admin adds an MCP server; only the chosen group sees it; a model that cannot use it shows it greyed out.</td></tr>
+      <tr><td>5. Jira and Outlook</td><td class="plain">Encrypted store for people's account connections; Jira Cloud; our Outlook connector; approval before sending or changing anything.</td><td class="plain">"Summarise my open tickets" and "draft a reply to this email" work; sending asks first.</td></tr>
+      <tr><td>6. Document search</td><td class="plain">Collections, upload, reading in, search by meaning and keywords, access rights, citations, "sources only" mode, "never send outside" label.</td><td class="plain">The pilot can start on one server.</td></tr>
+      <tr><td>7. Guards and audit</td><td class="plain">Outgoing-data scan, untrusted-text rule, answer checks, tamper-evident chain, retention, export, viewer, auditor role.</td><td class="plain">An auditor can rebuild how any answer was produced.</td></tr>
+      <tr><td>8. Many servers</td><td class="plain">Containers, Kubernetes package, Redis between servers, scaling rules, GPU pools, health checks and metrics, load test, and the one-command Windows start.</td><td class="plain">Stopping a server mid-reply does not break a user's session; added load brings new copies up.</td></tr>
+      <tr><td>9. Hardening</td><td class="plain">Security review, a set of real test questions run on every change, guides for users and admins.</td><td class="plain">Ready for a wider rollout.</td></tr>
+    </tbody>
+  </table>
+  <div class="note"><b>Time estimates</b> come after phase 1's code map: it shows how much of today's request handling, which was written for one person, has to change.</div>
+</section>
+
+<!-- ============================================================ COMPANY NEEDS, RISKS -->
+<section>
+  <h2><span class="n">15</span>What we need from the company</h2>
+  <table>
+    <thead><tr><th style="width:36%">Item</th><th>Why</th><th style="width:15%">Needed by</th></tr></thead>
+    <tbody>
+      <tr><td>A Microsoft Entra ID app registration, with admin consent</td><td class="plain">Company sign-in, and Outlook access on each person's behalf</td><td class="plain">Phase 1 (Outlook: phase 5)</td></tr>
+      <tr><td>Provider accounts and keys (OpenAI, Anthropic, Google)</td><td class="plain">Outside models; data-processing terms with each provider</td><td class="plain">Phase 2</td></tr>
+      <tr><td>A code-signing certificate</td><td class="plain">So Windows and macOS trust the app's installer and updates</td><td class="plain">Phase 3</td></tr>
+      <tr><td>Atlassian Cloud admin approval</td><td class="plain">Allows Atlassian's MCP server for our site</td><td class="plain">Phase 5</td></tr>
+      <tr><td>One GPU server (or AWS equivalent), a pilot department and its documents</td><td class="plain">The pilot</td><td class="plain">Phase 6</td></tr>
+      <tr><td>A legal review of the open-weight models' licences</td><td class="plain">Before the pilot uses them</td><td class="plain">Phase 6</td></tr>
+      <tr><td>The hosting decision: our own servers or AWS</td><td class="plain">Decides where the many-server version is installed</td><td class="plain">Phase 8</td></tr>
+    </tbody>
+  </table>
+
+  <h2 style="margin-top:14px"><span class="n">16</span>Risks and open points</h2>
+  <table>
+    <thead><tr><th style="width:27%">Risk</th><th>How we handle it</th></tr></thead>
+    <tbody>
+      <tr><td>The size of the rework</td><td class="plain">Today's request handling was written for one person and one model. Phase 1 starts with a full map of it before any estimate is given.</td></tr>
+      <tr><td>Hidden instructions in emails, documents and web pages</td><td class="plain">Such text is treated as information; actions that follow it, and every send or change, ask the user first.</td></tr>
+      <tr><td>Official connectors are limited</td><td class="plain">Microsoft's mail server needs a Copilot licence and Google's cannot send, so Outlook gets our own small connector.</td></tr>
+      <tr><td>Data leaving the company</td><td class="plain">Outside providers only through the outgoing-data scan, "never send outside" labels and per-group rules.</td></tr>
+      <tr><td>Speed with many copies of a model</td><td class="plain">The same conversation goes to the same copy, so it keeps reusing what it already read.</td></tr>
+      <tr><td>GPU capacity on our own servers</td><td class="plain">Fixed by the GPUs we buy; scaling shares them between models; AWS can add machines.</td></tr>
+      <tr><td>vLLM needs Linux GPU servers</td><td class="plain">Laptops and small servers use llama.cpp, which the Companion already tunes.</td></tr>
+    </tbody>
+  </table>
+
+  <h2 style="margin-top:14px"><span class="n">17</span>Terms used</h2>
+  <dl class="gloss">
+    <dt>Audit log</dt><dd>A record of who asked what, which documents and tools were used, and what was decided.</dd>
+    <dt>Container</dt><dd>A sealed bundle of a program and everything it needs, which runs the same on any server.</dd>
+    <dt>Embedding</dt><dd>A list of numbers that captures what a passage means, so passages can be found by meaning.</dd>
+    <dt>Kubernetes</dt><dd>The standard system for running containers across many servers; it restarts failed copies and adds or removes copies.</dd>
+    <dt>llama.cpp</dt><dd>A model server that runs open-weight models on almost any machine; the Companion uses it today.</dd>
+    <dt>Load balancer</dt><dd>The front door that spreads incoming requests across the server copies.</dd>
+    <dt>MCP</dt><dd>Model Context Protocol: an open standard for connecting AI apps to tools.</dd>
+    <dt>OpenAI format</dt><dd>The request format most AI tools speak; offering it lets existing tools use our models.</dd>
+    <dt>pgvector</dt><dd>An add-on that lets PostgreSQL search by meaning.</dd>
+    <dt>RAG</dt><dd>Retrieval-augmented generation: giving the model relevant passages from our documents when a question is asked.</dd>
+    <dt>Redis</dt><dd>Fast shared memory used so several servers can pass live replies and counters to each other.</dd>
+    <dt>Tauri</dt><dd>A way to package web screens as an installable desktop app with a small Rust core.</dd>
+    <dt>vLLM</dt><dd>A model server built to serve many people at once from large GPUs.</dd>
+  </dl>
+</section>
+
+</body>
+</html>

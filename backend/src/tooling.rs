@@ -198,8 +198,8 @@ fn parameters(tool: &str) -> serde_json::Value {
         "edit_file" => (
             serde_json::json!({
                 "path": path,
-                "old": string("The exact text to replace, copied from the file"),
-                "new": string("The text that replaces it"),
+                "old": string("Only the lines you are changing, copied exactly from the file as it is now"),
+                "new": string("The text that replaces them"),
             }),
             &["path", "old", "new"],
         ),
@@ -209,7 +209,7 @@ fn parameters(tool: &str) -> serde_json::Value {
                 "from": integer("First line to replace, as read_file numbers them (1-based)"),
                 "to": integer("Last line to replace; the same as from for one line"),
                 "text": string("The lines that take their place; empty deletes them"),
-                "expect": string("The text of line `from` as you read it, checked before anything is replaced"),
+                "expect": string("The current text of line `from` (or of all the lines being replaced), checked before anything changes"),
             }),
             &["path", "from", "to", "text"],
         ),

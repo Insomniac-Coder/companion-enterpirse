@@ -517,6 +517,21 @@ impl RunningSidecar {
         tracing::info!("llama-server stopped ({})", self.base_url);
     }
 
+    /// For tests: any long-running process stands in for the model server,
+    /// and requests go to `base_url` (a scripted server).
+    #[cfg(test)]
+    pub fn stand_in(child: Child, base_url: String, cfg: InferenceConfig) -> Self {
+        Self {
+            child,
+            log_tasks: Vec::new(),
+            log_tail: Arc::new(Mutex::new(Vec::new())),
+            exited: None,
+            base_url,
+            cfg,
+            started_at: chrono::Utc::now(),
+        }
+    }
+
     pub fn is_alive(&mut self) -> bool {
         if self.exited.is_some() {
             return false;

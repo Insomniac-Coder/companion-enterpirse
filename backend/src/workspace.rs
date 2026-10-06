@@ -42,7 +42,34 @@ impl WorkspaceManager {
     /// Rejects absolute escapes and `..` traversal without touching disk
     /// (pure lexical check), then canonicalizes the nearest existing ancestor
     /// to also defeat symlink/junction escapes when creating a new file.
+    /// A path written from the folder above, such as `site/src/app.js` for
+    /// a workspace that is `site` itself. A follow-up run works inside the
+    /// project its conversation named, while the earlier run - begun before
+    /// that folder existed - worked from the folder above and left its paths
+    /// in the conversation (owner's NEON runs, 2026-09-18). When the
+    /// workspace holds nothing of its own name, that first part names the
+    /// workspace, and it is dropped. Only ever narrows: the rest is resolved
+    /// and contained as any other path.
+    fn without_own_name(&self, user_path: &str) -> String {
+        if Path::new(user_path).is_absolute() {
+            return user_path.to_string();
+        }
+        let Some(own) = self.root.file_name().and_then(|name| name.to_str()) else {
+            return user_path.to_string();
+        };
+        let forward = user_path.replace('\\', "/");
+        let trimmed = forward.trim_start_matches("./");
+        let (first, rest) = trimmed.split_once('/').unwrap_or((trimmed, ""));
+        if first.is_empty() || !first.eq_ignore_ascii_case(own) || self.root.join(first).exists() {
+            return user_path.to_string();
+        }
+        let rest = rest.trim_start_matches('/');
+        if rest.is_empty() { ".".to_string() } else { rest.to_string() }
+    }
+
     pub fn resolve(&self, user_path: &str) -> Result<PathBuf, WorkspaceError> {
+        let own_name_dropped = self.without_own_name(user_path);
+        let user_path = own_name_dropped.as_str();
         let requested = user_path.to_string();
         let joined = if Path::new(user_path).is_absolute() {
             PathBuf::from(user_path)

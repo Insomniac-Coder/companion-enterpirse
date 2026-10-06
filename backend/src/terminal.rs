@@ -116,9 +116,20 @@ fn shell() -> (&'static str, &'static str) {
 fn spawn(cmd: &str, cwd: &Path) -> Result<Child, String> {
     let (shell, flag) = shell();
     let mut command = Command::new(shell);
+    // cmd.exe gets the command line as it was written. Passed as an argument,
+    // it was quoted the way C programs read quotes - every inner `"` became
+    // `\"`, which cmd.exe does not understand - so `python -c "print(1)"`
+    // reached Python as `"print(1)` and failed (live check, 2026-09-18).
+    // With /S, cmd.exe drops only the outer pair of quotes and runs the rest
+    // unchanged.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.raw_arg(format!("/S {flag} \"{cmd}\""));
+    }
+    #[cfg(not(windows))]
+    command.arg(flag).arg(cmd);
     command
-        .arg(flag)
-        .arg(cmd)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

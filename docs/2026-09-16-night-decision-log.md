@@ -1825,6 +1825,37 @@ Updated continuously so it survives context compaction. Read this after `docs/HA
       50, 7 of 72); in the repetitive 36-file run it was 31 of 68. The host's existing "Your previous response was
       empty" nudge recovers every time, for one short request that is read entirely from the cache.
 
+72. **2026-09-18 ~13:30 Why actions kept failing, and every tool tested (owner: "some actions keep failing";
+    "all tools need thorough testing").** Across the owner's history edit_file had failed 41 of its 72 calls
+    and replace_lines 5 of 6; every other tool 0-3. In the owner's NEON conversation both runs were stopped by
+    the "same action failed three times" guard.
+    - **Built:** edit_file refuses an edit that changes nothing, answers "already holds the new text" for a
+      repeated edit (and no longer inserts an insertion twice), names the line where old text differs from the
+      file (with the lines around it and, for a long old text, "send only the lines you change, or write_file"),
+      reads its write back and says which lines changed. replace_lines takes `expect` as the first line or the
+      whole block, says where the text is when the numbers moved and shows the real lines when they did not,
+      and keeps a Windows file's line endings (it turned every one into a Unix ending). search_text names hits
+      from the project root with forward slashes (it named them from the folder searched, so `src/App.tsx` came
+      back as `App.tsx`) and searches invalid expressions as plain text. list_directory marks folders with
+      "/"; read_file, write_file, append_file, edit_file and list_directory say plainly when given a folder, a
+      file or binary data; outline and search_text point at the real path. A path written from the folder above
+      (`neon-observatory/src/App.tsx` inside `neon-observatory`) resolves inside the project. **Commands with
+      double quotes were mangled on Windows** (`python -c "..."` reached Python as `"...`): cmd.exe now gets
+      the command line as written (`/S /C "..."`). A background command "stopped" with a shell command is told
+      the right form. The answer given before the host's look over the project stays the final message when
+      nothing was changed after it (a model's last reply only described a folder listing).
+    - **Tested:** 30 new unit tests over every tool in tools.rs (tool_checks, command_checks); the run-handled
+      tools keep their existing tests. Live, a five-task fixture project calling every tool but open_path (it
+      would open windows) and web_search (network off): small model 39 calls, 26B 41 calls, **none failed**;
+      bug fixed, tests passing, line endings kept, commit made, plan presented, server served and previewed.
+    - **Open, noted for later (owner: "don't fix them just note them down"):** (1) two scripted whole-run tests
+      (`api::tests::scripted_runs`) are ignored: their task text names out.txt, which the host reads as a
+      requested txt document, so the run takes the document path instead of the look over the project; the
+      harness itself works (fake model, real run loop, real tools). (2) `del tmp/old.log` fails in cmd.exe
+      (it reads `/` as a switch): no hint yet. (3) delete_file deletes permanently; moving to the Recycle Bin is
+      proposed, not built. (4) A model's edit_file with the wrong indentation is written as sent.
+    - Backend 521 tests (7 ignored), build current. Not committed.
+
     - *Times in entries 62-67 were corrected afterwards against the files' own timestamps
       (`agent_progress.rs` 06:55, `api.rs` 07:16, `project_check.rs` 07:38, `cdp.rs` 08:00): the clock
       readings written at the time ran several hours ahead of the machine's.*

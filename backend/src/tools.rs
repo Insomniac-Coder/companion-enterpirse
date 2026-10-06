@@ -381,12 +381,29 @@ pub fn execute(
         "list_directory" => {
             let rel = req.args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
             let dir = ws.resolve(rel).map_err(ToolError::Workspace)?;
+            if dir.is_file() {
+                return Err(ToolError::InvalidArgs(format!(
+                    "{rel} is a file, not a folder: read it with read_file"
+                )));
+            }
             let entries = std::fs::read_dir(&dir).map_err(|error| missing_path(ws, rel, error))?;
+            // Folders end in "/": the names alone did not say which could be
+            // listed and which read.
             let mut names: Vec<String> = entries
                 .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if e.file_type().is_ok_and(|kind| kind.is_dir()) {
+                        format!("{name}/")
+                    } else {
+                        name
+                    }
+                })
                 .collect();
             names.sort();
+            if names.is_empty() {
+                return Ok(ToolResult::ok(format!("{rel} is an empty folder")));
+            }
             Ok(ToolResult::ok(names.join("\n")))
         }
         "read_file" => {
@@ -394,7 +411,15 @@ pub fn execute(
                 ToolError::InvalidArgs("read_file requires {\"path\": \"...\"}".into())
             })?;
             let p = ws.resolve(rel).map_err(ToolError::Workspace)?;
+            if p.is_dir() {
+                return Err(ToolError::InvalidArgs(format!(
+                    "{rel} is a folder, not a file: list it with list_directory"
+                )));
+            }
             crate::file_read::read(&p, &req.args).map_err(|error| match error {
+                ToolError::Io(io) if io.kind() == std::io::ErrorKind::InvalidData => ToolError::InvalidArgs(format!(
+                    "{rel} is not a text file (it holds binary data), so it cannot be read as text"
+                )),
                 ToolError::Io(io) => missing_path(ws, rel, io),
                 other => other,
             })
@@ -414,6 +439,12 @@ pub fn execute(
             }
             reject_released_note("write_file", content)?;
             let p = ws.resolve(rel).map_err(ToolError::Workspace)?;
+            if p.is_dir() {
+                return Err(ToolError::InvalidArgs(format!(
+                    "{rel} is a folder: give the path of a file inside it, such as {}/index.html",
+                    rel.trim_end_matches(['/', '\\'])
+                )));
+            }
             if let Some(parent) = p.parent() {
                 std::fs::create_dir_all(parent).map_err(ToolError::Io)?;
             }
@@ -455,6 +486,9 @@ pub fn execute(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| ToolError::InvalidArgs(USAGE.into()))?;
             let p = ws.resolve(rel).map_err(ToolError::Workspace)?;
+            if p.is_dir() {
+                return Err(ToolError::InvalidArgs(format!("{rel} is a folder, not a file")));
+            }
             let existing = match std::fs::metadata(&p) {
                 Ok(meta) => meta.len(),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
@@ -500,6 +534,9 @@ pub fn execute(
                 ToolError::InvalidArgs(USAGE.into())
             })?;
             let p = ws.resolve(rel).map_err(ToolError::Workspace)?;
+            if p.is_dir() {
+                return Err(ToolError::InvalidArgs(format!("{rel} is a folder, not a file")));
+            }
             let original = std::fs::read_to_string(&p).map_err(|error| missing_path(ws, rel, error))?;
             if original.len() as u64 > MAX_FILE_BYTES {
                 return Err(ToolError::InvalidArgs("file too large to patch; rewrite it in chunks".into()));
@@ -512,6 +549,22 @@ pub fn execute(
                     ToolError::InvalidArgs(USAGE.into())
                 })?;
                 reject_released_note("edit_file", new)?;
+                // An edit whose old and new are the same changes nothing. It
+                // used to report success, and a model took three such edits
+                // for changes it had made (owner's 26B run, 2026-09-18).
+                if old.replace("\r\n", "\n") == new.replace("\r\n", "\n") {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "old and new are the same text, so this would change nothing in {rel}. Put the text the file should hold in new."
+                    )));
+                }
+                // Made already, by an earlier step: repeating a successful
+                // edit used to fail as "not found" and read as a new problem,
+                // and repeating an insertion used to insert it twice.
+                if edit_already_made(&original, old, new) {
+                    return Ok(ToolResult::ok(format!(
+                        "{rel} already holds the new text: this change was made by an earlier step, so nothing was changed."
+                    )));
+                }
                 let replace_all = req.args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
                 apply_replacement(&original, old, new, replace_all).map_err(ToolError::InvalidArgs)?
             } else if let Some(patch) = req.args.get("patch").and_then(|v| v.as_str()) {
@@ -520,8 +573,15 @@ pub fn execute(
                 return Err(ToolError::InvalidArgs(USAGE.into()));
             };
             std::fs::write(&p, &updated).map_err(ToolError::Io)?;
+            let on_disk = std::fs::read(&p).map_err(ToolError::Io)?;
+            if on_disk != updated.as_bytes() {
+                return Err(ToolError::Io(std::io::Error::other(format!(
+                    "{rel} was patched but does not read back as written; read it again before the next change"
+                ))));
+            }
             Ok(ToolResult::ok(format!(
-                "patched {rel}: {} -> {} bytes",
+                "patched {rel} ({}): {} -> {} bytes, read back from disk",
+                changed_lines(&original, &updated),
                 original.len(),
                 updated.len()
             )))
@@ -546,6 +606,7 @@ pub fn execute(
             }
             let p = ws.resolve(rel).map_err(ToolError::Workspace)?;
             let original = std::fs::read_to_string(&p).map_err(|error| missing_path(ws, rel, error))?;
+            let crlf = original.contains("\r\n");
             let lines: Vec<&str> = original.lines().collect();
             if from > lines.len() {
                 return Err(ToolError::InvalidArgs(format!(
@@ -554,15 +615,33 @@ pub fn execute(
                 )));
             }
             let last = to.min(lines.len());
-            // An optional anchor: the first line being replaced, as the model
-            // read it. Line numbers move after every edit, and a wrong number
-            // silently destroys the wrong lines.
-            if let Some(expect) = req.args.get("expect").and_then(|v| v.as_str()).map(str::trim).filter(|text| !text.is_empty()) {
-                let actual = lines[from - 1].trim();
-                if actual != expect {
-                    return Err(ToolError::InvalidArgs(format!(
-                        "line {from} of {rel} is {actual:?}, not {expect:?}. Read the file again: the numbers have moved."
-                    )));
+            // An optional anchor: the text being replaced, as the model read
+            // it - the first line, or every line of the range, which is what
+            // models send (5 of 6 calls failed on it, owner's 26B run,
+            // 2026-09-18). Line numbers move after every edit, and a wrong
+            // number silently destroys the wrong lines.
+            if let Some(expect) = req.args.get("expect").and_then(|v| v.as_str()).filter(|text| !text.trim().is_empty()) {
+                let mut expected: Vec<&str> = expect.lines().map(str::trim).collect();
+                while expected.last().is_some_and(|line| line.is_empty()) {
+                    expected.pop();
+                }
+                let end = (from - 1 + expected.len()).min(lines.len());
+                let actual: Vec<&str> = lines[from - 1..end].iter().map(|line| line.trim()).collect();
+                if actual != expected {
+                    let found = line_block_positions(&lines, &expected);
+                    let message = match found.as_slice() {
+                        [at] => format!(
+                            "{rel} has that text at line {} now, not at line {from}: the numbers have moved. Send from {} and to {} for the same lines.",
+                            at + 1,
+                            at + 1,
+                            at + 1 + (last - from)
+                        ),
+                        _ => format!(
+                            "lines {from}-{end} of {rel} hold:\n{}\nnot the text in expect, and that text is not in the file as it is now. expect is the current text of line {from} (the first line is enough); read the file again if you are not sure what it holds.",
+                            numbered_lines(&lines, from - 1, end)
+                        ),
+                    };
+                    return Err(ToolError::InvalidArgs(message));
                 }
             }
             let mut updated: Vec<&str> = Vec::with_capacity(lines.len());
@@ -570,9 +649,12 @@ pub fn execute(
             let replacement: Vec<&str> = if text.is_empty() { Vec::new() } else { text.lines().collect() };
             updated.extend_from_slice(&replacement);
             updated.extend_from_slice(&lines[last..]);
-            let mut body = updated.join("\n");
+            // The file's own line endings: joining with "\n" alone turned a
+            // Windows file's every line ending into a Unix one.
+            let separator = if crlf { "\r\n" } else { "\n" };
+            let mut body = updated.join(separator);
             if original.ends_with('\n') && !body.is_empty() {
-                body.push('\n');
+                body.push_str(separator);
             }
             if body.len() as u64 > MAX_FILE_BYTES {
                 return Err(ToolError::InvalidArgs(format!("file would exceed {MAX_FILE_BYTES} bytes")));
@@ -595,7 +677,7 @@ pub fn execute(
             })?;
             let p = ws.resolve(rel).map_err(ToolError::Workspace)?;
             if !p.exists() {
-                return Err(ToolError::InvalidArgs(format!("no such path {rel:?} in the workspace")));
+                return Err(missing_path(ws, rel, std::io::ErrorKind::NotFound.into()));
             }
             crate::outline::outline(&p, rel)
                 .map(ToolResult::ok)
@@ -639,9 +721,21 @@ pub fn execute(
             })?;
             let rel = req.args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
             let dir = ws.resolve(rel).map_err(ToolError::Workspace)?;
-            let re = regex::Regex::new(q)
-                .map_err(|e| ToolError::InvalidArgs(format!("bad regex: {e}")))?;
-            Ok(ToolResult::ok(search_dir(&dir, &re)))
+            if !dir.exists() {
+                return Err(missing_path(ws, rel, std::io::ErrorKind::NotFound.into()));
+            }
+            // Code a model searches for is often not a valid expression -
+            // `render(` or `items[0]` - and was refused; it is searched for as
+            // it is written instead.
+            let (re, note) = match regex::Regex::new(q) {
+                Ok(re) => (re, None),
+                Err(_) => (
+                    regex::Regex::new(&regex::escape(q)).map_err(|e| ToolError::InvalidArgs(format!("bad query: {e}")))?,
+                    Some(format!("({q:?} is not a regular expression, so it was searched for as plain text.)\n")),
+                ),
+            };
+            let found = search_dir(&dir, ws.root(), &re);
+            Ok(ToolResult::ok(format!("{}{found}", note.unwrap_or_default())))
         }
         "execute_command" => {
             require_approved(req, approved, "Command execution needs explicit approval.")?;
@@ -708,7 +802,19 @@ pub fn execute(
             }
             match crate::terminal::run(cmd, &cwd, timeout) {
                 Ok(r) => {
-                    let mut res = ToolResult::ok(crate::terminal::format_result(cmd, &r));
+                    let mut output = crate::terminal::format_result(cmd, &r);
+                    // A background command stopped as if it were a shell
+                    // command ("stop --background_id 1"): measured live, a
+                    // small model wrote the stop call that way.
+                    let first = cmd.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+                    let running = crate::terminal::background_commands();
+                    if r.exit_code != Some(0) && matches!(first.as_str(), "stop" | "kill") && !running.is_empty() {
+                        let ids = running.iter().map(|(id, cmd)| format!("{id} ({cmd})")).collect::<Vec<_>>().join(", ");
+                        output.push_str(&format!(
+                            "\n\nA background command is stopped with execute_command itself, not a shell command: send {{\"background_id\": N, \"stop\": true}}. Running now: {ids}."
+                        ));
+                    }
+                    let mut res = ToolResult::ok(output);
                     res.exit_code = r.exit_code;
                     Ok(res)
                 }
@@ -943,6 +1049,144 @@ fn locate_lines(haystack: &[&str], needle: &[&str], from: usize, hint: usize) ->
 /// The file lines that best resemble the block the model tried to match:
 /// the window whose lines share the most leading characters (after trimming)
 /// with the requested lines. Shown verbatim so the model can copy them.
+/// Where `needle`'s lines (compared without surrounding spaces) occur in
+/// `haystack`, as 0-based starting lines.
+fn line_block_positions(haystack: &[&str], needle: &[&str]) -> Vec<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return Vec::new();
+    }
+    (0..=haystack.len() - needle.len())
+        .filter(|&start| {
+            needle
+                .iter()
+                .enumerate()
+                .all(|(offset, line)| haystack[start + offset].trim() == line.trim())
+        })
+        .collect()
+}
+
+/// Lines `from..to` (0-based, end exclusive) labelled as read_file labels them.
+fn numbered_lines(lines: &[&str], from: usize, to: usize) -> String {
+    lines[from.min(lines.len())..to.min(lines.len())]
+        .iter()
+        .enumerate()
+        .map(|(offset, line)| format!("{}: {line}", from + offset + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether an edit is already in the file: its new text is there and its old
+/// text is not - or, for an insertion (new extends old), new is there as a
+/// whole. Only for a new text long enough not to be found by chance.
+fn edit_already_made(original: &str, old: &str, new: &str) -> bool {
+    let text = original.replace("\r\n", "\n");
+    let old = old.replace("\r\n", "\n");
+    let new = new.replace("\r\n", "\n");
+    let (old_block, new_block) = (old.trim_matches('\n'), new.trim_matches('\n'));
+    if new_block.trim().chars().count() < 16 {
+        return false;
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let present = |block: &str| {
+        text.contains(block) || !line_block_positions(&lines, &block.lines().collect::<Vec<_>>()).is_empty()
+    };
+    if !present(new_block) {
+        return false;
+    }
+    !present(old_block) || (new_block.contains(old_block) && text.contains(new_block))
+}
+
+/// "lines 12-15" (1-based) for the part of a file an edit changed.
+fn changed_lines(before: &str, after: &str) -> String {
+    let (a, b): (Vec<&str>, Vec<&str>) = (before.lines().collect(), after.lines().collect());
+    if a == b {
+        return "line endings only".to_string();
+    }
+    let first = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let same_tail = a[first..]
+        .iter()
+        .rev()
+        .zip(b[first..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    let last = b.len().saturating_sub(same_tail);
+    match (first + 1, last) {
+        (start, end) if end < start => format!("lines removed after line {}", first),
+        (start, end) if start == end => format!("line {start}"),
+        (start, end) => format!("lines {start}-{end}"),
+    }
+}
+
+/// Why an edit's old text was not found, pointing at the line where it parts
+/// from the file. The closest block alone was not enough: a model sent the
+/// same 4,000-character old text four times with two stale places in it
+/// (owner's 26B run, 2026-09-18).
+fn not_found_message(haystack: &[&str], needle: &[&str]) -> String {
+    let advice = if needle.len() > 20 {
+        format!(
+            "Your old text is {} lines long: send only the few lines you are changing, copied from the file as it is now - or, to change most of the file, write the whole file with write_file.",
+            needle.len()
+        )
+    } else {
+        "Copy those lines from the file as it is now into old (without the line-number labels), then give their replacement in new.".to_string()
+    };
+    let Some(start) = closest_start(haystack, needle) else {
+        return format!(
+            "old text was not found in the file, and no part of the file resembles it: the file may not hold what you remember. Read it again. {advice}"
+        );
+    };
+    let differs = needle
+        .iter()
+        .enumerate()
+        .find(|(offset, line)| haystack.get(start + offset).map_or(true, |file| file.trim() != line.trim()));
+    let Some((offset, old_line)) = differs else {
+        return format!("old text was not found in the file. {advice}");
+    };
+    let at = start + offset;
+    let matched = if offset > 0 {
+        format!(" It matches the file from line {} to line {at}, then differs at line {}:", start + 1, at + 1)
+    } else {
+        format!(" The closest place is line {}:", at + 1)
+    };
+    let file_line = haystack.get(at).map(|line| line.trim()).unwrap_or("(the file ends here)");
+    format!(
+        "old text was not found in the file.{matched}\n  the file has: {file_line}\n  old has:      {}\nThe file around line {}:\n{}\n{advice}",
+        old_line.trim(),
+        at + 1,
+        numbered_lines(haystack, at.saturating_sub(2), at + 3)
+    )
+}
+
+/// The start (0-based) where `needle` lines up best with `haystack`, by how
+/// much of each line matches; None when nothing resembles it.
+fn closest_start(haystack: &[&str], needle: &[&str]) -> Option<usize> {
+    if haystack.is_empty() || needle.is_empty() {
+        return None;
+    }
+    let similarity = |a: &str, b: &str| {
+        let (a, b) = (a.trim(), b.trim());
+        let common = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+        if a.is_empty() || b.is_empty() {
+            0
+        } else {
+            common * 100 / a.len().max(b.len())
+        }
+    };
+    let window = needle.len().min(haystack.len());
+    let (start, score) = (0..=haystack.len() - window)
+        .map(|start| {
+            let score: usize = needle
+                .iter()
+                .take(window)
+                .enumerate()
+                .map(|(offset, line)| similarity(haystack[start + offset], line))
+                .sum();
+            (start, score)
+        })
+        .max_by_key(|(start, score)| (*score, usize::MAX - *start))?;
+    (score > 0).then_some(start)
+}
+
 fn closest_region(haystack: &[&str], needle: &[&str]) -> Option<String> {
     if haystack.is_empty() || needle.is_empty() {
         return None;
@@ -1068,12 +1312,7 @@ pub fn apply_replacement(
             }
             Ok(finish(updated))
         }
-        0 => Err(format!(
-            "old text was not found in the file. Copy the exact existing lines (without the line-number labels) into old, then give their replacement in new.{}",
-            closest_region(&haystack, &needle)
-                .map(|region| format!("\nThe closest text in the file is:\n{region}\nUse those exact lines (or a unique subset of them) as old."))
-                .unwrap_or_default()
-        )),
+        0 => Err(not_found_message(&haystack, &needle)),
         n => Err(format!(
             "old text matches {n} places when ignoring indentation; include more surrounding lines so it is unique"
         )),
@@ -1112,10 +1351,15 @@ fn parse_hunk_header(line: &str) -> Result<(usize, usize), String> {
 /// Recursive regex search (§24). Large source files are scanned line by line.
 /// Returns `path:line: match` lines, capped — deterministic and terse for
 /// small local models (§95: relevant sections, not dumps).
-fn search_dir(dir: &std::path::Path, re: &regex::Regex) -> String {
+fn search_dir(dir: &std::path::Path, root: &std::path::Path, re: &regex::Regex) -> String {
+    // The folder searched is a resolved path (on Windows it carries the
+    // long-path prefix); the root it is named from must be resolved the same
+    // way, or nothing is stripped and every hit shows its full path.
+    let resolved_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let root = resolved_root.as_path();
     let mut hits: Vec<String> = vec![];
     if dir.is_file() {
-        search_file(dir, dir.parent().unwrap_or(dir), re, &mut hits);
+        search_file(dir, root, re, &mut hits);
     }
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -1149,7 +1393,7 @@ fn search_dir(dir: &std::path::Path, re: &regex::Regex) -> String {
             if ft.is_dir() {
                 stack.push(path);
             } else if ft.is_file() {
-                search_file(&path, dir, re, &mut hits);
+                search_file(&path, root, re, &mut hits);
             }
         }
     }
@@ -1191,9 +1435,12 @@ fn search_file(
             break;
         }
         if re.is_match(&line) {
+            // Named from the project root, with forward slashes: named from
+            // the folder searched, `src/App.tsx` came back as `App.tsx`, and
+            // the model's next read_file of it failed.
+            let shown = path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/");
             hits.push(format!(
-                "{}:{}: {}",
-                path.strip_prefix(root).unwrap_or(path).display(),
+                "{shown}:{}: {}",
                 n + 1,
                 line.chars().take(200).collect::<String>()
             ));
@@ -1467,9 +1714,11 @@ mod tests {
         assert!(result.output.contains("it is now 3 lines"), "{}", result.output);
         assert!(result.output.contains("read it again"), "{}", result.output);
 
-        // The anchor catches a number that has moved, and changes nothing.
+        // The anchor catches text that is not there, shows the real line,
+        // and changes nothing.
         let stale = execute(&call(serde_json::json!({"path": "a.txt", "from": 2, "to": 2, "text": "x", "expect": "two"})), &w, true).unwrap_err();
-        assert!(format!("{stale}").contains("not \"two\""), "{stale}");
+        assert!(format!("{stale}").contains("2: TWO-FOUR"), "{stale}");
+        assert!(!format!("{stale}").contains("have moved"), "{stale}");
         assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\nTWO-FOUR\nfive\n");
 
         // With the right anchor it goes through.
@@ -1585,7 +1834,7 @@ mod tests {
         // A near miss (the model dropped the trailing comment) shows the real
         // lines so the next attempt can copy them.
         let err = apply_replacement(original, "function subtract(a, b) {\n  return a + b;\n}", "x", false).unwrap_err();
-        assert!(err.contains("closest text"), "{err}");
+        assert!(err.contains("then differs at line 2"), "{err}");
         assert!(err.contains("return a + b; // BUG"), "{err}");
     }
 
@@ -1636,15 +1885,14 @@ mod tests {
         let r = execute(&req, &w, false).unwrap();
         assert!(r.output.contains("x.rs:1"), "{}", r.output);
         assert!(r.output.contains("x.rs:2"), "{}", r.output);
+        // Not a valid expression: searched for as typed, and said so.
         let bad = ToolRequest {
             name: "search_text".into(),
             args: serde_json::json!({"query": "(unclosed"}),
             approved: false,
         };
-        assert!(matches!(
-            execute(&bad, &w, false).unwrap_err(),
-            ToolError::InvalidArgs(_)
-        ));
+        let plain = execute(&bad, &w, false).unwrap().output;
+        assert!(plain.contains("plain text") && plain.contains("(no matches)"), "{plain}");
     }
 
     #[test]
@@ -1758,5 +2006,359 @@ mod tests {
             "{}",
             r.output.chars().take(200).collect::<String>()
         );
+    }
+}
+
+
+/// The whole tool set, driven as the agent drives it: success and failure,
+/// and whether each failure says what to do next (owner, 2026-09-18: "all
+/// tools need thorough testing"; edit_file had failed 41 of its 72 calls).
+#[cfg(test)]
+mod tool_checks {
+    use super::*;
+    use serde_json::json;
+
+    fn project(name: &str) -> WorkspaceManager {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir()
+            .join(format!("companion-tool-checks-{}-{n}", std::process::id()))
+            .join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        WorkspaceManager::new(dir)
+    }
+
+    fn run(w: &WorkspaceManager, name: &str, args: serde_json::Value) -> Result<ToolResult, ToolError> {
+        execute(&ToolRequest { name: name.into(), args, approved: true }, w, true)
+    }
+
+    fn put(w: &WorkspaceManager, rel: &str, text: &str) {
+        let path = w.root().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn get(w: &WorkspaceManager, rel: &str) -> String {
+        std::fs::read_to_string(w.root().join(rel)).unwrap()
+    }
+
+    #[test]
+    fn a_listing_marks_folders_and_says_what_a_file_an_empty_folder_or_a_wrong_path_is() {
+        let w = project("site");
+        put(&w, "a.txt", "hello");
+        put(&w, "src/main.rs", "fn main() {}\n");
+        std::fs::create_dir_all(w.root().join("src/empty")).unwrap();
+        assert_eq!(run(&w, "list_directory", json!({"path": "."})).unwrap().output, "a.txt\nsrc/");
+        assert_eq!(run(&w, "list_directory", json!({})).unwrap().output, "a.txt\nsrc/", "the root by default");
+        assert_eq!(run(&w, "list_directory", json!({"path": "src"})).unwrap().output, "empty/\nmain.rs");
+        assert!(run(&w, "list_directory", json!({"path": "src/empty"})).unwrap().output.contains("empty folder"));
+        let file = run(&w, "list_directory", json!({"path": "src/main.rs"})).unwrap_err().to_string();
+        assert!(file.contains("is a file") && file.contains("read_file"), "{file}");
+        let missing = run(&w, "list_directory", json!({"path": "empty"})).unwrap_err().to_string();
+        assert!(missing.contains("src/empty"), "the folder of that name is named: {missing}");
+        assert!(run(&w, "list_directory", json!({"path": ".."})).is_err(), "nothing above the project");
+    }
+
+    #[test]
+    fn reading_handles_line_endings_ranges_folders_binary_files_and_wrong_paths() {
+        let w = project("site");
+        put(&w, "notes/plan.md", "line one\r\nline two\r\nline three\r\n");
+        std::fs::write(w.root().join("notes/logo.png"), [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe, 0x00]).unwrap();
+        let whole = run(&w, "read_file", json!({"path": "notes/plan.md"})).unwrap().output;
+        assert!(whole.contains("1: line one") && whole.contains("3: line three") && !whole.contains('\r'), "{whole}");
+        let part = run(&w, "read_file", json!({"path": "notes/plan.md", "start_line": 2, "end_line": 2})).unwrap().output;
+        assert!(part.contains("2: line two") && !part.contains("line one") && !part.contains("line three"), "{part}");
+        let folder = run(&w, "read_file", json!({"path": "notes"})).unwrap_err().to_string();
+        assert!(folder.contains("is a folder") && folder.contains("list_directory"), "{folder}");
+        let binary = run(&w, "read_file", json!({"path": "notes/logo.png"})).unwrap_err().to_string();
+        assert!(binary.contains("not a text file"), "{binary}");
+        let missing = run(&w, "read_file", json!({"path": "plan.md"})).unwrap_err().to_string();
+        assert!(missing.contains("notes/plan.md"), "{missing}");
+        let backwards = run(&w, "read_file", json!({"path": "notes/plan.md", "start_line": 3, "end_line": 1})).unwrap_err().to_string();
+        assert!(backwards.contains("end_line"), "{backwards}");
+    }
+
+    #[test]
+    fn a_write_makes_its_folders_keeps_every_character_and_is_checked_on_disk() {
+        let w = project("site");
+        let text = "tab\there \"quotes\" 'single' back\\slash\r\nnon-ascii: São Paulo 25°C ✓\n{\"json\": [1, 2]}\n";
+        let written = run(&w, "write_file", json!({"path": "deep/er/file.txt", "content": text})).unwrap();
+        assert!(written.output.contains(WRITE_VERIFIED), "{}", written.output);
+        assert_eq!(std::fs::read(w.root().join("deep/er/file.txt")).unwrap(), text.as_bytes());
+        // Overwrites, and writes an empty file.
+        run(&w, "write_file", json!({"path": "deep/er/file.txt", "content": "second"})).unwrap();
+        assert_eq!(get(&w, "deep/er/file.txt"), "second");
+        run(&w, "write_file", json!({"path": "empty.txt", "content": ""})).unwrap();
+        assert_eq!(get(&w, "empty.txt"), "");
+        assert!(run(&w, "write_file", json!({"path": "../escape.txt", "content": "x"})).is_err());
+        let note = run(&w, "write_file", json!({"path": "x.js", "content": "[Released: 900 characters were released]"})).unwrap_err().to_string();
+        assert!(note.contains("context note"), "{note}");
+        assert!(!w.root().join("x.js").exists());
+    }
+
+    #[test]
+    fn appending_builds_a_file_in_parts() {
+        let w = project("site");
+        let first = run(&w, "append_file", json!({"path": "log/out.txt", "content": "part one\n"})).unwrap().output;
+        assert!(first.contains("it is now 9 bytes"), "{first}");
+        run(&w, "append_file", json!({"path": "log/out.txt", "content": "part two\n"})).unwrap();
+        assert_eq!(get(&w, "log/out.txt"), "part one\npart two\n");
+    }
+
+    #[test]
+    fn an_edit_that_changes_nothing_or_was_made_already_says_so() {
+        let w = project("site");
+        put(&w, "app.js", "const a = 1;\nconst b = 2;\n");
+        let same = run(&w, "edit_file", json!({"path": "app.js", "old": "const a = 1;", "new": "const a = 1;"})).unwrap_err().to_string();
+        assert!(same.contains("same text") && same.contains("nothing"), "{same}");
+        let edit = json!({"path": "app.js", "old": "const b = 2;", "new": "const b = 3; // tuned value"});
+        let first = run(&w, "edit_file", edit.clone()).unwrap().output;
+        assert!(first.contains("line 2") && first.contains("read back from disk"), "{first}");
+        // The same edit again: made already, not "not found".
+        let again = run(&w, "edit_file", edit).unwrap().output;
+        assert!(again.contains("already holds the new text"), "{again}");
+        assert_eq!(get(&w, "app.js"), "const a = 1;\nconst b = 3; // tuned value\n");
+        // An insertion repeated is not inserted twice.
+        let insert = json!({"path": "app.js", "old": "const a = 1;", "new": "const a = 1;\nconst inserted = true; // once"});
+        run(&w, "edit_file", insert.clone()).unwrap();
+        let twice = run(&w, "edit_file", insert).unwrap().output;
+        assert!(twice.contains("already holds"), "{twice}");
+        assert_eq!(get(&w, "app.js").matches("inserted").count(), 1);
+        // A short new text is not taken as made already by chance.
+        put(&w, "short.js", "x();\ny();\n");
+        let short = run(&w, "edit_file", json!({"path": "short.js", "old": "z();", "new": "y();"})).unwrap_err().to_string();
+        assert!(short.contains("not found"), "{short}");
+    }
+
+    #[test]
+    fn an_edit_from_a_stale_copy_is_told_where_the_file_differs() {
+        let w = project("site");
+        let file: String = (1..=40).map(|n| format!("line {n} of the component\n")).collect();
+        put(&w, "App.tsx", &file);
+        // The model's copy: the whole file, with line 30 as it remembers it.
+        let stale: String = (1..=40)
+            .map(|n| if n == 30 { "line 30 with a heading it never saved\n".to_string() } else { format!("line {n} of the component\n") })
+            .collect();
+        let error = run(&w, "edit_file", json!({"path": "App.tsx", "old": stale, "new": "whatever\n"})).unwrap_err().to_string();
+        assert!(error.contains("from line 1 to line 29, then differs at line 30"), "{error}");
+        assert!(error.contains("the file has: line 30 of the component"), "{error}");
+        assert!(error.contains("old has:      line 30 with a heading it never saved"), "{error}");
+        assert!(error.contains("30: line 30 of the component"), "the lines around it, numbered: {error}");
+        assert!(error.contains("40 lines long") && error.contains("write_file"), "{error}");
+        assert_eq!(get(&w, "App.tsx"), file, "nothing written");
+        let nothing = run(&w, "edit_file", json!({"path": "App.tsx", "old": "zzz qqq", "new": "x"})).unwrap_err().to_string();
+        assert!(nothing.contains("no part of the file resembles it"), "{nothing}");
+        // A short old text gets the short advice.
+        let near = run(&w, "edit_file", json!({"path": "App.tsx", "old": "line 7 of the widget", "new": "x"})).unwrap_err().to_string();
+        assert!(near.contains("Copy those lines") && !near.contains("write_file"), "{near}");
+    }
+
+    #[test]
+    fn edits_keep_a_windows_files_line_endings() {
+        let w = project("site");
+        put(&w, "win.txt", "one\r\ntwo\r\nthree\r\n");
+        run(&w, "edit_file", json!({"path": "win.txt", "old": "two", "new": "TWO\nand more"})).unwrap();
+        assert_eq!(get(&w, "win.txt"), "one\r\nTWO\r\nand more\r\nthree\r\n");
+        run(&w, "replace_lines", json!({"path": "win.txt", "from": 1, "to": 1, "text": "ONE"})).unwrap();
+        assert_eq!(get(&w, "win.txt"), "ONE\r\nTWO\r\nand more\r\nthree\r\n", "replace_lines used to turn every ending into \\n");
+        put(&w, "unix.txt", "one\ntwo\n");
+        run(&w, "replace_lines", json!({"path": "unix.txt", "from": 2, "to": 2, "text": "TWO"})).unwrap();
+        assert_eq!(get(&w, "unix.txt"), "one\nTWO\n");
+    }
+
+    #[test]
+    fn replace_lines_takes_the_whole_block_as_expect_and_says_where_text_moved() {
+        let w = project("site");
+        let original = "import React from 'react';\n\n  // Filter data based on search\n  const filtered = items.filter(m =>\n    m.name.includes(query)\n  );\nexport default App;\n";
+        put(&w, "App.tsx", original);
+        // Every line of the range as expect, trailing space and all: accepted.
+        run(&w, "replace_lines", json!({
+            "path": "App.tsx", "from": 4, "to": 6,
+            "expect": "  const filtered = items.filter(m => \n    m.name.includes(query)\n  );",
+            "text": "  const filtered = items.filter(m => m.name.includes(query));"
+        })).unwrap();
+        assert!(get(&w, "App.tsx").contains("  // Filter data based on search\n  const filtered = items.filter(m => m.name.includes(query));\nexport"));
+        // Numbers one off: the text is found where it is, and the numbers to send are named.
+        put(&w, "App.tsx", original);
+        let moved = run(&w, "replace_lines", json!({
+            "path": "App.tsx", "from": 4, "to": 6,
+            "expect": "  // Filter data based on search\n  const filtered = items.filter(m =>",
+            "text": "x"
+        })).unwrap_err().to_string();
+        assert!(moved.contains("at line 3 now") && moved.contains("Send from 3 and to 5"), "{moved}");
+        // Text not in the file: the real lines, and no claim that anything moved.
+        let wrong = run(&w, "replace_lines", json!({"path": "App.tsx", "from": 4, "to": 4, "expect": "const nothing = here;", "text": "x"})).unwrap_err().to_string();
+        assert!(wrong.contains("4:   const filtered") && !wrong.contains("have moved"), "{wrong}");
+        assert_eq!(get(&w, "App.tsx"), original, "nothing replaced on a refused anchor");
+        // Bounds.
+        assert!(run(&w, "replace_lines", json!({"path": "App.tsx", "from": 0, "to": 1, "text": "x"})).unwrap_err().to_string().contains("start at 1"));
+        assert!(run(&w, "replace_lines", json!({"path": "App.tsx", "from": 5, "to": 4, "text": "x"})).unwrap_err().to_string().contains("before"));
+        assert!(run(&w, "replace_lines", json!({"path": "App.tsx", "from": 99, "to": 99, "text": "x"})).unwrap_err().to_string().contains("past its end"));
+    }
+
+    #[test]
+    fn search_accepts_code_as_typed_and_names_files_from_the_project_root() {
+        let w = project("site");
+        put(&w, "src/components/Layout.tsx", "export const render = () => items[0];\n");
+        put(&w, "node_modules/lib/index.js", "items[0]\n");
+        let typed = run(&w, "search_text", json!({"query": "items[0", "path": "src"})).unwrap().output;
+        assert!(typed.contains("plain text"), "{typed}");
+        assert!(typed.contains("src/components/Layout.tsx:1:"), "named from the root, forward slashes: {typed}");
+        let everywhere = run(&w, "search_text", json!({"query": "render"})).unwrap().output;
+        assert!(everywhere.contains("src/components/Layout.tsx:1:"), "{everywhere}");
+        assert!(!run(&w, "search_text", json!({"query": "items\\[0"})).unwrap().output.contains("node_modules"), "dependencies are skipped");
+        let one = run(&w, "search_text", json!({"query": "render", "path": "src/components/Layout.tsx"})).unwrap().output;
+        assert!(one.starts_with("src/components/Layout.tsx:1:"), "{one}");
+        assert!(run(&w, "search_text", json!({"query": "absent_symbol"})).unwrap().output.contains("(no matches)"));
+        let missing = run(&w, "search_text", json!({"query": "x", "path": "components"})).unwrap_err().to_string();
+        assert!(missing.contains("src/components"), "{missing}");
+    }
+
+    #[test]
+    fn outline_and_delete_point_at_the_real_path_and_refuse_what_they_cannot_do() {
+        let w = project("site");
+        put(&w, "src/app.py", "def main():\n    pass\n\nclass Store:\n    pass\n");
+        let outline = run(&w, "outline", json!({"path": "src/app.py"})).unwrap().output;
+        assert!(outline.contains("main") && outline.contains("Store"), "{outline}");
+        let missing = run(&w, "outline", json!({"path": "app.py"})).unwrap_err().to_string();
+        assert!(missing.contains("src/app.py"), "{missing}");
+        let folder = run(&w, "delete_file", json!({"path": "src"})).unwrap_err().to_string();
+        assert!(folder.contains("not a file"), "{folder}");
+        let gone = run(&w, "delete_file", json!({"path": "app.py"})).unwrap_err().to_string();
+        assert!(gone.contains("src/app.py"), "{gone}");
+        run(&w, "delete_file", json!({"path": "src/app.py"})).unwrap();
+        assert!(!w.root().join("src/app.py").exists());
+        assert!(run(&w, "delete_file", json!({"path": "../x"})).is_err());
+    }
+
+    #[test]
+    fn a_path_written_from_the_folder_above_resolves_inside_the_project() {
+        let w = project("site");
+        put(&w, "src/app.js", "let app;\n");
+        // The earlier run's form of the path, and the project's own form.
+        assert!(run(&w, "read_file", json!({"path": "site/src/app.js"})).unwrap().output.contains("let app;"));
+        assert!(run(&w, "read_file", json!({"path": "src/app.js"})).unwrap().output.contains("let app;"));
+        run(&w, "write_file", json!({"path": "site/src/new.js", "content": "new\n"})).unwrap();
+        assert!(w.root().join("src/new.js").exists() && !w.root().join("site").exists(), "written inside, not into a site/site folder");
+        assert_eq!(run(&w, "list_directory", json!({"path": "site"})).unwrap().output, "src/");
+        assert_eq!(run(&w, "list_directory", json!({"path": "site\\src"})).unwrap().output, "app.js\nnew.js");
+        // A project that holds a folder of its own name keeps it.
+        let nested = project("app");
+        put(&nested, "app/inner.txt", "inner\n");
+        assert!(run(&nested, "read_file", json!({"path": "app/inner.txt"})).unwrap().output.contains("inner"));
+        // Never outside the project.
+        assert!(run(&w, "read_file", json!({"path": "site/../../escape.txt"})).is_err());
+    }
+
+    #[test]
+    fn commands_report_output_and_exit_codes_and_refuse_servers_in_the_foreground() {
+        let w = project("site");
+        let ok = run(&w, "execute_command", json!({"command": "echo tool-check"})).unwrap();
+        assert!(ok.output.contains("tool-check") && ok.exit_code == Some(0), "{}", ok.output);
+        let failed = run(&w, "execute_command", json!({"command": "exit 3"})).unwrap();
+        assert_eq!(failed.exit_code, Some(3), "{}", failed.output);
+        let server = run(&w, "execute_command", json!({"command": "npm run dev"})).unwrap_err().to_string();
+        assert!(server.contains("\"background\": true"), "{server}");
+        std::fs::create_dir_all(w.root().join("sub")).unwrap();
+        let inside = run(&w, "execute_command", json!({"command": "echo in-sub", "cwd": "sub"})).unwrap();
+        assert!(inside.output.contains("in-sub"), "{}", inside.output);
+        assert!(run(&w, "execute_command", json!({"command": "echo x", "cwd": "nope"})).is_err());
+        assert!(run(&w, "execute_command", json!({"background_id": 999_999})).unwrap_err().to_string().contains("no background command"));
+    }
+
+    #[test]
+    fn the_small_tools_answer_plainly() {
+        let w = project("site");
+        let system = run(&w, "system_info", json!({})).unwrap().output;
+        assert!(system.contains("os=") && system.contains("arch="), "{system}");
+        assert!(!run(&w, "list_processes", json!({})).unwrap().output.is_empty());
+        let commit = run(&w, "git_commit", json!({"message": "x; rm -rf /"})).unwrap_err().to_string();
+        assert!(commit.contains("single plain line"), "{commit}");
+        let open = run(&w, "open_path", json!({"path": "nothing-here.txt"})).unwrap_err().to_string();
+        assert!(open.contains("nothing was opened"), "{open}");
+        // Unknown tools and approval.
+        assert!(run(&w, "nuke", json!({})).is_err());
+        let unapproved = execute(&ToolRequest { name: "write_file".into(), args: json!({"path": "a", "content": "b"}), approved: false }, &w, false);
+        assert!(matches!(unapproved, Err(ToolError::PermissionRequired { .. })));
+    }
+}
+
+
+#[cfg(test)]
+mod command_checks {
+    use super::*;
+    use serde_json::json;
+
+    fn project() -> WorkspaceManager {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "companion-command-checks-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        WorkspaceManager::new(dir)
+    }
+
+    fn run(w: &WorkspaceManager, args: serde_json::Value) -> ToolResult {
+        execute(&ToolRequest { name: "execute_command".into(), args, approved: true }, w, true).unwrap()
+    }
+
+    #[test]
+    fn a_command_with_double_quotes_reaches_the_program_as_written() {
+        let w = project();
+        // A program that prints its arguments one per line shows exactly what
+        // arrived; python is what the live check used.
+        let py = run(&w, json!({"command": "python -c \"import sys; print('|'.join(sys.argv[1:]))\" \"two words\" plain"}));
+        if py.output.contains("not recognized") || py.output.contains("not found") {
+            eprintln!("python is not on PATH here; skipping the python half");
+        } else {
+            assert_eq!(py.exit_code, Some(0), "{}", py.output);
+            assert!(py.output.contains("two words|plain"), "{}", py.output);
+        }
+        // The shell's own quoting and operators still work.
+        let echo = run(&w, json!({"command": "echo \"quoted text\" && echo second"}));
+        assert_eq!(echo.exit_code, Some(0), "{}", echo.output);
+        assert!(echo.output.contains("quoted text") && echo.output.contains("second"), "{}", echo.output);
+        std::fs::create_dir_all(w.root().join("with space")).unwrap();
+        std::fs::write(w.root().join("with space").join("note.txt"), "inside\n").unwrap();
+        let spaced = if cfg!(windows) {
+            run(&w, json!({"command": "type \"with space\\note.txt\""}))
+        } else {
+            run(&w, json!({"command": "cat \"with space/note.txt\""}))
+        };
+        assert!(spaced.output.contains("inside"), "{}", spaced.output);
+    }
+
+    #[test]
+    fn stopping_a_background_command_as_a_shell_command_is_answered_with_the_right_form() {
+        let w = project();
+        #[cfg(windows)]
+        let long = "ping -n 30 127.0.0.1 >nul";
+        #[cfg(not(windows))]
+        let long = "sleep 30";
+        let started = run(&w, json!({"command": long, "background": true, "wait_secs": 1}));
+        assert!(started.output.contains("Id "), "{}", started.output);
+        let wrong = run(&w, json!({"command": "stop --background_id 1"}));
+        assert!(wrong.output.contains("\"background_id\": N, \"stop\": true"), "{}", wrong.output);
+        crate::terminal::stop_background_for(&w.root().to_string_lossy());
+    }
+
+    #[test]
+    fn a_folder_given_to_a_write_says_so() {
+        let w = project();
+        std::fs::create_dir_all(w.root().join("site")).unwrap();
+        let write = execute(&ToolRequest { name: "write_file".into(), args: json!({"path": "site", "content": "x"}), approved: true }, &w, true)
+            .unwrap_err()
+            .to_string();
+        assert!(write.contains("is a folder") && write.contains("site/index.html"), "{write}");
+        let append = execute(&ToolRequest { name: "append_file".into(), args: json!({"path": "site/", "content": "x"}), approved: true }, &w, true)
+            .unwrap_err()
+            .to_string();
+        assert!(append.contains("is a folder"), "{append}");
     }
 }

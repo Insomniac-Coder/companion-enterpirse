@@ -2866,6 +2866,10 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
     let mut repeated_review = 0u32;
     let mut repeated_despite_changes = 0u32;
     let mut actions_since_review = 0u32;
+    // The answer given before the host asked to look over the project (its
+    // own "before finishing" request, not a checker's finding): it stands
+    // when nothing is changed after that look.
+    let mut answer_before_check: Option<String> = None;
     let mut no_action_pushback_used = false;
     // A plan run's written plan that was not presented yet (see present_plan).
     let mut plan_draft: Option<String> = None;
@@ -3502,7 +3506,8 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                 it,
             ));
 
-            let review = if verification.needs_evidence() {
+            let host_check = verification.needs_evidence();
+            let review = if host_check {
                 CompletionReview::Continue(verification.remaining())
             } else {
                 review_completion(
@@ -3518,11 +3523,29 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
 
             match review {
                 CompletionReview::Complete => {
+                    // After the host's look over the project with nothing
+                    // changed, the last reply only describes that look: the
+                    // answer is the one before it (live check, 2026-09-18: "The
+                    // page's heading is Shop status" reached the user as "The
+                    // workspace root contains ...").
+                    let reply = match answer_before_check.take() {
+                        Some(answer) if actions_since_review == 0 => answer,
+                        _ => reply,
+                    };
                     persist_final(&state, &run, &reply).await;
                     run.emit(AgentEvent::activity("final", S::Completed, reply, it));
                     return S::Completed;
                 }
                 CompletionReview::Continue(reason) => {
+                    // Kept across the host's own look only: missing work found
+                    // by the checker makes the earlier answer stale.
+                    if host_check {
+                        if answer_before_check.is_none() {
+                            answer_before_check = Some(reply.clone());
+                        }
+                    } else {
+                        answer_before_check = None;
+                    }
                     completion_reviews += 1;
                     let reason = reason.trim().chars().take(600).collect::<String>();
                     // The same finding again means one of two things. With no

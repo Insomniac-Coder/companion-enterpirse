@@ -14119,4 +14119,165 @@ Would you like me to fix it?")]));
             .unwrap();
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
+
+
+/// Whole runs against a scripted model: the real run loop, the real tools and
+/// a real project folder, with the model's replies written in advance. Each
+/// agent request takes the next reply; the completion check and the
+/// compaction note are answered COMPLETE.
+mod scripted_runs {
+    use super::*;
+    use axum::response::IntoResponse;
+    use serde_json::json;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    async fn scripted_model(script: Vec<serde_json::Value>) -> (String, tokio::task::JoinHandle<()>, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let replies = Arc::new(Mutex::new(VecDeque::from(script)));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let (queue, seen) = (replies.clone(), bodies.clone());
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let (queue, seen) = (queue.clone(), seen.clone());
+                async move {
+                    seen.lock().unwrap().push(body.clone());
+                    if !body["stream"].as_bool().unwrap_or(false) {
+                        return axum::Json(json!({
+                            "choices": [{"message": {"content": "COMPLETE"}, "finish_reason": "stop"}],
+                            "usage": {"prompt_tokens": 100, "completion_tokens": 1}
+                        }))
+                        .into_response();
+                    }
+                    let next = queue.lock().unwrap().pop_front().unwrap_or(json!({"text": "Done."}));
+                    let frames = match next.get("call") {
+                        Some(call) => vec![
+                            json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": format!("call_{}", seen.lock().unwrap().len()), "type": "function", "function": {"name": call["name"], "arguments": call["args"].to_string()}}]}}]}),
+                            json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}], "usage": {"prompt_tokens": 100, "completion_tokens": 10}}),
+                        ],
+                        None => vec![
+                            json!({"choices": [{"delta": {"content": next["text"]}}]}),
+                            json!({"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 100, "completion_tokens": 10}}),
+                        ],
+                    };
+                    let mut sse = String::new();
+                    for frame in frames {
+                        sse.push_str(&format!("data: {frame}\n\n"));
+                    }
+                    sse.push_str("data: [DONE]\n\n");
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://127.0.0.1:{port}"), server, bodies)
+    }
+
+    fn native_profile() -> crate::tooling::ToolingProfile {
+        crate::tooling::ToolingProfile {
+            version: crate::tooling::PROFILE_VERSION,
+            method: crate::tooling::ToolMethod::Native,
+            can_write: true,
+            file_text: crate::tooling::FileText::Arguments,
+            checked_at: "2026-09-18T00:00:00Z".into(),
+            runtime: "scripted".into(),
+            template: "scripted".into(),
+            template_reports_tools: Some(true),
+            checks: Vec::new(),
+            duration_ms: 0,
+        }
+    }
+
+    /// Starts `script` on `task` in a fresh project folder and returns the
+    /// run's final message and the folder.
+    async fn run_script(task: &str, script: Vec<serde_json::Value>) -> (String, std::path::PathBuf, Vec<crate::agent::AgentEvent>) {
+        let state = AppState::new_stub();
+        let (url, server, _bodies) = scripted_model(script).await;
+        let mut stand_in = if cfg!(windows) {
+            let mut command = tokio::process::Command::new("cmd");
+            command.args(["/C", "ping", "-n", "120", "127.0.0.1"]);
+            command
+        } else {
+            let mut command = tokio::process::Command::new("sleep");
+            command.arg("120");
+            command
+        };
+        let child = stand_in
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let cfg = crate::inference::InferenceConfig { n_ctx: 16384, tooling: Some(native_profile()), ..Default::default() };
+        state.llama.write().await.running = Some(crate::llamaserver::RunningSidecar::stand_in(child, url, cfg));
+        let app = router(state.clone());
+        let mode = app.clone().oneshot(json_req("PUT", "/api/permissions/mode", json!({"mode": "auto"}))).await.unwrap();
+        assert_eq!(mode.status(), StatusCode::OK);
+        let folder = std::path::PathBuf::from(agent_ws());
+        std::fs::write(folder.join("a.txt"), "hello\n").unwrap();
+        let started = app
+            .clone()
+            .oneshot(json_req("POST", "/api/agent/run", json!({"workspace": folder.to_string_lossy(), "task": task, "mode": "agent"})))
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::OK);
+        let run_id = body_json(started).await["run_id"].as_str().unwrap().to_string();
+        let run = state.agents.read().await.get(&run_id).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !matches!(run.state(), AgentState::Completed | AgentState::Failed | AgentState::Cancelled) {
+            assert!(std::time::Instant::now() < deadline, "the scripted run did not finish");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let events = run.events.lock().unwrap().clone();
+        let last = events.last().unwrap().clone();
+        state.llama.write().await.stop().await;
+        server.abort();
+        assert_eq!(last.state, AgentState::Completed, "{:?}", events.iter().map(|e| e.message.chars().take(160).collect::<String>()).collect::<Vec<_>>());
+        (last.message, folder, events)
+    }
+
+    /// Whether the host asked for its look over the project in this run.
+    fn host_looked(events: &[crate::agent::AgentEvent]) -> bool {
+        events.iter().any(|event| event.message.contains("Before finishing, list"))
+    }
+
+    #[tokio::test]
+    #[ignore = "open (decision 72): the task text names out.txt, which the host reads as a requested txt document, so the run takes the document path instead of the look over the project"]
+    async fn an_answer_given_before_the_hosts_look_over_the_project_is_the_final_message() {
+        let (final_message, _, events) = run_script(
+            "Run `echo checked > out.txt` in the project and tell me the page heading.",
+            vec![
+                json!({"call": {"name": "execute_command", "args": {"command": "echo checked > out.txt"}}}),
+                json!({"text": "The page's heading is Shop status."}),
+                json!({"call": {"name": "list_directory", "args": {"path": "."}}}),
+                json!({"text": "The workspace root contains a.txt and out.txt."}),
+            ],
+        )
+        .await;
+        assert!(host_looked(&events), "the command should have made the host ask for a look");
+        assert_eq!(final_message, "The page's heading is Shop status.");
+    }
+
+    #[tokio::test]
+    #[ignore = "open (decision 72): same as the test above"]
+    async fn a_change_made_after_the_hosts_look_makes_the_new_answer_the_final_one() {
+        let (final_message, folder, events) = run_script(
+            "Run `echo checked > out.txt` in the project and tell me the page heading.",
+            vec![
+                json!({"call": {"name": "execute_command", "args": {"command": "echo checked > out.txt"}}}),
+                json!({"text": "The page's heading is Shop status."}),
+                json!({"call": {"name": "list_directory", "args": {"path": "."}}}),
+                json!({"call": {"name": "write_file", "args": {"path": "fix.txt", "content": "fixed\n"}}}),
+                json!({"text": "I also wrote fix.txt; the heading is Shop status."}),
+            ],
+        )
+        .await;
+        assert!(host_looked(&events), "the command should have made the host ask for a look");
+        assert!(folder.join("fix.txt").exists());
+        assert_eq!(final_message, "I also wrote fix.txt; the heading is Shop status.");
+    }
+}
 }

@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Direction C · Graphite</title>
+<style>
+@font-face { font-family: 'Inter'; font-weight: 300 700; src: url(fonts/inter.woff2) format('woff2'); }
+@font-face { font-family: 'JetBrains Mono'; font-weight: 400 600; src: url(fonts/jetbrains-mono.woff2) format('woff2'); }
+:root {
+  --bg: #0e0f12;
+  --side: #121317;
+  --panel: #16181c;
+  --raise: #1c1e23;
+  --line: #24262c;
+  --line-2: #30333a;
+  --ink: #ecedf0;
+  --ink-2: #b4b8c1;
+  --ink-3: #7d828d;
+  --ink-4: #555a64;
+  --ice: #9db9ff;
+  --ice-wash: rgba(157, 185, 255, 0.1);
+  --wait: #e8b05c;
+  --wait-wash: rgba(232, 176, 92, 0.09);
+  --wait-line: rgba(232, 176, 92, 0.3);
+  --on-ink: #0e0f12;
+  --mark: linear-gradient(140deg, #e9ecf5, #9db9ff);
+  --mark-ring: #0e0f12;
+  --avatar: #2c3140;
+  --lift: 0 16px 40px -20px rgba(0, 0, 0, 0.8);
+  --key-line: rgba(14, 15, 18, 0.25);
+  --sans: 'Inter', 'Segoe UI', system-ui, sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, monospace;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--ink); font: 13.5px/1.55 var(--sans); letter-spacing: -0.005em; -webkit-font-smoothing: antialiased; }
+svg.i { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; flex: none; }
+.app { display: grid; grid-template-columns: 244px 1fr; grid-template-rows: 900px; height: 900px; }
+
+.side { background: var(--side); border-right: 1px solid var(--line); padding: 12px 10px; display: flex; flex-direction: column; gap: 1px; }
+.org { display: flex; align-items: center; gap: 9px; padding: 4px 8px 12px; }
+.org .mark { width: 20px; height: 20px; border-radius: 6px; background: var(--mark); display: grid; place-items: center; }
+.org .mark span { width: 7px; height: 7px; border-radius: 50%; border: 2px solid var(--mark-ring); border-right-color: transparent; transform: rotate(-45deg); }
+.org b { font-weight: 600; font-size: 13.5px; }
+.org .chev { margin-left: auto; color: var(--ink-3); }
+.row { display: flex; align-items: center; gap: 10px; height: 30px; padding: 0 8px; border-radius: 7px; color: var(--ink-2); }
+.row.on { background: var(--raise); color: var(--ink); }
+.row kbd, .k { margin-left: auto; font: 10.5px var(--mono); color: var(--ink-3); padding: 1px 5px; border-radius: 4px; box-shadow: inset 0 0 0 1px var(--line-2); }
+.row .n { margin-left: auto; font: 11px var(--mono); color: var(--ink-3); }
+.sec { padding: 16px 8px 5px; font: 500 11px var(--sans); letter-spacing: 0.04em; color: var(--ink-4); text-transform: uppercase; }
+.conv { height: 30px; display: flex; align-items: center; gap: 9px; padding: 0 8px; border-radius: 7px; color: var(--ink-2); white-space: nowrap; overflow: hidden; }
+.conv .st { width: 6px; height: 6px; border-radius: 50%; background: var(--ink-4); flex: none; }
+.conv .st.wait { background: var(--wait); }
+.conv.on { background: var(--raise); color: var(--ink); }
+.conv .t { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.me { margin-top: auto; display: flex; align-items: center; gap: 9px; padding: 8px; border-top: 1px solid var(--line); color: var(--ink-2); }
+.me .av { width: 24px; height: 24px; border-radius: 50%; background: var(--avatar); color: var(--ink); display: grid; place-items: center; font-size: 10.5px; font-weight: 600; }
+.me .i { margin-left: auto; color: var(--ink-3); }
+
+.main { display: flex; flex-direction: column; min-width: 0; }
+.top { height: 52px; display: flex; align-items: center; gap: 12px; padding: 0 18px; border-bottom: 1px solid var(--line); }
+.crumb { display: flex; align-items: center; gap: 8px; color: var(--ink-3); }
+.crumb b { color: var(--ink); font-weight: 500; }
+.cmd { margin: 0 auto; width: 380px; height: 30px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border-radius: 8px; background: var(--panel); box-shadow: inset 0 0 0 1px var(--line); color: var(--ink-3); }
+.cmd .k { margin-left: auto; }
+.inside { display: inline-flex; align-items: center; gap: 6px; font: 500 11px var(--mono); letter-spacing: 0.04em; color: var(--ice); text-transform: uppercase; }
+.inside .i { width: 14px; height: 14px; }
+
+.thread { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; }
+.col { width: 700px; margin: 0 auto; }
+.msg { padding: 14px 0; border-top: 1px solid var(--line); }
+.msg:first-child { border-top: 0; }
+.meta { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; font: 11px var(--mono); color: var(--ink-3); letter-spacing: 0.02em; }
+.meta b { font-weight: 500; color: var(--ink-2); }
+.meta .sep { color: var(--ink-4); }
+.meta .ok { color: var(--ice); }
+.meta .tm { margin-left: auto; color: var(--ink-4); }
+.msg.you p { margin: 0; color: var(--ink); }
+.answer { color: var(--ink); font-size: 14px; line-height: 1.62; }
+.answer p { margin: 0 0 9px; color: var(--ink-2); }
+.answer ul { margin: 0 0 12px; padding-left: 18px; color: var(--ink-2); }
+.answer li { margin: 3px 0; }
+.answer li b { color: var(--ink); font-weight: 600; }
+.ref { font: 500 10.5px var(--mono); color: var(--ice); margin-left: 3px; vertical-align: 2px; }
+table { border-collapse: collapse; margin: 2px 0 4px; font-variant-numeric: tabular-nums; font-size: 13px; }
+th { text-align: left; font: 500 11px var(--mono); letter-spacing: 0.03em; text-transform: uppercase; color: var(--ink-3); padding: 4px 26px 6px 0; border-bottom: 1px solid var(--line-2); }
+td { padding: 6px 26px 6px 0; border-bottom: 1px solid var(--line); color: var(--ink); }
+.src { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+.src span { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 8px; border-radius: 6px; background: var(--panel); box-shadow: inset 0 0 0 1px var(--line); color: var(--ink-2); font-size: 12px; }
+.src span em { font: normal 500 10.5px var(--mono); color: var(--ice); }
+.gate { margin-top: 4px; border-radius: 10px; background: var(--wait-wash); box-shadow: inset 0 0 0 1px var(--wait-line); overflow: hidden; }
+.gate .h { display: flex; align-items: center; gap: 10px; padding: 10px 12px; color: var(--ink); font-weight: 500; }
+.gate .h .i { color: var(--wait); }
+.gate .h small { margin-left: auto; font: 11px var(--mono); color: var(--wait); letter-spacing: 0.03em; text-transform: uppercase; }
+.gate .body { margin: 0 12px; padding: 10px 12px; border-radius: 8px; background: var(--panel); box-shadow: inset 0 0 0 1px var(--line); color: var(--ink-2); font-size: 13px; }
+.gate .body div span { display: inline-block; width: 60px; color: var(--ink-3); }
+.gate .body ol { margin: 6px 0 0; padding-left: 18px; color: var(--ink); }
+.gate .acts { display: flex; align-items: center; gap: 8px; padding: 10px 12px 12px; }
+.b { height: 28px; display: inline-flex; align-items: center; gap: 8px; padding: 0 10px; border-radius: 7px; font-weight: 500; font-size: 12.5px; color: var(--ink-2); box-shadow: inset 0 0 0 1px var(--line-2); }
+.b.go { background: var(--ink); color: var(--on-ink); box-shadow: none; }
+.b .k { margin: 0; box-shadow: inset 0 0 0 1px var(--key-line); color: inherit; opacity: 0.7; }
+
+.dock { padding: 10px 0 18px; }
+.composer { width: 700px; margin: 0 auto; border-radius: 12px; background: var(--panel); box-shadow: inset 0 0 0 1px var(--line-2), var(--lift); padding: 12px 12px 10px 14px; }
+.composer .ph { color: var(--ink-4); height: 24px; font-size: 14px; }
+.composer .bar { display: flex; align-items: center; gap: 4px; margin-top: 8px; color: var(--ink-3); }
+.composer .bar .t { height: 28px; display: inline-flex; align-items: center; gap: 6px; padding: 0 8px; border-radius: 7px; font-size: 12.5px; }
+.composer .model { margin-left: auto; height: 28px; display: inline-flex; align-items: center; gap: 7px; padding: 0 9px; border-radius: 7px; box-shadow: inset 0 0 0 1px var(--line-2); color: var(--ink-2); font-size: 12.5px; }
+.composer .model em { font: normal 500 10.5px var(--mono); color: var(--ice); letter-spacing: 0.04em; }
+.composer .send { width: 28px; height: 28px; margin-left: 6px; border-radius: 7px; background: var(--ink); color: var(--on-ink); display: grid; place-items: center; }
+</style>
+</head>
+<body>
+<!--ICONS-->
+<div class="app">
+  <aside class="side">
+    <div class="org"><div class="mark"><span></span></div><b>Companion</b><svg class="i chev"><use href="#i-down"/></svg></div>
+    <div class="row"><svg class="i"><use href="#i-plus"/></svg>New chat<kbd>C</kbd></div>
+    <div class="row"><svg class="i"><use href="#i-search"/></svg>Search<kbd>/</kbd></div>
+    <div class="sec">Workspace</div>
+    <div class="row on"><svg class="i"><use href="#i-chat"/></svg>Chats<span class="n">12</span></div>
+    <div class="row"><svg class="i"><use href="#i-code"/></svg>Code tasks<span class="n">3</span></div>
+    <div class="row"><svg class="i"><use href="#i-book"/></svg>Documents<span class="n">4</span></div>
+    <div class="row"><svg class="i"><use href="#i-plug"/></svg>Tools<span class="n">6</span></div>
+    <div class="sec">Recent</div>
+    <div class="conv on"><span class="st wait"></span><span class="t">Quarterly report summary</span></div>
+    <div class="conv"><span class="st"></span><span class="t">Supplier contract questions</span></div>
+    <div class="conv"><span class="st"></span><span class="t">Onboarding checklist for new hires</span></div>
+    <div class="conv"><span class="st"></span><span class="t">Fix the invoice export job</span></div>
+    <div class="conv"><span class="st"></span><span class="t">Q4 hiring plan draft</span></div>
+    <div class="me"><div class="av">AM</div>Alex Morgan<svg class="i"><use href="#i-gear"/></svg></div>
+  </aside>
+  <main class="main">
+    <header class="top">
+      <div class="crumb">Chats <span style="color:var(--ink-4)">/</span> <b>Quarterly report summary</b></div>
+      <div class="cmd"><svg class="i"><use href="#i-search"/></svg>Search, or run a command<span class="k">Ctrl K</span></div>
+      <span class="inside"><svg class="i"><use href="#i-shield"/></svg>Inside the company</span>
+    </header>
+    <div class="thread"><div class="col">
+      <div class="msg you"><div class="meta"><b>You</b><span class="tm">10:42</span></div><p>Summarise the Q3 operations report for Thursday's leadership meeting. Keep it to what changed and what needs a decision.</p></div>
+      <div class="msg"><div class="meta"><b>Companion</b><span class="sep">·</span>company model<span class="sep">·</span>2 documents<span class="sep">·</span>Jira<span class="sep">·</span><span class="ok">inside</span><span class="tm">4.1 s</span></div>
+        <div class="answer">
+          <p>Here is a one-page summary of the Q3 operations report.</p>
+          <ul>
+            <li><b>Order volume</b> grew 12% on Q2, mostly from the two new regional distributors.<span class="ref">[1]</span></li>
+            <li><b>Fulfilment time</b> fell from 3.4 to 2.6 days after the warehouse moved to two shifts.<span class="ref">[1]</span></li>
+            <li><b>Support tickets</b> rose 18%; most were about the new invoice format.<span class="ref">[2]</span></li>
+          </ul>
+          <table>
+            <tr><th>Measure</th><th>Q2</th><th>Q3</th><th>Change</th></tr>
+            <tr><td>Orders</td><td>41,200</td><td>46,150</td><td>+12%</td></tr>
+            <tr><td>Fulfilment, days</td><td>3.4</td><td>2.6</td><td>−0.8</td></tr>
+            <tr><td>Support tickets</td><td>2,310</td><td>2,725</td><td>+18%</td></tr>
+          </table>
+          <div class="src"><span><em>1</em>Q3 Operations Report.pdf · p. 4, 7</span><span><em>2</em>Leadership notes, September.docx</span><span><svg class="i" style="width:14px;height:14px"><use href="#i-ticket"/></svg>FIN-412</span></div>
+        </div>
+      </div>
+      <div class="msg you"><div class="meta"><b>You</b><span class="tm">10:44</span></div><p>Draft the two decisions as agenda questions and email them to the leadership team.</p></div>
+      <div class="msg"><div class="meta"><b>Companion</b><span class="sep">·</span>company model<span class="sep">·</span>Outlook<span class="sep">·</span><span class="ok">inside</span><span class="tm">2.3 s</span></div>
+        <div class="gate">
+          <div class="h"><svg class="i"><use href="#i-mail"/></svg>Send an email with Outlook<small>Waiting for you</small></div>
+          <div class="body">
+            <div><span>To</span>Leadership team</div>
+            <div><span>Subject</span>Agenda: two decisions for Thursday</div>
+            <ol><li>Do we make the warehouse's second shift permanent in Q4?</li><li>Do we roll back the new invoice format, or fund the fix (FIN-412)?</li></ol>
+          </div>
+          <div class="acts"><span class="b go">Send <span class="k">Enter</span></span><span class="b">Edit <span class="k" style="color:var(--ink-3)">E</span></span><span class="b">Don't send <span class="k" style="color:var(--ink-3)">Esc</span></span></div>
+        </div>
+      </div>
+    </div></div>
+    <div class="dock"><div class="composer">
+      <div class="ph">Ask, or describe a task…</div>
+      <div class="bar">
+        <span class="t"><svg class="i"><use href="#i-clip"/></svg></span>
+        <span class="t"><svg class="i"><use href="#i-book"/></svg>Operations reports</span>
+        <span class="t"><svg class="i"><use href="#i-globe"/></svg>Web</span>
+        <span class="model">Company model <em>· inside</em><svg class="i" style="width:14px;height:14px"><use href="#i-down"/></svg></span>
+        <span class="send"><svg class="i"><use href="#i-up"/></svg></span>
+      </div>
+    </div></div>
+  </main>
+</div>
+</body>
+</html>

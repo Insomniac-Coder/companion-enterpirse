@@ -1,6 +1,6 @@
 // End-to-end evaluation of chat and coding-agent behaviour through the real
 // backend API, with a disposable fixture project and a scratch database.
-import { readFileSync, writeFileSync, copyFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, copyFileSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 
 const API = process.env.COMPANION_API || 'http://127.0.0.1:5173';
@@ -139,7 +139,9 @@ const py = r.text.match(/```(?:python)?\n([\s\S]*?)```/);
 if (py) {
   const path = new URL('./generated.py', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
   writeFileSync(path, py[1]);
-  try { execFileSync('python', [path], { stdio: 'pipe', timeout: 20000 }); log('  generated python executed without error (asserts held)'); }
+  // Linux and macOS name it python3.
+  const python = process.platform === 'win32' ? 'python' : 'python3';
+  try { execFileSync(python, [path], { stdio: 'pipe', timeout: 20000 }); log('  generated python executed without error (asserts held)'); }
   catch (e) { log(`  generated python FAILED: ${(e.stderr || e.message).toString().slice(-300)}`); }
 }
 
@@ -177,6 +179,7 @@ writeFileSync(new URL(`./agent-deltas-${MODEL}.txt`, import.meta.url).pathname.r
 log(`  events: ${run.events.filter((e) => e.kind !== 'context').map((e) => `${e.iteration}:${e.kind}${e.tool ? '(' + e.tool + ')' : ''}`).join(' ')}`);
 // restore fixture
 copyFileSync(FIXTURE + 'calculator.js.orig', FIXTURE + 'calculator.js');
+unlinkSync(FIXTURE + 'calculator.js.orig');
 
 // Report
 writeFileSync(new URL(`./report-${MODEL}.txt`, import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'), report.join('\n'));

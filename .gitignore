@@ -58,5 +58,9 @@ Desktop.ini
 /models/**/tooling.json
 /models/**/tooling.json.tmp
 
+# What scripts/e2e/e2e.mjs writes for each run (the report is read, not kept).
+/scripts/e2e/*.txt
+/scripts/e2e/generated.py
+
 # Page previews from docs/enterprise/plan-source/render.sh
 docs/enterprise/plan-source/preview-*.png

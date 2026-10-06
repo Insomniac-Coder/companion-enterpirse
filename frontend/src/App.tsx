@@ -26,6 +26,7 @@ import RuntimePage from './components/RuntimePage';
 import ToolsPage from './components/ToolsPage';
 import { PERMISSION_MODE_DESCRIPTIONS, PERMISSION_MODE_LABELS, PROJECT_BOUNDARY_DESCRIPTION, SEARCH_PERMISSION_DESCRIPTION } from './components/permissionCopy';
 import { VisibleOutputMeter, type GenerationPhase, type OutputTiming } from './services/outputTiming';
+import { signOut, type Me } from './services/account';
 import { applyAgentContext } from './services/contextUsage';
 import { currentActivitySnapshot, parseActivityStart, visibleWorkActivity } from './services/workElapsed';
 import { groupActivity, groupSessionsByProject, lastSessionKey, projectGroupOpen, projectPick, projectRemoval, type ProjectGroup } from './services/projectSessions';
@@ -82,7 +83,7 @@ function shortcutLabel(binding: string) {
   return binding.split('+').map((part) => part.trim()).map((part) => part.length === 1 ? part.toUpperCase() : part[0].toUpperCase() + part.slice(1)).join(' ');
 }
 
-export default function App() {
+export default function App({ me }: { me?: Me }) {
   const [tab, setTab] = useState<'chat' | PageId>('chat');
   const [mode, setMode] = useState<'chat' | 'code'>(() => (localStorage.getItem('companion.mode') as any) || 'chat');
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -1584,6 +1585,13 @@ export default function App() {
               {!rail && <span>{label}</span>}
             </button>
           ))}
+          {me?.sign_in && (
+            <div className="sb-person" title={me.email || me.name}>
+              <span className="sb-person-initial" aria-hidden="true">{(me.name || '?').slice(0, 1).toUpperCase()}</span>
+              {!rail && <span className="sb-person-name">{me.name}</span>}
+              <IconButton icon="power" label={`Sign out ${me.name}`} size="sm" tipSide={rail ? 'right' : 'top'} onClick={() => { void signOut().then(() => { window.location.href = '/'; }, () => notify('error', 'Sign-out did not finish. Try again.')); }} />
+            </div>
+          )}
         </nav>
 
         <Rig
@@ -2054,7 +2062,7 @@ export default function App() {
 
         {tab === 'tools' && <ToolsPage registry={registry} wsId={wsId} notify={notify} onRefresh={() => void refreshRegistry()} />}
 
-        {tab === 'settings' && <SettingsPanel setToasts={setToasts} />}
+        {tab === 'settings' && <SettingsPanel setToasts={setToasts} me={me} />}
 
         {diffWs && <DiffModal wsId={diffWs} onClose={() => setDiffWs(null)} />}
       </div>

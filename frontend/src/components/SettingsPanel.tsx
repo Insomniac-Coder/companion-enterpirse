@@ -4,6 +4,8 @@ import { cacheConflict, flashAttentionRequired, FLASH_ATTENTION_CONFLICT_NOTE, F
 import { Children, cloneElement, isValidElement, useEffect, useId, useRef, useState, type ReactElement, type ReactNode } from 'react';
 import { getSettings, putSettings, listModels, scanModels, getRuntimePolicy, type ModelMeta } from '../services/api';
 import { pushToast, type Toast } from './Toasts';
+import AccountSection from './AccountSection';
+import type { Me } from '../services/account';
 import { defaultModelOptions, type ModelListState } from './settingsModels';
 import { expertSectionOpen, settingsSearchMatches, updateSetting } from './settingsForm';
 import { PERMISSION_MODE_DESCRIPTIONS, PERMISSION_MODE_LABELS, PROJECT_BOUNDARY_DESCRIPTION, SEARCH_PERMISSION_DESCRIPTION } from './permissionCopy';
@@ -14,6 +16,7 @@ type SetPreference = (path: string[], value: unknown) => void;
 type RuntimePolicy = Awaited<ReturnType<typeof getRuntimePolicy>>;
 
 const SECTION_ICONS: Record<string, IconName> = {
+  Account: 'lock',
   Personalization: 'sun',
   Assistant: 'sparkle',
   'Web search': 'globe',
@@ -100,7 +103,7 @@ export function RuntimeSummary({ policy, dirty }: { policy: RuntimePolicy; dirty
   </details>;
 }
 
-export default function SettingsPanel({ setToasts }: { setToasts: React.Dispatch<React.SetStateAction<Toast[]>> }) {
+export default function SettingsPanel({ setToasts, me }: { setToasts: React.Dispatch<React.SetStateAction<Toast[]>>; me?: Me }) {
   const [s, setS] = useState<any>(null);
   const [savedSettings, setSavedSettings] = useState<any>(null);
   const [settingsError, setSettingsError] = useState('');
@@ -254,6 +257,8 @@ export default function SettingsPanel({ setToasts }: { setToasts: React.Dispatch
         <div className="settings-page" ref={page}>
           <div className="settings-search"><Icon name="search" size={15} /><input aria-label="Search settings" placeholder="Search settings" value={query} onChange={(event) => setQuery(event.target.value)} /></div>
           {query.trim() && matchCount === 0 && <p className="settings-empty" role="status">No settings match “{query}”. Try a different term or <button type="button" onClick={() => setQuery('')}>clear search</button>.</p>}
+
+          {me?.sign_in && me.via === 'session' && <AccountSection me={me} setToasts={setToasts} />}
 
           <section className="settings-section" data-settings-title="Personalization">
             <h2><Icon name="sun" size={16} />Personalization</h2><p className="settings-section-intro">Choose how Companion looks and what appears in your conversations.</p>

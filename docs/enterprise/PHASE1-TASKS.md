@@ -47,9 +47,13 @@ actually took.
 |---|---|---|---|
 | 1 | PostgreSQL | Done 2026-10-06 | sqlx pool; `backend/migrations/0001_initial.sql` (18 tables); every storage call async; a private PostgreSQL started and stopped by the app (`pgsql.rs`) from `runtime/pgsql/`, installed by `scripts/get-postgres.py` from the pinned, checksum-checked `runtime/postgresql.lock.json` (Windows: the EnterpriseDB build, 141 MB kept; Linux: built from the official source, 27 MB); `companion-backend backup` (pg_dump) replaces the SQLite backup script. Three places where the old lock had made several steps one were made safe again: a run's final event and its reply text are saved together; editing a conversation saves only the fields it changed; re-indexing a file replaces its chunks as one step |
 | 2 | Import the Companion's history | Done 2026-10-06 | `companion-backend import-sqlite <file>`: every table, in the file's order, column by column (an older file's missing columns take their defaults), one transaction, safe to run twice. Owners arrive with task 5 |
+| 3 | Company sign-in | Done 2026-10-06 | `auth.rs` + `migrations/0002_sign_in.sql`: OpenID Connect sign-in (authorization code with PKCE; the ID token's signature, issuer, audience, expiry and nonce checked by the `openidconnect` crate) for Entra ID or any standard provider; session cookie; API keys; every `/api/` route knows who is calling; without sign-in the server refuses any address but this PC's, and is the local person. Screens: a sign-in page, the person in the sidebar, Settings > Account with API keys (only on a server with sign-in). Checked against a stand-in provider in the tests (tampered tokens, replayed and stale links, expired sessions, withdrawn keys) and live in a browser. Not done here: groups and roles (task 4), owners on records (task 5), the sign-in audit record (task 8), the desktop app's sign-in (Phase 3) |
 
-Tests: backend 536 on Windows and 534 on Linux (Ubuntu under WSL), frontend 114, against a throwaway private database
-that ends with the run; the test database skips crash-safe writes, which took a third off the run.
+Tests: backend 547 on Windows and 545 on Linux (Ubuntu under WSL), frontend 118 on both, against a throwaway
+private database that ends with the run; the test database skips crash-safe writes, which took a third off the run.
+Linux also checked end to end (2026-10-06): `run.sh` from a fresh copy (model runtime built CPU-only, private
+database, UI), `scripts/e2e/e2e.mjs` with a real model, and Ctrl+C leaving nothing running; the same script on
+Windows with the same model failed in the same places (the model's own mistakes), so none was the OS.
 
 ## Not in Phase 1
 

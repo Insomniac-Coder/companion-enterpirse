@@ -355,6 +355,38 @@ directories); results carry evidence IDs the model can keep or release as contex
 | `COMPANION_MODELS_DIR` | models directory | `models/` |
 | `COMPANION_FRONTEND_DIR` | compiled UI | `frontend/dist/` |
 | `COMPANION_LLAMA_SERVER_BIN` | a specific `llama-server` | `runtime/bin/`, then `PATH` |
+| `COMPANION_OIDC_ISSUER`, `COMPANION_OIDC_CLIENT_ID`, `COMPANION_OIDC_CLIENT_SECRET`, `COMPANION_PUBLIC_URL` | sign-in for a server several people use (see "Sign-in") | unset: no sign-in, this PC only |
+
+## Sign-in (a server for several people)
+
+Without sign-in, Companion serves only the PC it runs on: it refuses to listen on an address other
+machines can reach, and whoever uses it is the one local person. A server for several people needs
+sign-in through the company's identity provider (OpenID Connect: Microsoft Entra ID, or any standard
+provider). Set all four (setting some but not all stops startup, naming the missing ones):
+
+| Variable | What it is |
+| --- | --- |
+| `COMPANION_OIDC_ISSUER` | the identity provider; for Entra ID `https://login.microsoftonline.com/<Directory (tenant) ID>/v2.0` |
+| `COMPANION_OIDC_CLIENT_ID` | the app registration's *Application (client) ID* |
+| `COMPANION_OIDC_CLIENT_SECRET` | the app registration's client secret; keep it out of Git and shared files |
+| `COMPANION_PUBLIC_URL` | the address people open, e.g. `https://companion.example.com` |
+
+Microsoft Entra ID, once, in the Entra admin center (an administrator may need to do this):
+
+1. **App registrations > New registration**: name it Companion; *Accounts in this organizational
+   directory only*; redirect URI of type *Web*: `<COMPANION_PUBLIC_URL>/api/auth/callback`.
+2. Its **Overview** shows the *Application (client) ID* and the *Directory (tenant) ID*.
+3. **Certificates & secrets > New client secret**: its *Value* is the client secret.
+
+Then set `COMPANION_ADDR` to an address other machines reach (for example `0.0.0.0:3877`) and put
+Companion behind HTTPS (a reverse proxy such as nginx or IIS, or a cloud load balancer);
+`COMPANION_PUBLIC_URL` is that HTTPS address.
+
+People sign in with their company account; a sign-in lasts 12 hours. **Settings > Account** shows who
+is signed in, signs out, and makes **API keys** for software such as a build server or a script: it
+sends `Authorization: Bearer <key>` and acts as the person who made the key. A key is shown once and
+only its fingerprint is stored; withdrawing it stops it at once. Keys are made and withdrawn from a
+signed-in browser only, never with another key.
 
 ## Checks
 

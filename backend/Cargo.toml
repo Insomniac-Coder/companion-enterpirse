@@ -25,6 +25,8 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 percent-encoding = "2"
+# Company sign-in (OpenID Connect: Microsoft Entra ID or any standard provider).
+openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
 sysinfo = "0.30"
 futures = "0.3"
 tower = { version = "0.4", features = ["util"] }
@@ -47,3 +49,12 @@ ashpd = { version = "0.11", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
+# Signing keys for the tests' stand-in identity provider.
+rsa = { version = "0.9", features = ["getrandom"] }
+
+# RSA key generation (the sign-in tests) takes minutes without optimisation.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
+[profile.dev.package.rsa]
+opt-level = 3

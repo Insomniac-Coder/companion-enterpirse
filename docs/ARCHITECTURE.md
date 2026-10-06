@@ -533,6 +533,13 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   Startup stops with an error when the database cannot be opened; there is no in-memory fallback.
 
 ## Security invariants (§92–93)
+- Every `/api/` request has a `Caller` (`auth.rs`, enterprise Phase 1 task 3): without sign-in, the one
+  local person, and the server refuses any address other machines reach; with sign-in (OpenID Connect),
+  a session cookie (HttpOnly, SameSite=Lax, 12 h, only its SHA-256 stored) or an API key (only its
+  SHA-256 stored; managed from a signed-in browser only). `/api/health` and the two sign-in routes are
+  the only ones that answer anyone. A sign-in's return link is accepted only in the browser that
+  started it (a short-lived cookie holds its state), so nobody can be signed in to someone else's
+  account by being sent that person's link.
 - `LLM → ToolRequest → PermissionManager → Tool → OS`. No direct OS access.
 - `WorkspaceManager::resolve` is the only path joiner; lexical + canonical checks.
 - MODERATE/DANGEROUS tools require `approved=true` (permission UX sets it, §26).

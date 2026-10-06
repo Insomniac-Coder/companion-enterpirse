@@ -26,8 +26,11 @@ fork to drop the model weights (Git LFS); commit ids differ from the Companion's
   `runtime/pgsql/` (`python scripts/get-postgres.py` installs it; the run scripts do it on first run).
   Tests need that install or `COMPANION_TEST_DATABASE_URL`. Linux is checked in WSL Ubuntu: a copy of the
   tree in `~/companion-linux` there; building PostgreSQL needs bison and flex (WSL has no passwordless
-  sudo, so for the check they were unpacked into `~/buildtools`, not installed). Next: task 3 (sign-in,
-  not enforced on the laptop).
+  sudo, so for the check they were unpacked into `~/buildtools`, not installed; Node.js 24 is there too).
+  Task 3 (sign-in) done the same day: `auth.rs`; without the four `COMPANION_OIDC_*`/`COMPANION_PUBLIC_URL`
+  settings the server is the local person and refuses non-loopback addresses. A live sign-in can be
+  checked against a throwaway stand-in provider (the tests have one in Rust; a Node one was used for the
+  browser check). Next: task 4 (users, groups and roles).
 - Everything below this section is the Companion's own handoff, kept as it was at the fork.
 
 # Handoff — start here

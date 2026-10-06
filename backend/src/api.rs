@@ -107,6 +107,8 @@ pub struct AppState {
     >,
     /// The fit search ahead of each model's first load.
     pub fit_preparation: Arc<FitPreparation>,
+    /// How callers are told apart: sign-in, or one local person.
+    pub auth: Arc<crate::auth::Auth>,
 }
 
 /// Stage 21 load progress with truthful stages (§174 rule: no fake %).
@@ -355,12 +357,18 @@ impl AppState {
             })),
             repo_index: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             fit_preparation: Arc::new(FitPreparation::default()),
+            auth: Arc::new(crate::auth::Auth::default()),
         }
     }
 
     /// The installation root the runtime and plugins are found under.
     pub fn with_install_root(mut self, root: PathBuf) -> Self {
         self.install_root = root;
+        self
+    }
+
+    pub fn with_auth(mut self, auth: crate::auth::Auth) -> Self {
+        self.auth = Arc::new(auth);
         self
     }
 
@@ -384,20 +392,20 @@ pub(crate) struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, message: impl Into<String>, hint: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, message: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
             hint: hint.into(),
         }
     }
-    fn not_found(msg: impl Into<String>) -> Self {
+    pub(crate) fn not_found(msg: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, msg, "Check the id and try again.")
     }
-    fn bad(msg: impl Into<String>, hint: impl Into<String>) -> Self {
+    pub(crate) fn bad(msg: impl Into<String>, hint: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, msg, hint)
     }
-    fn internal(msg: impl Into<String>) -> Self {
+    pub(crate) fn internal(msg: impl Into<String>) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             msg,
@@ -444,7 +452,10 @@ fn validate_content(content: &str) -> Result<(), ApiError> {
 }
 
 pub fn router(state: AppState) -> Router {
-    let origins = trusted_loopback_origins();
+    let mut origins = trusted_loopback_origins();
+    if let Some(origin) = state.auth.public_origin().and_then(|origin| origin.parse().ok()) {
+        origins.push(origin);
+    }
     let guarded_origins = origins.clone();
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
@@ -456,9 +467,16 @@ pub fn router(state: AppState) -> Router {
             axum::http::Method::DELETE,
             axum::http::Method::OPTIONS,
         ])
-        .allow_headers([axum::http::header::CONTENT_TYPE]);
+        .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION]);
     Router::new()
         .route("/api/health", get(health))
+        // Phase 1 task 3: who is calling.
+        .route("/api/auth/login", get(crate::auth::login))
+        .route("/api/auth/callback", get(crate::auth::callback))
+        .route("/api/auth/logout", post(crate::auth::logout))
+        .route("/api/me", get(crate::auth::me))
+        .route("/api/me/api-keys", get(crate::auth::list_api_keys).post(crate::auth::create_api_key))
+        .route("/api/me/api-keys/:id", delete(crate::auth::revoke_api_key))
         .route("/api/runtime/policy", get(runtime_policy))
         .route("/api/models", get(list_models))
         .route("/api/models/load", post(load_model))
@@ -622,6 +640,8 @@ pub fn router(state: AppState) -> Router {
         // Stage 38: first-run + benchmark.
         .route("/api/setup/status", get(setup_status))
         .route("/api/system/benchmark", post(benchmark))
+        // Innermost: CORS answers preflight requests before anyone is asked who they are.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::authenticate))
         .layer(cors)
         .layer(axum::middleware::from_fn(move |request: axum::extract::Request, next: axum::middleware::Next| {
             let origins = guarded_origins.clone();
@@ -635,11 +655,12 @@ pub fn router(state: AppState) -> Router {
                     // Same-origin DNS-rebinding requests can omit Origin.
                     if let Some(host) = request.headers().get(axum::http::header::HOST) {
                         let trusted_host = host.to_str().ok().map(|host| {
-                            let expected = format!("http://{host}");
-                            origins.iter().any(|origin| origin.to_str().ok() == Some(expected.as_str()))
+                            origins.iter().filter_map(|origin| origin.to_str().ok()).any(|origin| {
+                                origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://")) == Some(host)
+                            })
                         }).unwrap_or(false);
                         if !trusted_host {
-                            return ApiError::new(StatusCode::FORBIDDEN, "Only local Companion hosts are allowed", "Use localhost or a loopback address. LAN access requires a future authenticated mode.").into_response();
+                            return ApiError::new(StatusCode::FORBIDDEN, "This address is not one Companion answers on", "Open Companion at its own address: localhost on this PC, or the address your company published.").into_response();
                         }
                     }
                 }

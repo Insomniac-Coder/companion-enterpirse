@@ -1,4 +1,5 @@
 import type { GenerationPhase, OutputTiming } from './outputTiming';
+import { signInNeeded } from './account.ts';
 export const API = '';
 
 import type { ToolingProfile, ToolingState } from './tooling';
@@ -47,6 +48,7 @@ export interface ChatMessage {
 
 async function req(path: string, init?: RequestInit) {
   const r = await fetch(path, init);
+  if (r.status === 401) signInNeeded();
   if (!r.ok) {
     // Backend returns {error, hint} (§52); surface both, keep the status.
     try {

@@ -10,6 +10,7 @@ mod agent;
 mod agent_progress;
 mod agent_runner;
 mod api;
+mod auth;
 mod calibration;
 mod cdp;
 mod cpu_topology;
@@ -69,6 +70,14 @@ async fn main() {
         .init();
 
     let cfg = config::AppConfig::from_env();
+    // Who is calling: sign-in, or one local person on an address only this PC reaches.
+    let auth = match auth::Auth::from_env().and_then(|auth| auth::check_address(&cfg.addr, &auth).map(|()| auth)) {
+        Ok(auth) => auth,
+        Err(e) => {
+            tracing::error!("{e}; startup stopped");
+            std::process::exit(1);
+        }
+    };
     if let Err(e) = std::fs::create_dir_all(&cfg.data_dir) {
         tracing::error!("cannot create data dir {}: {e}", cfg.data_dir.display());
         std::process::exit(1);
@@ -155,7 +164,8 @@ async fn main() {
         cfg.data_dir.join("attachments"),
     )
     .await
-    .with_install_root(cfg.root.clone());
+    .with_install_root(cfg.root.clone())
+    .with_auth(auth);
 
     // Register models found on disk (§9 layout), then seed demo only if empty
     // so the UI Model selector is never blank on first launch (§88).
@@ -189,14 +199,6 @@ async fn main() {
     // Each model's fit is searched ahead of its first load (owner decision
     // 2026-09-17), once the interface has had time to come up.
     api::spawn_fit_preparation(&state, std::time::Duration::from_secs(20));
-
-    // Refuse non-loopback binds unless explicitly overridden (§54).
-    if !(cfg.addr.starts_with("127.0.0.1:") || cfg.addr.starts_with("localhost:")) {
-        tracing::warn!(
-            "COMPANION_ADDR={} is not loopback; the API has no auth. Prefer 127.0.0.1.",
-            cfg.addr
-        );
-    }
 
     // Stage 15: resource sampler (2 s cadence, 1 h ring).
     {

@@ -49,6 +49,9 @@ pub struct OpenId {
 pub struct Auth {
     /// None: no sign-in, one local person.
     pub open_id: Option<OpenId>,
+    /// `COMPANION_PLATFORM_ADMINS`: email addresses made platform admin at sign-in, so a new server
+    /// has its first admin before anyone grants roles (lower case).
+    pub platform_admins: Vec<String>,
 }
 
 const VARIABLES: [&str; 4] = [
@@ -64,9 +67,18 @@ impl Auth {
         Self::from_values(|name| std::env::var(name).ok())
     }
 
-    fn from_values(get: impl Fn(&str) -> Option<String>) -> Result<Auth, String> {
+    pub(crate) fn from_values(get: impl Fn(&str) -> Option<String>) -> Result<Auth, String> {
         let values: Vec<Option<String>> = VARIABLES.iter().map(|name| get(name).filter(|value| !value.trim().is_empty())).collect();
+        let platform_admins: Vec<String> = get("COMPANION_PLATFORM_ADMINS")
+            .unwrap_or_default()
+            .split([',', ';'])
+            .map(|email| email.trim().to_lowercase())
+            .filter(|email| !email.is_empty())
+            .collect();
         if values.iter().all(Option::is_none) {
+            if !platform_admins.is_empty() {
+                return Err("COMPANION_PLATFORM_ADMINS needs sign-in: without it the one local person is already the admin".into());
+            }
             return Ok(Auth::default());
         }
         let missing: Vec<&str> = VARIABLES.iter().zip(&values).filter(|(_, value)| value.is_none()).map(|(name, _)| *name).collect();
@@ -82,6 +94,7 @@ impl Auth {
         IssuerUrl::new(value(0)).map_err(|e| format!("COMPANION_OIDC_ISSUER is not a URL: {e}"))?;
         Ok(Auth {
             open_id: Some(OpenId { issuer: value(0), client_id: value(1), client_secret: value(2), public_url }),
+            platform_admins,
         })
     }
 
@@ -119,12 +132,28 @@ pub struct Caller {
     pub email: String,
     /// "local", "session" or "api key".
     pub via: &'static str,
+    /// Roles on top of user: platform_admin, team_admin, auditor (`roles.rs`).
+    pub roles: Vec<String>,
+    /// The groups this person is team admin of.
+    pub team_admin_of: Vec<String>,
 }
 
 impl Caller {
-    /// The one person of an install without sign-in (the `users` row 'local').
+    /// The one person of an install without sign-in (the `users` row 'local'): every role, as the
+    /// migration grants it.
     pub fn local() -> Caller {
-        Caller { id: "local".into(), name: "You".into(), email: String::new(), via: "local" }
+        Caller {
+            id: "local".into(),
+            name: "You".into(),
+            email: String::new(),
+            via: "local",
+            roles: vec![crate::roles::AUDITOR.into(), crate::roles::PLATFORM_ADMIN.into()],
+            team_admin_of: Vec::new(),
+        }
+    }
+
+    pub fn has(&self, role: &str) -> bool {
+        self.roles.iter().any(|held| held == role)
     }
 }
 
@@ -171,7 +200,7 @@ async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Option<Caller>,
                 .execute(pool)
                 .await?;
         }
-        return Ok(row.map(|row| Caller { id: row.get("id"), name: row.get("name"), email: row.get("email"), via: "api key" }));
+        return with_roles(pool, row, "api key").await;
     }
     let Some(token) = cookie(headers, COOKIE) else {
         return Ok(None);
@@ -183,7 +212,18 @@ async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Option<Caller>,
     .bind(hash(&token))
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|row| Caller { id: row.get("id"), name: row.get("name"), email: row.get("email"), via: "session" }))
+    with_roles(pool, row, "session").await
+}
+
+/// The person in `row` (id, name, email) as a caller, with their current roles: a role withdrawn
+/// a moment ago is already gone from the next request.
+async fn with_roles(pool: &sqlx::PgPool, row: Option<sqlx::postgres::PgRow>, via: &'static str) -> Result<Option<Caller>, sqlx::Error> {
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let id: String = row.get("id");
+    let (roles, team_admin_of) = crate::roles::grants(pool, &id).await?;
+    Ok(Some(Caller { name: row.get("name"), email: row.get("email"), id, via, roles, team_admin_of }))
 }
 
 /// Every /api/ request but the `OPEN` ones must come from someone.
@@ -375,27 +415,43 @@ async fn finish_sign_in(state: &AppState, open_id: &OpenId, headers: &HeaderMap,
         .unwrap_or_default();
     let name = claims.name().and_then(|name| name.get(None)).map(|name| name.as_str().to_string()).unwrap_or_else(|| email.clone());
 
-    let user_id: String = sqlx::query_scalar(
-        "INSERT INTO users (id, issuer, subject, email, name) VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (issuer, subject) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name, last_seen_at = now()
-         RETURNING id",
-    )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(claims.issuer().as_str())
-    .bind(claims.subject().as_str())
-    .bind(&email)
-    .bind(&name)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| format!("cannot save the person: {e}"))?;
+    // Groups and roles ride in the same token, whose signature was just checked; the library's
+    // claims type has no room for them, so they are read from its payload.
+    let payload = id_token.to_string();
+    let directory = payload
+        .split('.')
+        .nth(1)
+        .and_then(|part| base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, part).ok())
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .map(|claims| crate::roles::Directory::from_claims(&claims))
+        .ok_or("the ID token's payload could not be read")?;
+
     let token = new_secret();
-    sqlx::query("INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1, $2, now() + make_interval(hours => $3))")
-        .bind(hash(&token))
-        .bind(&user_id)
-        .bind(SESSION_HOURS)
-        .execute(pool)
-        .await
-        .map_err(|e| format!("cannot start the session: {e}"))?;
+    let saved = async {
+        let mut tx = pool.begin().await?;
+        let user_id: String = sqlx::query_scalar(
+            "INSERT INTO users (id, issuer, subject, email, name) VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (issuer, subject) DO UPDATE SET email = EXCLUDED.email, name = EXCLUDED.name, last_seen_at = now()
+             RETURNING id",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(claims.issuer().as_str())
+        .bind(claims.subject().as_str())
+        .bind(&email)
+        .bind(&name)
+        .fetch_one(&mut *tx)
+        .await?;
+        crate::roles::renew_at_sign_in(&mut tx, &user_id, &email, &directory, &state.auth.platform_admins).await?;
+        sqlx::query("INSERT INTO sessions (token_hash, user_id, expires_at) VALUES ($1, $2, now() + make_interval(hours => $3))")
+            .bind(hash(&token))
+            .bind(&user_id)
+            .bind(SESSION_HOURS)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok::<_, sqlx::Error>(user_id)
+    };
+    let user_id = saved.await.map_err(|e| format!("cannot save the sign-in: {e}"))?;
     tracing::info!(user = %user_id, "signed in");
     Ok((token, return_to))
 }
@@ -428,14 +484,20 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result
 }
 
 /// Who this is, and whether this install has sign-in.
-pub async fn me(State(state): State<AppState>, Extension(caller): Extension<Caller>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+pub async fn me(State(state): State<AppState>, Extension(caller): Extension<Caller>) -> Result<Json<serde_json::Value>, ApiError> {
+    let groups = crate::roles::groups_of(state.storage.pool(), &caller.id)
+        .await
+        .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
+    Ok(Json(serde_json::json!({
         "id": caller.id,
         "name": caller.name,
         "email": caller.email,
         "via": caller.via,
         "sign_in": state.auth.sign_in_required(),
-    }))
+        "roles": caller.roles,
+        "team_admin_of": caller.team_admin_of,
+        "groups": groups,
+    })))
 }
 
 /// API keys are made and withdrawn from a signed-in browser only: a key cannot make more keys.
@@ -534,11 +596,8 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use openidconnect::core::{CoreIdToken, CoreIdTokenClaims, CoreJsonWebKeySet, CoreJwsSigningAlgorithm, CoreRsaPrivateSigningKey};
-    use openidconnect::{
-        Audience, EmptyAdditionalClaims, EndUserEmail, EndUserName, JsonWebKeyId, LocalizedClaim, PrivateSigningKey, StandardClaims,
-        SubjectIdentifier,
-    };
+    use openidconnect::core::{CoreJsonWebKeySet, CoreJwsSigningAlgorithm, CoreRsaPrivateSigningKey};
+    use openidconnect::{Audience, EndUserEmail, EndUserName, JsonWebKeyId, LocalizedClaim, PrivateSigningKey, StandardClaims, SubjectIdentifier};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
     use tower::ServiceExt as _;
@@ -566,7 +625,19 @@ mod tests {
     struct Provider {
         issuer: String,
         grants: Mutex<HashMap<String, Grant>>,
+        /// What the directory says about a person (by subject): their groups and app roles.
+        directory: Mutex<HashMap<String, (Vec<String>, Vec<String>)>>,
     }
+
+    /// The claims Entra ID adds when the app registration asks for them.
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    struct DirectoryClaims {
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        groups: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        roles: Vec<String>,
+    }
+    impl openidconnect::AdditionalClaims for DirectoryClaims {}
 
     /// Two RSA keys, made once: the provider's, and a stranger's.
     fn keys() -> &'static [String; 2] {
@@ -594,7 +665,7 @@ mod tests {
     async fn start_provider() -> Arc<Provider> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let issuer = format!("http://{}", listener.local_addr().unwrap());
-        let provider = Arc::new(Provider { issuer: issuer.clone(), grants: Mutex::new(HashMap::new()) });
+        let provider = Arc::new(Provider { issuer: issuer.clone(), grants: Mutex::new(HashMap::new()), directory: Mutex::new(HashMap::new()) });
         let discovery = serde_json::json!({
             "issuer": issuer,
             "authorization_endpoint": format!("{issuer}/authorize"),
@@ -649,7 +720,8 @@ mod tests {
             let issuer = if grant.spoil == Spoil::Issuer { "http://impostor.test".to_string() } else { self.issuer.clone() };
             let audience = if grant.spoil == Spoil::Audience { "another-app" } else { CLIENT_ID };
             let nonce = if grant.spoil == Spoil::Nonce { "a-different-nonce".to_string() } else { grant.nonce };
-            let claims = CoreIdTokenClaims::new(
+            let (groups, roles) = self.directory.lock().unwrap().get(&grant.subject).cloned().unwrap_or_default();
+            let claims = openidconnect::IdTokenClaims::<DirectoryClaims, openidconnect::core::CoreGenderClaim>::new(
                 IssuerUrl::new(issuer).unwrap(),
                 vec![Audience::new(audience.into())],
                 expires,
@@ -657,11 +729,17 @@ mod tests {
                 StandardClaims::new(SubjectIdentifier::new(grant.subject.clone()))
                     .set_email(Some(EndUserEmail::new(format!("{}@example.com", grant.subject))))
                     .set_name(Some(LocalizedClaim::from(EndUserName::new(format!("Person {}", grant.subject))))),
-                EmptyAdditionalClaims {},
+                DirectoryClaims { groups, roles },
             )
             .set_nonce(Some(Nonce::new(nonce)));
             let key = signing_key(if grant.spoil == Spoil::SignedByAnotherKey { 1 } else { 0 });
-            let id_token = CoreIdToken::new(claims, &key, CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256, None, None).unwrap();
+            let id_token = openidconnect::IdToken::<
+                DirectoryClaims,
+                openidconnect::core::CoreGenderClaim,
+                openidconnect::core::CoreJweContentEncryptionAlgorithm,
+                CoreJwsSigningAlgorithm,
+            >::new(claims, &key, CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha256, None, None)
+            .unwrap();
             Json(serde_json::json!({ "access_token": "access", "token_type": "Bearer", "expires_in": 3600, "id_token": id_token }))
                 .into_response()
         }
@@ -672,6 +750,11 @@ mod tests {
     const PUBLIC_URL: &str = "https://companion.example.com";
 
     async fn companion_with_sign_in() -> (axum::Router, Arc<Provider>, AppState) {
+        companion_with_admins(Vec::new()).await
+    }
+
+    /// With `COMPANION_PLATFORM_ADMINS` set to `admins`.
+    async fn companion_with_admins(admins: Vec<String>) -> (axum::Router, Arc<Provider>, AppState) {
         let provider = start_provider().await;
         let auth = Auth {
             open_id: Some(OpenId {
@@ -680,6 +763,7 @@ mod tests {
                 client_secret: CLIENT_SECRET.into(),
                 public_url: reqwest::Url::parse(PUBLIC_URL).unwrap(),
             }),
+            platform_admins: admins,
         };
         let state = AppState::new_stub().with_auth(auth);
         (crate::api::router(state.clone()), provider, state)
@@ -900,6 +984,36 @@ mod tests {
         }
         let signed_in: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions").fetch_one(state.storage.pool()).await.unwrap();
         assert_eq!(signed_in, 0);
+    }
+
+    #[tokio::test]
+    async fn the_directory_and_the_admin_list_decide_roles_at_sign_in() {
+        let (app, provider, _) = companion_with_admins(vec!["grace@example.com".into()]).await;
+        provider.directory.lock().unwrap().insert("ada".into(), (vec!["g-eng".into(), "g-all".into()], vec!["auditor".into(), "made_up".into()]));
+        let (back, _, _) = sign_in(&app, &provider, "ada", Spoil::Nothing).await;
+        let ada = session_of(&set_cookie(&back).unwrap());
+        let me = body_json(send(&app, with_header(get("/api/me"), "cookie", &ada)).await).await;
+        assert_eq!(me["roles"], serde_json::json!(["auditor"]), "a role the directory made up is ignored");
+        let mut groups: Vec<&str> = me["groups"].as_array().unwrap().iter().map(|g| g["external_id"].as_str().unwrap()).collect();
+        groups.sort();
+        assert_eq!(groups, ["g-all", "g-eng"]);
+        assert_eq!(send(&app, with_header(get("/api/admin/users"), "cookie", &ada)).await.status(), StatusCode::OK, "an auditor reads people");
+        assert_eq!(send(&app, with_header(get("/api/models/downloads"), "cookie", &ada)).await.status(), StatusCode::FORBIDDEN);
+
+        // Grace is on the admin list; the directory gives her nothing.
+        let (back, _, _) = sign_in(&app, &provider, "grace", Spoil::Nothing).await;
+        let grace = session_of(&set_cookie(&back).unwrap());
+        let me = body_json(send(&app, with_header(get("/api/me"), "cookie", &grace)).await).await;
+        assert_eq!(me["roles"], serde_json::json!(["platform_admin"]));
+        assert_eq!(send(&app, with_header(get("/api/models/downloads"), "cookie", &grace)).await.status(), StatusCode::OK);
+
+        // Ada leaves a group and loses the role in the directory: her next sign-in says so.
+        provider.directory.lock().unwrap().insert("ada".into(), (vec!["g-all".into()], vec![]));
+        let (back, _, _) = sign_in(&app, &provider, "ada", Spoil::Nothing).await;
+        let ada = session_of(&set_cookie(&back).unwrap());
+        let me = body_json(send(&app, with_header(get("/api/me"), "cookie", &ada)).await).await;
+        assert_eq!(me["roles"], serde_json::json!([]));
+        assert_eq!(me["groups"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

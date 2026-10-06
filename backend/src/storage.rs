@@ -463,14 +463,18 @@ impl Storage {
     }
 
     pub async fn messages_for(&self, conv: &str) -> DbResult<Vec<Message>> {
-        // Insertion order, stable even when timestamps collide.
-        sqlx::query("SELECT id,conversation_id,role,content,created_at FROM messages WHERE conversation_id=$1 ORDER BY seq")
-            .bind(conv)
-            .fetch_all(&self.pool)
-            .await?
-            .iter()
-            .map(message)
-            .collect()
+        sqlx::query(MESSAGES_OF).bind(conv).fetch_all(&self.pool).await?.iter().map(message).collect()
+    }
+
+    /// A conversation's messages and their journals, read from one snapshot: a reply that finishes
+    /// meanwhile is seen whole or not at all, never its new journal beside its old text.
+    pub async fn messages_with_activities(&self, conv: &str) -> DbResult<(Vec<Message>, ActivitiesByMessage)> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY").execute(&mut *tx).await?;
+        let messages = sqlx::query(MESSAGES_OF).bind(conv).fetch_all(&mut *tx).await?.iter().map(message).collect::<DbResult<Vec<_>>>()?;
+        let journals = group_activities(sqlx::query(ACTIVITIES_OF).bind(conv).fetch_all(&mut *tx).await?)?;
+        tx.commit().await?;
+        Ok((messages, journals))
     }
 
     /// A derived inference view. Canonical messages, IDs and timestamps are
@@ -545,31 +549,6 @@ impl Storage {
             .execute(&mut *tx)
             .await?;
         tx.commit().await
-    }
-
-    /// Every journal in one conversation, grouped by message id, in one query.
-    pub async fn conversation_activities(
-        &self,
-        conv: &str,
-    ) -> DbResult<std::collections::HashMap<String, Vec<crate::agent::AgentEvent>>> {
-        let rows = sqlx::query(
-            "SELECT a.message_id, a.event_json FROM message_activities a
-             JOIN messages m ON m.id = a.message_id
-             WHERE m.conversation_id=$1 ORDER BY a.seq",
-        )
-        .bind(conv)
-        .fetch_all(&self.pool)
-        .await?;
-        let mut grouped: std::collections::HashMap<String, Vec<crate::agent::AgentEvent>> =
-            std::collections::HashMap::new();
-        for row in rows {
-            let message_id: String = row.try_get("message_id")?;
-            let json: String = row.try_get("event_json")?;
-            if let Ok(event) = serde_json::from_str(&json) {
-                grouped.entry(message_id).or_default().push(event);
-            }
-        }
-        Ok(grouped)
     }
 
     pub async fn message_activities(&self, mid: &str) -> DbResult<Vec<crate::agent::AgentEvent>> {
@@ -1147,6 +1126,26 @@ impl Storage {
     }
 }
 
+/// A conversation's messages, in insertion order (stable even when timestamps collide).
+const MESSAGES_OF: &str = "SELECT id,conversation_id,role,content,created_at FROM messages WHERE conversation_id=$1 ORDER BY seq";
+/// Every journal event in a conversation, in order.
+const ACTIVITIES_OF: &str = "SELECT a.message_id, a.event_json FROM message_activities a
+     JOIN messages m ON m.id = a.message_id WHERE m.conversation_id=$1 ORDER BY a.seq";
+
+pub type ActivitiesByMessage = std::collections::HashMap<String, Vec<crate::agent::AgentEvent>>;
+
+fn group_activities(rows: Vec<PgRow>) -> DbResult<ActivitiesByMessage> {
+    let mut grouped = ActivitiesByMessage::new();
+    for row in rows {
+        let message_id: String = row.try_get("message_id")?;
+        let json: String = row.try_get("event_json")?;
+        if let Ok(event) = serde_json::from_str(&json) {
+            grouped.entry(message_id).or_default().push(event);
+        }
+    }
+    Ok(grouped)
+}
+
 /// Bounded, deterministic memory text: this session first, then its project,
 /// then global preferences, about 2,000 characters at most.
 fn memory_context_from(memories: &[MemoryEntry]) -> MemoryContext {
@@ -1583,6 +1582,24 @@ mod tests {
         a.unwrap();
         b.unwrap();
         assert_eq!(s.knowledge_paths("ws").await.unwrap(), vec![("notes.md".to_string(), 20)]);
+    }
+
+    #[tokio::test]
+    async fn a_reader_never_sees_a_reply_half_finished() {
+        let s = testing::storage();
+        s.create_conversation(&conversation_named("c")).await.unwrap();
+        let failed = crate::agent::AgentEvent::new(crate::agent::AgentState::Failed, "No inference running.".into(), 0);
+        for i in 0..150 {
+            let id = format!("m{i}");
+            s.add_message(&message_in("c", &id, "assistant", "Work is starting…", "now")).await.unwrap();
+            let (finished, read) = tokio::join!(s.finish_message("c", &id, &failed), s.messages_with_activities("c"));
+            finished.unwrap();
+            let (messages, journals) = read.unwrap();
+            for message in messages {
+                let ended = journals.get(&message.id).is_some_and(|events| !events.is_empty());
+                assert_eq!(ended, message.content != "Work is starting…", "read {i}: {} has {:?} with text {:?}", message.id, journals.get(&message.id), message.content);
+            }
+        }
     }
 
     #[tokio::test]

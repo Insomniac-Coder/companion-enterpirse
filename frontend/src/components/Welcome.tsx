@@ -31,6 +31,7 @@ export default function Welcome({
   workspaces,
   branch,
   onStarter,
+  canLoad,
   onLoad,
   onChooseModel,
   onChooseProject,
@@ -45,6 +46,8 @@ export default function Welcome({
   workspaces: Workspace[];
   branch: string;
   onStarter: (text: string) => void;
+  /** False for a person who is not a platform admin on a server with sign-in. */
+  canLoad: boolean;
   onLoad: () => void;
   onChooseModel: () => void;
   onChooseProject: () => void;
@@ -122,12 +125,14 @@ export default function Welcome({
         ) : (
           <>
             <div className="welcome-eyebrow eyebrow"><Lamp state="off" /> No model loaded</div>
-            <h1 className="welcome-title">Load a model to begin.</h1>
-            <p className="welcome-lede">{selected ? <>Companion runs <strong style={{ color: 'var(--text)' }}>{selected.name}</strong> on your own hardware. Loading moves it into memory; nothing is sent anywhere.</> : 'Add a GGUF model to the models folder, then scan for it on the Models page.'}</p>
-            <div className="welcome-actions">
-              {selected && <Button variant="primary" size="lg" icon="power" onClick={onLoad}>Load {selected.name}</Button>}
-              <Button variant="ghost" size="lg" icon="layers" onClick={onChooseModel}>{selected ? 'Choose another model' : 'Open Models'}</Button>
-            </div>
+            <h1 className="welcome-title">{canLoad ? 'Load a model to begin.' : 'No model is running yet.'}</h1>
+            {canLoad ? <>
+              <p className="welcome-lede">{selected ? <>Companion runs <strong style={{ color: 'var(--text)' }}>{selected.name}</strong> on your own hardware. Loading moves it into memory; nothing is sent anywhere.</> : 'Add a GGUF model to the models folder, then scan for it on the Models page.'}</p>
+              <div className="welcome-actions">
+                {selected && <Button variant="primary" size="lg" icon="power" onClick={onLoad}>Load {selected.name}</Button>}
+                <Button variant="ghost" size="lg" icon="layers" onClick={onChooseModel}>{selected ? 'Choose another model' : 'Open Models'}</Button>
+              </div>
+            </> : <p className="welcome-lede">A platform admin of this server loads models for everyone. You can start once one is running.</p>}
           </>
         )}
 

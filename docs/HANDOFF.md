@@ -30,7 +30,9 @@ fork to drop the model weights (Git LFS); commit ids differ from the Companion's
   Task 3 (sign-in) done the same day: `auth.rs`; without the four `COMPANION_OIDC_*`/`COMPANION_PUBLIC_URL`
   settings the server is the local person and refuses non-loopback addresses. A live sign-in can be
   checked against a throwaway stand-in provider (the tests have one in Rust; a Node one was used for the
-  browser check). Next: task 4 (users, groups and roles).
+  browser check). Task 4 (users, groups, roles) done too: `roles.rs`; shared routes wrapped in `admin(...)`
+  (list in `roles::tests::PLATFORM_ADMIN_ROUTES`). Interim: settings and permission mode are admin-only on
+  a server with sign-in until tasks 6 and 7. Next: task 5 (an owner on every record).
 - Everything below this section is the Companion's own handoff, kept as it was at the fork.
 
 # Handoff — start here

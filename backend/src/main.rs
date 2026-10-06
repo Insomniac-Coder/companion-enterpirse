@@ -36,6 +36,7 @@ mod preview;
 mod project_check;
 mod recommend;
 mod repo_index;
+mod roles;
 mod runtime_fit;
 mod runtime_selection;
 mod search;

@@ -21,6 +21,8 @@ type Props = {
   phaseLabel?: string;
   collapsed: boolean;
   onSelect: (id: string) => void;
+  /** Load, reload, eject and the model pages: a platform admin's on a server with sign-in. */
+  canManage: boolean;
   onLoad: (id: string) => void;
   onUnload: () => void;
   onReload: () => void;
@@ -124,15 +126,15 @@ export default function Rig(props: Props) {
         </button>
       ))}
       <PopDivider />
-      {selected && !selected.loaded && (
+      {props.canManage && selected && !selected.loaded && (
         <PopItem icon="power" disabled={loadingModel || backendUp === false} onClick={() => { setMenuOpen(false); props.onLoad(selected.id); }}>
           Load {selected.name}
         </PopItem>
       )}
-      {loaded && <PopItem icon="refresh" disabled={loadingModel} onClick={() => { setMenuOpen(false); props.onReload(); }}>Reload model</PopItem>}
-      {loaded && <PopItem icon="eject" disabled={loadingModel} onClick={() => { setMenuOpen(false); props.onUnload(); }}>Eject model</PopItem>}
-      <PopItem icon="layers" onClick={() => { setMenuOpen(false); props.onOpenModels(); }}>Manage models</PopItem>
-      <PopItem icon="activity" onClick={() => { setMenuOpen(false); props.onOpenResources(); }}>Resource monitor</PopItem>
+      {props.canManage && loaded && <PopItem icon="refresh" disabled={loadingModel} onClick={() => { setMenuOpen(false); props.onReload(); }}>Reload model</PopItem>}
+      {props.canManage && loaded && <PopItem icon="eject" disabled={loadingModel} onClick={() => { setMenuOpen(false); props.onUnload(); }}>Eject model</PopItem>}
+      {props.canManage && <PopItem icon="layers" onClick={() => { setMenuOpen(false); props.onOpenModels(); }}>Manage models</PopItem>}
+      {props.canManage && <PopItem icon="activity" onClick={() => { setMenuOpen(false); props.onOpenResources(); }}>Resource monitor</PopItem>}
     </Popover>
   );
 
@@ -210,7 +212,7 @@ export default function Rig(props: Props) {
           {loadingModel ? (
             <>
               <div className="rig-speed"><span>{stage?.stage === 'checking_tools' ? 'Checking how it calls tools' : 'Preparing the runtime'}</span></div>
-              {(stage?.stage === 'validating' || stage?.stage === 'loading') && (
+              {props.canManage && (stage?.stage === 'validating' || stage?.stage === 'loading') && (
                 <Button size="sm" variant="ghost" onClick={() => cancelLoad().then(() => props.notify('info', 'Model load cancelled.')).catch((error) => props.notify('error', error.message))}>Cancel</Button>
               )}
             </>
@@ -222,12 +224,12 @@ export default function Rig(props: Props) {
                     : !live && lastTps != null ? <><strong>{lastTps.toFixed(1)}</strong><span>tok/s last reply</span></>
                       : <span>{live ? props.phaseLabel ?? 'Working…' : 'Waiting for a message'}</span>}
               </div>
-              <IconButton icon="eject" label="Eject model" size="sm" tipSide="top" disabled={live} onClick={props.onUnload} />
+              {props.canManage && <IconButton icon="eject" label="Eject model" size="sm" tipSide="top" disabled={live} onClick={props.onUnload} />}
             </>
           ) : (
             <>
-              <div className="rig-speed"><span>{backendUp === false ? 'Offline' : !selected ? 'Pick a model first' : vramKnown ? 'Loads into GPU memory' : 'Loads into memory'}</span></div>
-              <Button size="sm" variant="primary" icon="power" disabled={!selected || backendUp === false} onClick={() => selected && props.onLoad(selected.id)}>Load</Button>
+              <div className="rig-speed"><span>{backendUp === false ? 'Offline' : !props.canManage ? 'No model running yet' : !selected ? 'Pick a model first' : vramKnown ? 'Loads into GPU memory' : 'Loads into memory'}</span></div>
+              {props.canManage && <Button size="sm" variant="primary" icon="power" disabled={!selected || backendUp === false} onClick={() => selected && props.onLoad(selected.id)}>Load</Button>}
             </>
           )}
         </div>

@@ -540,6 +540,10 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   the only ones that answer anyone. A sign-in's return link is accepted only in the browser that
   started it (a short-lived cookie holds its state), so nobody can be signed in to someone else's
   account by being sent that person's link.
+- Roles (`roles.rs`, task 4): a route that changes the server for everyone, or shows everyone's
+  activity, is wrapped in `admin(...)` in `api::router` and answers 403 to anyone but a platform admin
+  (`roles::tests::PLATFORM_ADMIN_ROUTES` lists them; add a new one there too). Roles are read from
+  `role_grants` on every request, so a withdrawn role is gone from the next one.
 - `LLM → ToolRequest → PermissionManager → Tool → OS`. No direct OS access.
 - `WorkspaceManager::resolve` is the only path joiner; lexical + canonical checks.
 - MODERATE/DANGEROUS tools require `approved=true` (permission UX sets it, §26).

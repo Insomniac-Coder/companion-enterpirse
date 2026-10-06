@@ -9,7 +9,22 @@ export interface Me {
   via: 'local' | 'session' | 'api key';
   /** Whether this server has sign-in at all. */
   sign_in: boolean;
+  /** Roles on top of user: platform_admin, team_admin, auditor. */
+  roles: string[];
+  /** Groups this person is team admin of. */
+  team_admin_of: string[];
+  groups: { id: string; name: string; external_id: string }[];
 }
+
+/** Whether this person runs the server for everyone (models, downloads, company settings, system
+ * checks). Without an answer from the server (unreachable) the app behaves as it always has; the
+ * server refuses what is not allowed either way. */
+export function isPlatformAdmin(me: Me | undefined): boolean {
+  return !me || me.roles.includes('platform_admin');
+}
+
+/** What a person who is not a platform admin is told where an admin-only control would be. */
+export const ADMIN_ONLY_NOTE = 'A platform admin of this server looks after this.';
 
 export interface ApiKey {
   id: string;

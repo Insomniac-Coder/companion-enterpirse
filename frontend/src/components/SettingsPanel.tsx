@@ -5,7 +5,7 @@ import { Children, cloneElement, isValidElement, useEffect, useId, useRef, useSt
 import { getSettings, putSettings, listModels, scanModels, getRuntimePolicy, type ModelMeta } from '../services/api';
 import { pushToast, type Toast } from './Toasts';
 import AccountSection from './AccountSection';
-import type { Me } from '../services/account';
+import { ADMIN_ONLY_NOTE, isPlatformAdmin, type Me } from '../services/account';
 import { defaultModelOptions, type ModelListState } from './settingsModels';
 import { expertSectionOpen, settingsSearchMatches, updateSetting } from './settingsForm';
 import { PERMISSION_MODE_DESCRIPTIONS, PERMISSION_MODE_LABELS, PROJECT_BOUNDARY_DESCRIPTION, SEARCH_PERMISSION_DESCRIPTION } from './permissionCopy';
@@ -259,6 +259,7 @@ export default function SettingsPanel({ setToasts, me }: { setToasts: React.Disp
           {query.trim() && matchCount === 0 && <p className="settings-empty" role="status">No settings match “{query}”. Try a different term or <button type="button" onClick={() => setQuery('')}>clear search</button>.</p>}
 
           {me?.sign_in && me.via === 'session' && <AccountSection me={me} setToasts={setToasts} />}
+          {!isPlatformAdmin(me) && <p className="settings-context-warning" role="note">These settings apply to everyone on this server, so they are read-only here. {ADMIN_ONLY_NOTE} Your own preferences arrive with a later update.</p>}
 
           <section className="settings-section" data-settings-title="Personalization">
             <h2><Icon name="sun" size={16} />Personalization</h2><p className="settings-section-intro">Choose how Companion looks and what appears in your conversations.</p>
@@ -351,7 +352,7 @@ export default function SettingsPanel({ setToasts, me }: { setToasts: React.Disp
               <Lamp state="caution" />
               <span>{conflict ? 'Cannot save: an 8-bit KV cache needs Flash Attention' : 'Unsaved changes'}</span>
               <Button variant="ghost" size="sm" disabled={saving} onClick={discard}>Discard</Button>
-              <Button size="sm" loading={saving} disabled={!!conflict} title={conflict ?? undefined} onClick={() => void save()}>Save changes</Button>
+              <Button size="sm" loading={saving} disabled={!!conflict || !isPlatformAdmin(me)} title={!isPlatformAdmin(me) ? ADMIN_ONLY_NOTE : conflict ?? undefined} onClick={() => void save()}>Save changes</Button>
             </div>
           )}
         </div>

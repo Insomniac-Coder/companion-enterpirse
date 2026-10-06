@@ -356,6 +356,7 @@ directories); results carry evidence IDs the model can keep or release as contex
 | `COMPANION_FRONTEND_DIR` | compiled UI | `frontend/dist/` |
 | `COMPANION_LLAMA_SERVER_BIN` | a specific `llama-server` | `runtime/bin/`, then `PATH` |
 | `COMPANION_OIDC_ISSUER`, `COMPANION_OIDC_CLIENT_ID`, `COMPANION_OIDC_CLIENT_SECRET`, `COMPANION_PUBLIC_URL` | sign-in for a server several people use (see "Sign-in") | unset: no sign-in, this PC only |
+| `COMPANION_PLATFORM_ADMINS` | email addresses made platform admin when they sign in (needs sign-in) | unset |
 
 ## Sign-in (a server for several people)
 
@@ -381,6 +382,37 @@ Microsoft Entra ID, once, in the Entra admin center (an administrator may need t
 Then set `COMPANION_ADDR` to an address other machines reach (for example `0.0.0.0:3877`) and put
 Companion behind HTTPS (a reverse proxy such as nginx or IIS, or a cloud load balancer);
 `COMPANION_PUBLIC_URL` is that HTTPS address.
+
+### Roles and groups
+
+Everyone who signs in is a user. On top of that:
+
+| Role | What it is for |
+| --- | --- |
+| Platform admin | runs the server for everyone: models, downloads, settings, system checks, plugins, the logs |
+| Team admin | looks after one group (its settings come with a later update) |
+| Auditor | reads who has which role and group (and, later, the audit records) |
+
+**Groups** come from the company directory: in the Entra app registration, **Token configuration >
+Add groups claim** (security groups). Companion reads them at each sign-in. The token carries group ids,
+not names; a platform admin can name a group in Companion. (Someone in more than 200 groups gets no list
+in the token; their memberships then stay as they were.)
+
+**Roles** come from three places, and a person has all of them together:
+1. The directory: in the app registration, **App roles > Create app role** with the value
+   `platform_admin` or `auditor`, then assign people or groups to it under **Enterprise applications**.
+   Read at each sign-in.
+2. `COMPANION_PLATFORM_ADMINS`: email addresses that become platform admin at sign-in, so a new server
+   has its first admin before anything else is set up. Read at each sign-in.
+3. Grants a platform admin makes in Companion (the only way to make a team admin, which is for one
+   group). They last until withdrawn, and take effect on the person's next request. Until the admin
+   dashboard arrives, through the API: `GET /api/admin/users`, `GET /api/admin/groups`,
+   `POST` or `DELETE /api/admin/users/<id>/roles` with `{"role": "team_admin", "group_id": "<group id>"}`,
+   `PATCH /api/admin/groups/<id>` with `{"name": "..."}`.
+
+For now, on a server with sign-in, the settings and the agents' permission mode apply to everyone, so
+only a platform admin changes them; people get their own with later updates. A laptop install has no
+sign-in and its one person has every role, as before.
 
 People sign in with their company account; a sign-in lasts 12 hours. **Settings > Account** shows who
 is signed in, signs out, and makes **API keys** for software such as a build server or a script: it

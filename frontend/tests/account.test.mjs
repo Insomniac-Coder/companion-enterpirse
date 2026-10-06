@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { apiKeyNameProblem, getMe, listApiKeys, onSignInNeeded, signInUrl } from '../src/services/account.ts';
+import { apiKeyNameProblem, getMe, isPlatformAdmin, listApiKeys, onSignInNeeded, signInUrl } from '../src/services/account.ts';
 
 const answer = (status, body) => async () => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 
@@ -33,4 +33,13 @@ test('a key name is checked here first, by the same rule as the server', () => {
 
 test('signing in comes back to the same page on this server', () => {
   assert.equal(signInUrl('/settings?tab=keys'), '/api/auth/login?return_to=%2Fsettings%3Ftab%3Dkeys');
+});
+
+test('only a platform admin gets the controls that change the server for everyone', () => {
+  const person = (roles) => ({ id: 'x', name: 'X', email: '', via: 'session', sign_in: true, roles, team_admin_of: [], groups: [] });
+  assert.equal(isPlatformAdmin(person(['platform_admin'])), true);
+  assert.equal(isPlatformAdmin(person([])), false);
+  assert.equal(isPlatformAdmin(person(['auditor', 'team_admin'])), false, 'reading people is not running the server');
+  assert.equal(isPlatformAdmin({ ...person(['platform_admin', 'auditor']), id: 'local', via: 'local', sign_in: false }), true, "the laptop's one person");
+  assert.equal(isPlatformAdmin(undefined), true, 'server unreachable: the app as it always was; the server still refuses');
 });

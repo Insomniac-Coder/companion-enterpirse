@@ -451,6 +451,24 @@ fn validate_content(content: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// Only a platform admin may call `handler` (`roles.rs`).
+fn admin<H, T>(handler: H) -> impl axum::handler::Handler<T, AppState>
+where
+    H: axum::handler::Handler<T, AppState>,
+    T: 'static,
+{
+    handler.layer(axum::middleware::from_fn(crate::roles::platform_admin_only))
+}
+
+/// Only a platform admin or an auditor may call `handler`.
+fn admin_or_auditor<H, T>(handler: H) -> impl axum::handler::Handler<T, AppState>
+where
+    H: axum::handler::Handler<T, AppState>,
+    T: 'static,
+{
+    handler.layer(axum::middleware::from_fn(crate::roles::admin_or_auditor))
+}
+
 pub fn router(state: AppState) -> Router {
     let mut origins = trusted_loopback_origins();
     if let Some(origin) = state.auth.public_origin().and_then(|origin| origin.parse().ok()) {
@@ -477,21 +495,26 @@ pub fn router(state: AppState) -> Router {
         .route("/api/me", get(crate::auth::me))
         .route("/api/me/api-keys", get(crate::auth::list_api_keys).post(crate::auth::create_api_key))
         .route("/api/me/api-keys/:id", delete(crate::auth::revoke_api_key))
+        // Phase 1 task 4: people, groups and roles.
+        .route("/api/admin/users", get(admin_or_auditor(crate::roles::list_users)))
+        .route("/api/admin/groups", get(admin_or_auditor(crate::roles::list_groups)))
+        .route("/api/admin/groups/:id", patch(admin(crate::roles::name_group)))
+        .route("/api/admin/users/:id/roles", post(admin(crate::roles::grant_role)).delete(admin(crate::roles::revoke_role)))
         .route("/api/runtime/policy", get(runtime_policy))
         .route("/api/models", get(list_models))
-        .route("/api/models/load", post(load_model))
-        .route("/api/models/unload", post(unload_models))
-        .route("/api/models/scan", post(scan_models))
-        .route("/api/models/:id/tooling/check", post(recheck_model_tooling))
+        .route("/api/models/load", post(admin(load_model)))
+        .route("/api/models/unload", post(admin(unload_models)))
+        .route("/api/models/scan", post(admin(scan_models)))
+        .route("/api/models/:id/tooling/check", post(admin(recheck_model_tooling)))
         .route(
             "/api/models/downloads",
-            get(list_downloads).post(start_download),
+            get(admin(list_downloads)).post(admin(start_download)),
         )
-        .route("/api/models/downloads/:id", get(get_download))
-        .route("/api/models/downloads/:id/pause", post(pause_download))
-        .route("/api/models/downloads/:id/resume", post(resume_download))
-        .route("/api/models/downloads/:id/cancel", post(cancel_download))
-        .route("/api/models/:id", get(model_detail).delete(delete_model))
+        .route("/api/models/downloads/:id", get(admin(get_download)))
+        .route("/api/models/downloads/:id/pause", post(admin(pause_download)))
+        .route("/api/models/downloads/:id/resume", post(admin(resume_download)))
+        .route("/api/models/downloads/:id/cancel", post(admin(cancel_download)))
+        .route("/api/models/:id", get(model_detail).delete(admin(delete_model)))
         .route("/api/models/:id/recommend", get(model_recommend))
         .route("/api/chat", post(chat_sse))
         .route("/api/chat/stop", post(chat_stop))
@@ -551,21 +574,21 @@ pub fn router(state: AppState) -> Router {
                 .patch(patch_conversation),
         )
         .route("/api/sessions", get(list_sessions))
-        .route("/api/settings", get(get_settings).put(put_settings))
+        .route("/api/settings", get(get_settings).put(admin(put_settings)))
         .route(
             "/api/permissions/mode",
-            get(get_permission_mode).put(put_permission_mode),
+            get(get_permission_mode).put(admin(put_permission_mode)),
         )
         .route("/api/system", get(system_info))
         .route("/api/system/pick-folder", post(pick_folder))
         .route("/api/system/metrics", get(system_metrics))
-        .route("/api/system/overview", get(system_overview))
+        .route("/api/system/overview", get(admin(system_overview)))
         .route("/api/inference/status", get(inference_status))
-        .route("/api/inference/start", post(inference_start))
-        .route("/api/inference/stop", post(inference_stop))
+        .route("/api/inference/start", post(admin(inference_start)))
+        .route("/api/inference/stop", post(admin(inference_stop)))
         // Stage 21: staged load progress + cancel.
         .route("/api/models/load/progress", get(load_progress))
-        .route("/api/models/load/cancel", post(cancel_load))
+        .route("/api/models/load/cancel", post(admin(cancel_load)))
         // Stage 22: versioned API. v1 mirrors the stable surface; the
         // unversioned paths stay for compatibility.
         .route("/api/v1/status", get(v1_status))
@@ -579,7 +602,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/settings", get(get_settings))
         .route("/api/v1/system", get(system_info))
         .route("/api/v1/system/metrics", get(system_metrics))
-        .route("/api/v1/system/overview", get(system_overview))
+        .route("/api/v1/system/overview", get(admin(system_overview)))
         .route("/api/v1/tools", get(list_tools))
         .route("/api/v1/commands", get(list_commands))
         .route("/api/v1/workspaces", get(list_workspaces))
@@ -603,7 +626,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/:id", patch(patch_session))
         .route("/api/sessions/recovery", get(sessions_recovery))
         .route("/api/sessions/:id/action", post(session_action))
-        .route("/api/logs/archive", get(logs_archive))
+        .route("/api/logs/archive", get(admin(logs_archive)))
         // Stage 28: attachment budget + OCR availability.
         .route(
             "/api/conversations/:id/attachment-budget",
@@ -616,10 +639,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/system/cache", get(cache_budget))
         .route("/api/system/device", get(device_profile))
         .route("/api/system/capabilities", get(capability_db))
-        .route("/api/system/calibrate", post(calibrate))
+        .route("/api/system/calibrate", post(admin(calibrate)))
         .route("/api/models/:id/optimize", get(model_optimize))
         .route("/api/models/:id/calibration", get(model_calibration))
-        .route("/api/models/:id/calibrate", post(calibrate_model))
+        .route("/api/models/:id/calibrate", post(admin(calibrate_model)))
         // Stage 32: repo index.
         .route("/api/workspaces/:id/index", get(workspace_index))
         // Stage 35: local knowledge.
@@ -634,12 +657,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/workspaces/:id/git", get(workspace_git))
         // Stage 37: plugins.
         .route("/api/plugins", get(list_plugins))
-        .route("/api/plugins/:id/run", post(run_plugin_command))
+        .route("/api/plugins/:id/run", post(admin(run_plugin_command)))
         // Stage 34: diagnostics.
-        .route("/api/doctor", get(doctor))
+        .route("/api/doctor", get(admin(doctor)))
         // Stage 38: first-run + benchmark.
-        .route("/api/setup/status", get(setup_status))
-        .route("/api/system/benchmark", post(benchmark))
+        .route("/api/setup/status", get(admin(setup_status)))
+        .route("/api/system/benchmark", post(admin(benchmark)))
         // Innermost: CORS answers preflight requests before anyone is asked who they are.
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::authenticate))
         .layer(cors)
@@ -4419,13 +4442,11 @@ async fn list_messages(
     let st = &s.storage;
     match st.get_conversation(&id).await {
         Ok(Some(_)) => {
-            let messages = st
-                .messages_for(&id).await
-                .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
             // One query for every journal in the conversation instead of one
-            // per message (a long session used to issue hundreds).
-            let mut journals = st
-                .conversation_activities(&id).await
+            // per message (a long session used to issue hundreds), from the
+            // same snapshot as the messages.
+            let (messages, mut journals) = st
+                .messages_with_activities(&id).await
                 .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
             let mut payload = vec![];
             for message in messages {
@@ -13654,11 +13675,11 @@ Would you like me to fix it?")]));
                 .map(|events| !events.is_empty())
                 .unwrap_or(false)
             {
-                assert_eq!(reply["activities"][0]["state"], "FAILED");
+                assert_eq!(reply["activities"][0]["state"], "FAILED", "{reply}");
                 assert!(reply["content"]
                     .as_str()
                     .unwrap()
-                    .contains("No inference running"));
+                    .contains("No inference running"), "{reply}");
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

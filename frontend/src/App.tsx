@@ -26,7 +26,7 @@ import RuntimePage from './components/RuntimePage';
 import ToolsPage from './components/ToolsPage';
 import { PERMISSION_MODE_DESCRIPTIONS, PERMISSION_MODE_LABELS, PROJECT_BOUNDARY_DESCRIPTION, SEARCH_PERMISSION_DESCRIPTION } from './components/permissionCopy';
 import { VisibleOutputMeter, type GenerationPhase, type OutputTiming } from './services/outputTiming';
-import { signOut, type Me } from './services/account';
+import { ADMIN_ONLY_NOTE, isPlatformAdmin, signOut, type Me } from './services/account';
 import { applyAgentContext } from './services/contextUsage';
 import { currentActivitySnapshot, parseActivityStart, visibleWorkActivity } from './services/workElapsed';
 import { groupActivity, groupSessionsByProject, lastSessionKey, projectGroupOpen, projectPick, projectRemoval, type ProjectGroup } from './services/projectSessions';
@@ -84,6 +84,10 @@ function shortcutLabel(binding: string) {
 }
 
 export default function App({ me }: { me?: Me }) {
+  // On a server with sign-in, the shared machinery (models, downloads, company settings, system
+  // checks, the permission mode until it is per person) is a platform admin's (roles.rs).
+  const admin = isPlatformAdmin(me);
+  const destinations = admin ? WORKBENCH_DESTINATIONS : WORKBENCH_DESTINATIONS.filter(({ id }) => id === 'settings');
   const [tab, setTab] = useState<'chat' | PageId>('chat');
   const [mode, setMode] = useState<'chat' | 'code'>(() => (localStorage.getItem('companion.mode') as any) || 'chat');
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -273,6 +277,7 @@ export default function App({ me }: { me?: Me }) {
   }
 
   async function refreshDownloads() {
+    if (!admin) return;
     try {
       setDownloads(same(await listDownloads()));
     } catch { /* backend offline */ }
@@ -454,6 +459,10 @@ export default function App({ me }: { me?: Me }) {
 
   /** Returns whether the mode is now `next`. The picker shows it at once. */
   function changePermissionMode(next: PermissionMode): Promise<boolean> {
+    if (!admin) {
+      notify('info', `The permission mode is set for everyone on this server. ${ADMIN_ONLY_NOTE}`);
+      return Promise.resolve(false);
+    }
     setPermissionModeState(next);
     return modeSaver.current.request(next);
   }
@@ -980,7 +989,7 @@ export default function App({ me }: { me?: Me }) {
     // Shift+Tab cycles the permission mode, as in Claude Code.
     if (mode === 'code' && e.key === 'Tab' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
       e.preventDefault();
-      if (!busy && !agentBusy && !permissionModeBusy) {
+      if (admin && !busy && !agentBusy && !permissionModeBusy) {
         const next = nextPermissionMode(permissionMode, availableModes);
         setPermissionModeState(next);
         modeSaver.current.schedule(next, PERMISSION_MODE_SETTLE_MS);
@@ -1205,6 +1214,10 @@ export default function App({ me }: { me?: Me }) {
   }
 
   function requestLoad(id: string) {
+    if (!admin) {
+      notify('info', `Models are loaded for everyone on this server. ${ADMIN_ONLY_NOTE}`);
+      return;
+    }
     const current = runningModel();
     const target = models.find((model) => model.id === id);
     if (current?.id === id) return;
@@ -1338,7 +1351,7 @@ export default function App({ me }: { me?: Me }) {
     ...(['dark', 'light', 'system'] as Theme[]).filter((value) => value !== theme).map((value) => ({ id: `theme-${value}`, group: 'Actions', icon: (value === 'dark' ? 'moon' : value === 'light' ? 'sun' : 'monitor') as IconName, label: value === 'system' ? 'Match system theme' : `Use ${value} theme`, detail: `Current theme: ${theme}`, run: () => setTheme(value) })),
     { id: 'mode-chat', group: 'Go to', icon: 'chat', label: 'Chat', detail: 'Conversations', run: () => switchMode('chat') },
     { id: 'mode-code', group: 'Go to', icon: 'code', label: 'Code', detail: 'Project sessions', run: () => switchMode('code') },
-    ...WORKBENCH_DESTINATIONS.map(({ id, label }) => ({ id, group: 'Go to', icon: PAGE_META[id].icon, label, detail: PAGE_META[id].description, run: () => { setTab(id); setMobileNav(false); } })),
+    ...destinations.map(({ id, label }) => ({ id, group: 'Go to', icon: PAGE_META[id].icon, label, detail: PAGE_META[id].description, run: () => { setTab(id); setMobileNav(false); } })),
     ...convs.map((conversation) => ({ id: conversation.id, group: 'Sessions', icon: (conversation.mode === 'code' ? 'code' : 'chat') as IconName, label: conversation.title || 'Untitled', detail: conversation.mode === 'code' ? `Code session${workspaces.find((w) => w.id === conversation.workspace) ? ` · ${workspaces.find((w) => w.id === conversation.workspace)!.name}` : ''}` : 'Conversation', run: () => void selectConv(conversation.id) })),
   ];
 
@@ -1570,7 +1583,7 @@ export default function App({ me }: { me?: Me }) {
         )}
 
         <nav className="sb-utility" aria-label="Manage Companion">
-          {WORKBENCH_DESTINATIONS.map(({ id, label }) => (
+          {destinations.map(({ id, label }) => (
             <button
               type="button"
               key={id}
@@ -1606,6 +1619,7 @@ export default function App({ me }: { me?: Me }) {
           phaseLabel={busy ? (generationPhase === 'compacting' ? 'Compacting context…' : generationPhase === 'thinking' ? 'Thinking…' : generationPhase === 'responding' ? 'Writing…' : 'Reading your message…') : agentBusy ? 'Agent working…' : undefined}
           collapsed={rail}
           onSelect={chooseModel}
+          canManage={admin}
           onLoad={requestLoad}
           onUnload={requestEject}
           onReload={requestReload}
@@ -1729,7 +1743,7 @@ export default function App({ me }: { me?: Me }) {
                   <PopItem icon="pencil" onClick={() => { setSessionMenuOpen(false); if (convId) setRenaming({ id: convId, draft: activeConv?.title ?? '', where: 'head' }); }}>Rename</PopItem>
                   <PopItem icon="fork" onClick={() => { setSessionMenuOpen(false); void doFork(); }}>Duplicate</PopItem>
                   <PopItem icon="share" onClick={() => { setSessionMenuOpen(false); setShowShare(true); }}>Share context…</PopItem>
-                  <PopItem icon="download" onClick={() => { setSessionMenuOpen(false); void saveLogs(); }}>Save logs as a zip</PopItem>
+                  {admin && <PopItem icon="download" onClick={() => { setSessionMenuOpen(false); void saveLogs(); }}>Save logs as a zip</PopItem>}
                   <PopDivider />
                   <PopItem icon="layers" disabled={compacting} onClick={() => { setSessionMenuOpen(false); void doCompact(); }}>Compact context</PopItem>
                   <PopItem icon="refresh" onClick={() => { setSessionMenuOpen(false); doClear(); }}>Clear session</PopItem>
@@ -1795,6 +1809,7 @@ export default function App({ me }: { me?: Me }) {
                   workspaces={workspaces}
                   branch={branch}
                   onStarter={(text) => { setInput(text); requestAnimationFrame(() => composerRef.current?.focus()); }}
+                  canLoad={admin}
                   onLoad={() => { if (selectedModel) requestLoad(selectedModel.id); }}
                   onChooseModel={() => setTab('models')}
                   onChooseProject={() => setProjectLauncherOpen(true)}
@@ -1961,9 +1976,10 @@ export default function App({ me }: { me?: Me }) {
                       {mode === 'code' && (
                         <span className={`permission-mode ${permissionMode}`} role="group" aria-label="Permission mode (Shift+Tab to cycle)" title={`${PROJECT_BOUNDARY_DESCRIPTION} ${SEARCH_PERMISSION_DESCRIPTION}`}>
                           {PERMISSION_MODES.map((option) => (
-                            <button key={option} type="button" disabled={permissionModeBusy || busy || agentBusy || !availableModes.includes(option)} className={permissionMode === option ? 'active' : ''} aria-pressed={permissionMode === option} title={availableModes.includes(option) ? PERMISSION_MODE_DESCRIPTIONS[option] : READ_ONLY_MODE_REASON} onClick={() => void changePermissionMode(option)}>{PERMISSION_MODE_LABELS[option]}</button>
+                            <button key={option} type="button" disabled={!admin || permissionModeBusy || busy || agentBusy || !availableModes.includes(option)} className={permissionMode === option ? 'active' : ''} aria-pressed={permissionMode === option} title={availableModes.includes(option) ? PERMISSION_MODE_DESCRIPTIONS[option] : READ_ONLY_MODE_REASON} onClick={() => void changePermissionMode(option)}>{PERMISSION_MODE_LABELS[option]}</button>
                           ))}
                           {readOnlyModel && <span className="permission-mode-note" title={READ_ONLY_MODE_REASON}>Read-only model</span>}
+                          {!admin && <span className="permission-mode-note" title={`The permission mode is set for everyone on this server. ${ADMIN_ONLY_NOTE}`}>Set by your admin</span>}
                         </span>
                       )}
                       <Toggle
@@ -2063,6 +2079,7 @@ export default function App({ me }: { me?: Me }) {
         {tab === 'tools' && <ToolsPage registry={registry} wsId={wsId} notify={notify} onRefresh={() => void refreshRegistry()} />}
 
         {tab === 'settings' && <SettingsPanel setToasts={setToasts} me={me} />}
+        {tab !== 'settings' && tab !== 'chat' && !admin && <div className="page"><div className="page-inner"><p className="settings-capability-note">{ADMIN_ONLY_NOTE}</p></div></div>}
 
         {diffWs && <DiffModal wsId={diffWs} onClose={() => setDiffWs(null)} />}
       </div>

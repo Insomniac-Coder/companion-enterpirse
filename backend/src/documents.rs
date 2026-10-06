@@ -540,7 +540,7 @@ pub fn requested_document_kind(text: &str) -> Option<&'static str> {
 /// the conversation's artifacts, the same place create_document saves to.
 /// Returns the stored file name.
 pub async fn save_plain_document(
-    storage: &tokio::sync::Mutex<crate::storage::Storage>,
+    storage: &crate::storage::Storage,
     artifacts_dir: &std::path::Path,
     conversation_id: &str,
     filename: &str,
@@ -568,9 +568,7 @@ pub async fn save_plain_document(
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     storage
-        .lock()
-        .await
-        .record_artifact(&row)
+        .record_artifact(&row).await
         .map_err(|error| error.to_string())?;
     Ok(row.filename)
 }
@@ -622,7 +620,7 @@ fn missing_content(kind: &str, spec: &serde_json::Value) -> Option<&'static str>
 /// Args: {"filename": "report.xlsx", "kind": "xlsx"?, ...spec fields}.
 /// Everything except filename/kind IS the render spec (§98).
 pub async fn execute_create_document(
-    storage: &tokio::sync::Mutex<crate::storage::Storage>,
+    storage: &crate::storage::Storage,
     artifacts_dir: &std::path::Path,
     conversation_id: &str,
     args: &serde_json::Value,
@@ -710,9 +708,7 @@ pub async fn execute_create_document(
     };
     let size_kb = bytes.len() / 1024;
     storage
-        .lock()
-        .await
-        .record_artifact(&row)
+        .record_artifact(&row).await
         .map_err(|e| ToolError::Io(std::io::Error::other(e.to_string())))?;
     // Say what was produced, not only that something was: a model that meant
     // three slides and sent one can see the shortfall in this result. Say

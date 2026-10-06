@@ -33,6 +33,17 @@ if not defined COMPANION_LLAMA_SERVER_BIN if not exist "%ROOT%\runtime\bin\llama
     )
 )
 
+rem Without COMPANION_DATABASE_URL, Companion runs its own PostgreSQL from
+rem runtime\pgsql: installed once from runtime\postgresql.lock.json.
+if not defined COMPANION_DATABASE_URL if not exist "%ROOT%\runtime\pgsql\bin\pg_ctl.exe" (
+    echo PostgreSQL is not installed yet; installing it now, one time.
+    where py >nul 2>nul && (call py -3 "%ROOT%\scripts\get-postgres.py") || (call python "%ROOT%\scripts\get-postgres.py")
+    if not exist "%ROOT%\runtime\pgsql\bin\pg_ctl.exe" (
+        echo error: The PostgreSQL install failed. See the output above.
+        exit /b 1
+    )
+)
+
 rem npm is npm.cmd: without "call" this script would end when it returns. Every
 rem tool is started with "call", which works the same for .exe files.
 pushd "%ROOT%\frontend"

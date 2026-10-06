@@ -14,6 +14,15 @@ if (-not $env:COMPANION_LLAMA_SERVER_BIN -and -not (Test-Path $runtimeServer)) {
     if (-not (Test-Path $runtimeServer)) { throw 'The runtime build did not produce llama-server.exe. See the output above.' }
 }
 
+# Without COMPANION_DATABASE_URL, Companion runs its own PostgreSQL from
+# runtime\pgsql: installed once from runtime\postgresql.lock.json.
+if (-not $env:COMPANION_DATABASE_URL -and -not (Test-Path (Join-Path $repoRoot 'runtime\pgsql\bin\pg_ctl.exe'))) {
+    Write-Host 'PostgreSQL is not installed yet; installing it now (one time).'
+    $python = if (Get-Command py -ErrorAction SilentlyContinue) { @('py', '-3') } else { @('python') }
+    & $python[0] @($python | Select-Object -Skip 1) (Join-Path $repoRoot 'scripts\get-postgres.py')
+    if ($LASTEXITCODE -ne 0) { throw 'The PostgreSQL install failed. See the output above.' }
+}
+
 Push-Location $frontendDir
 try {
     if (-not (Test-Path (Join-Path $frontendDir 'node_modules'))) {

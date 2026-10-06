@@ -21,6 +21,7 @@ mod downloads;
 mod file_read;
 mod generation;
 mod hardware;
+mod import;
 mod inference;
 mod inspection_context;
 mod llamaserver;
@@ -29,6 +30,7 @@ mod metrics;
 mod models;
 mod outline;
 mod permissions;
+mod pgsql;
 mod preview;
 mod project_check;
 mod recommend;
@@ -74,15 +76,74 @@ async fn main() {
     logfile::init(&cfg.data_dir.join("logs"));
     tracing::info!(data = %cfg.data_dir.display(), models = %cfg.models_dir.display(), "resolved application storage");
 
-    let storage = match storage::Storage::open_persistent(&cfg.db_path()) {
+    // The database: COMPANION_DATABASE_URL, or else Companion's private
+    // PostgreSQL (runtime/pgsql, its files in the data folder).
+    let (database_url, private_database) = match cfg.database_url.clone() {
+        Some(url) => (url, None),
+        None => match private_database(&cfg).await {
+            Ok((url, cluster)) => (url, Some(cluster)),
+            Err(e) => {
+                tracing::error!("the private database is not available: {e}; startup stopped");
+                std::process::exit(1);
+            }
+        },
+    };
+    // One-off commands, then stop:
+    //   `companion-backend import-sqlite <file>`: copy a Companion's history
+    //     (its SQLite file) into this database;
+    //   `companion-backend backup`: the whole database into data/backups.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(command) = args.get(1).filter(|command| matches!(command.as_str(), "import-sqlite" | "backup")) {
+        let code = if command == "backup" {
+            let file = cfg.data_dir.join("backups").join(format!("{}.dump", chrono::Utc::now().format("%Y%m%dT%H%M%SZ")));
+            match pgsql::dump(&cfg.root.join("runtime").join("pgsql").join("bin"), &database_url, &file) {
+                Ok(()) => {
+                    println!("backup written to {} (restore it with pg_restore)", file.display());
+                    0
+                }
+                Err(e) => {
+                    eprintln!("no backup was written: {e}");
+                    1
+                }
+            }
+        } else if let Some(file) = args.get(2) {
+            match storage::Storage::open(&database_url).await {
+                Err(e) => {
+                    eprintln!("cannot open the database: {e}");
+                    1
+                }
+                Ok(storage) => match import::import_sqlite(std::path::Path::new(file), storage.pool()).await {
+                    Ok(report) => {
+                        for (table, rows) in &report.copied {
+                            println!("{table}: {rows} copied");
+                        }
+                        println!("{} already present and left alone", report.skipped);
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("import stopped, nothing was saved: {e}");
+                        1
+                    }
+                },
+            }
+        } else {
+            eprintln!("usage: companion-backend import-sqlite <path to companion.db>");
+            2
+        };
+        // A server a running Companion uses stays up.
+        if let Some(cluster) = private_database.as_ref().filter(|cluster| cluster.started) {
+            cluster.stop();
+        }
+        std::process::exit(code);
+    }
+    let storage = match storage::Storage::open(&database_url).await {
         Ok(s) => {
-            tracing::info!("opened database {}", cfg.db_path().display());
+            tracing::info!("opened the database");
             s
         }
         Err(e) => {
             tracing::error!(
-                "cannot open {}: {e}; startup stopped to protect persistent history. Check permissions or COMPANION_DATA_DIR.",
-                cfg.db_path().display()
+                "cannot open the database: {e}; startup stopped to protect persistent history. Check COMPANION_DATABASE_URL and that PostgreSQL is running."
             );
             std::process::exit(1);
         }
@@ -93,6 +154,7 @@ async fn main() {
         cfg.models_dir.clone(),
         cfg.data_dir.join("attachments"),
     )
+    .await
     .with_install_root(cfg.root.clone());
 
     // Register models found on disk (§9 layout), then seed demo only if empty
@@ -190,10 +252,25 @@ async fn main() {
         cfg.addr
     );
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(state))
+        .with_graceful_shutdown(shutdown_signal(state, private_database.clone()))
         .await
         .expect("serve");
+    if let Some(cluster) = &private_database {
+        cluster.stop();
+    }
     tracing::info!("local companion exited cleanly");
+}
+
+/// Companion's private PostgreSQL, running, and the URL of its database.
+async fn private_database(cfg: &config::AppConfig) -> Result<(String, pgsql::Cluster), String> {
+    let cluster = pgsql::Cluster::start(
+        &cfg.root.join("runtime").join("pgsql").join("bin"),
+        &cfg.data_dir.join("postgres"),
+        &cfg.data_dir.join("logs").join("postgres.log"),
+        &[],
+    )?;
+    let url = cluster.companion_database().await.map_err(|e| format!("cannot open its database: {e}"))?;
+    Ok((url, cluster))
 }
 
 /// Why the process is being asked to stop.
@@ -229,7 +306,7 @@ impl StopRequest {
     }
 }
 
-async fn shutdown_signal(state: api::AppState) {
+async fn shutdown_signal(state: api::AppState, private_database: Option<pgsql::Cluster>) {
     let request = stop_requested().await;
     let reason = request.reason();
     tracing::info!("stopping ({reason}): recording running tasks, then stopping the model server");
@@ -237,6 +314,9 @@ async fn shutdown_signal(state: api::AppState) {
     if request.ends_the_process() {
         // Open connections would only hold the exit until the system ends
         // the process anyway.
+        if let Some(cluster) = &private_database {
+            cluster.stop();
+        }
         tracing::info!("local companion exited ({reason})");
         std::process::exit(0);
     }

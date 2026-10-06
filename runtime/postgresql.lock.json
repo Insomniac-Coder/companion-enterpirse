@@ -1,0 +1,12 @@
+{
+  "version": "18.6",
+  "windows": {
+    "url": "https://get.enterprisedb.com/postgresql/postgresql-18.6-5-windows-x64-binaries.zip",
+    "sha256": "e2246ba91d22345bc3d017586c09ede52d9df180b1eeb480f050445f1cad84e2"
+  },
+  "source": {
+    "url": "https://ftp.postgresql.org/pub/source/v18.6/postgresql-18.6.tar.bz2",
+    "sha256": "555610c24d53e4316da5b7d3fc25c279d96856d5e0e23ee308c328c5fa881d9f"
+  },
+  "note": "The PostgreSQL that Companion runs privately on a PC, installed by scripts/get-postgres.py: on Windows the official EnterpriseDB build, elsewhere built from the official source. postgresql.org publishes the source's sha256 next to it; EnterpriseDB publishes none, so the Windows sha256 is the one recorded when this version was pinned (downloaded over HTTPS from EnterpriseDB, 2026-10-06). Change every field together, and run the backend tests before committing the bump."
+}

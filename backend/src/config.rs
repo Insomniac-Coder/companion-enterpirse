@@ -11,6 +11,8 @@ pub struct AppConfig {
     pub data_dir: PathBuf,
     pub models_dir: PathBuf,
     pub frontend_dir: PathBuf,
+    /// `COMPANION_DATABASE_URL`: the PostgreSQL database to use.
+    pub database_url: Option<String>,
 }
 
 impl AppConfig {
@@ -34,12 +36,14 @@ impl AppConfig {
                 "Two history databases exist. Neither has been moved or deleted. COMPANION_DATA_DIR selects the active history explicitly."
             );
         }
+        let database_url = std::env::var("COMPANION_DATABASE_URL").ok().filter(|url| !url.trim().is_empty());
         Self {
             addr,
             root,
             data_dir,
             models_dir,
             frontend_dir,
+            database_url,
         }
     }
 

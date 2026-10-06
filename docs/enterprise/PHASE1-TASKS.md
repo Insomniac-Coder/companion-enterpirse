@@ -35,8 +35,21 @@ actually took.
    as the Companion does today. A company account is not required yet: the project is in development
    and not yet approved for adoption. Sign-in becomes required when a server accepts connections from
    other machines.
-2. **PostgreSQL everywhere**, the laptop included, installed with the app (about 300 MB): one storage
-   layer to build and test.
+2. **PostgreSQL everywhere**, the laptop included, installed with the app: one storage layer to build
+   and test. The app manages its own private PostgreSQL; the install script is part of the repo
+   (`scripts/get-postgres.py`).
+3. **Windows and Linux both** ("make the whole project OS agnostic"): every script and the backend run
+   on either, checked on both.
+
+## Progress
+
+| # | Task | State | What was built |
+|---|---|---|---|
+| 1 | PostgreSQL | Done 2026-10-06 | sqlx pool; `backend/migrations/0001_initial.sql` (18 tables); every storage call async; a private PostgreSQL started and stopped by the app (`pgsql.rs`) from `runtime/pgsql/`, installed by `scripts/get-postgres.py` from the pinned, checksum-checked `runtime/postgresql.lock.json` (Windows: the EnterpriseDB build, 141 MB kept; Linux: built from the official source, 27 MB); `companion-backend backup` (pg_dump) replaces the SQLite backup script. Three places where the old lock had made several steps one were made safe again: a run's final event and its reply text are saved together; editing a conversation saves only the fields it changed; re-indexing a file replaces its chunks as one step |
+| 2 | Import the Companion's history | Done 2026-10-06 | `companion-backend import-sqlite <file>`: every table, in the file's order, column by column (an older file's missing columns take their defaults), one transaction, safe to run twice. Owners arrive with task 5 |
+
+Tests: backend 536 on Windows and 534 on Linux (Ubuntu under WSL), frontend 114, against a throwaway private database
+that ends with the run; the test database skips crash-safe writes, which took a third off the run.
 
 ## Not in Phase 1
 

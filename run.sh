@@ -50,6 +50,14 @@ if [ -z "${COMPANION_LLAMA_SERVER_BIN:-}" ] && [ ! -f "$runtime_server" ]; then
     [ -f "$runtime_server" ] || fail 'The runtime build did not produce llama-server. See the output above.'
 fi
 
+# Without COMPANION_DATABASE_URL, Companion runs its own PostgreSQL from
+# runtime/pgsql: installed once from runtime/postgresql.lock.json.
+if [ -z "${COMPANION_DATABASE_URL:-}" ] && [ ! -f "$repo_root/runtime/pgsql/bin/pg_ctl" ]; then
+    echo 'PostgreSQL is not installed yet; installing it now (one time).'
+    need python3 'Install Python 3.'
+    python3 "$repo_root/scripts/get-postgres.py" || fail 'The PostgreSQL install failed. See the output above.'
+fi
+
 (
     cd "$frontend_dir"
     if [ ! -d node_modules ]; then

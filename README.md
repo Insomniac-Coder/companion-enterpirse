@@ -15,7 +15,10 @@ needed and nothing leaves your machine unless you turn on web search.
 
 The llama.cpp runtime is **part of this project**: it is built from a pinned upstream commit with the
 backends your PC can use (CPU always; Vulkan and CUDA when the hardware and SDKs are present). Model
-weights are not included.
+weights are not included. So is the database: the history is kept in PostgreSQL, and on a PC Companion
+runs its own private one (see "The database").
+
+Windows and Linux are both supported: every script and the backend run on either.
 
 More documentation: `docs/ARCHITECTURE.md`, `docs/PERFORMANCE.md`, and the audit records in
 `docs/validation/` and `docs/research/`.
@@ -26,8 +29,9 @@ More documentation: `docs/ARCHITECTURE.md`, `docs/PERFORMANCE.md`, and the audit
 companion-enterprise/
   backend/    Rust (Axum) API: chat, models, tools, agent, search, vision, documents, memory
   frontend/   React + TypeScript + Vite UI, served by the backend
-  runtime/    llama.cpp.lock.json (the pinned commit); bin/ is built here (not in Git)
-  scripts/    build-runtime.ps1 / build-runtime.sh, benchmarks, backups, end-to-end checks
+  runtime/    llama.cpp.lock.json and postgresql.lock.json (pinned versions); bin/ and pgsql/ are
+              built or installed here (not in Git)
+  scripts/    build-runtime.ps1 / build-runtime.sh, get-postgres.py, benchmarks, end-to-end checks
   models/     your GGUF models, one folder per model (none are kept in Git); modeldownloader.py
   plugins/    plugin manifests
   docs/       architecture, performance, research and validation records
@@ -51,7 +55,7 @@ Install these, then open a **new** PowerShell so PATH changes take effect.
 | **C++ Clang tools for Windows** (a Visual Studio Installer component: *C++ Clang Compiler for Windows*) | *recommended*: faster CPU inference | the runtime build uses clang automatically when it is installed; see the note below |
 | [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) | *optional*: the Vulkan GPU backend | any GPU vendor, including integrated GPUs |
 | [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads) 12 or 13 | *optional*: the CUDA backend | NVIDIA GPUs only; the display driver is separate and not required from this installer |
-| Python 3 | *optional*: `models/modeldownloader.py`, `scripts/backup-data.py` | standard library only |
+| [Python 3](https://www.python.org/downloads/) | the private database install (`scripts/get-postgres.py`); `models/modeldownloader.py` | standard library only |
 
 Check:
 
@@ -69,7 +73,9 @@ records which compiler built which part. If you add clang later, run the build s
 
 ### Linux / macOS
 
-`git`, `cmake` 3.21+, a C/C++ compiler (`ninja` is used when present), Rust, Node.js 24+.
+`git`, `cmake` 3.21+, a C/C++ compiler (`ninja` is used when present), Rust, Node.js 24+, Python 3, and
+`make`, `bison` and `flex` for the private database, which is built from source here (Debian/Ubuntu:
+`sudo apt install build-essential cmake bison flex python3`). Checked on Ubuntu; macOS is untested.
 Optional: the Vulkan SDK or `libvulkan-dev` + `glslc` (Vulkan), the CUDA Toolkit (CUDA, Linux).
 macOS builds Metal automatically. Start the app with `run.sh` (see "Run" below).
 
@@ -130,7 +136,35 @@ runtime/bin/llama-server --list-devices
 To use a llama.cpp you built or installed elsewhere, set `COMPANION_LLAMA_SERVER_BIN` to its
 `llama-server` executable; the app looks there first, then `runtime/bin/`, then `PATH`.
 
-## 4. Add models
+## 4. The database
+
+Companion keeps conversations, settings and records in PostgreSQL. Unless `COMPANION_DATABASE_URL`
+names a database, it runs its own private one: PostgreSQL from `runtime/pgsql/`, its files in
+`data/postgres/`, reachable only from this PC (127.0.0.1) with a password generated on first start
+(`data/postgres.secret`). It starts with Companion and stops when Companion closes.
+
+`run.ps1`, `run.bat` and `run.sh` install it the first time, or run it yourself:
+
+```bash
+python scripts/get-postgres.py      # python3 on Linux; py -3 also works on Windows
+```
+
+It installs the version pinned in `runtime/postgresql.lock.json` and refuses any download whose
+SHA-256 differs from the one recorded there. On Windows it downloads the official EnterpriseDB build
+(385 MB, of which 141 MB is kept); on Linux it builds the same version from the official source (a
+22 MB download, a few minutes, 27 MB installed). The download is deleted afterwards.
+
+A server uses its own PostgreSQL instead: set `COMPANION_DATABASE_URL`
+(`postgres://user:password@host:5432/name`), and Companion creates its tables on first start.
+
+History from a Local LLM PC Companion (its `data/companion.db`) is copied in once, in order; running
+it again copies nothing twice:
+
+```bash
+cd backend && cargo run --bin companion-backend -- import-sqlite path/to/companion.db
+```
+
+## 5. Add models
 
 Model weights are not kept in this repository. Put each model in its own folder under `models/`, e.g. `models/my-model/my-model-Q4_K_M.gguf`.
 Split GGUF files need all their parts in the same folder; a vision model's projector (`mmproj-*.gguf`)
@@ -154,7 +188,7 @@ downloader then keeps the file with an `.incompatible` suffix and writes the rea
 Files added while the app is open appear after **Scan** in the model library. Deleted model folders
 disappear from the list on the next refresh.
 
-## 5. Run
+## 6. Run
 
 ### Windows
 
@@ -169,8 +203,9 @@ run.bat
 ```
 
 Then open <http://localhost:5173>. The first run builds the runtime if `runtime/bin/llama-server.exe`
-is missing (skipped when `COMPANION_LLAMA_SERVER_BIN` is set), installs UI dependencies, builds the UI
-and starts the backend; later runs start in seconds. Keep the terminal open and press **Ctrl+C** once
+is missing (skipped when `COMPANION_LLAMA_SERVER_BIN` is set), installs the private database if
+`runtime/pgsql/` is missing (skipped when `COMPANION_DATABASE_URL` is set), installs UI dependencies,
+builds the UI and starts the backend; later runs start in seconds. Keep the terminal open and press **Ctrl+C** once
 to stop the app and the model server cleanly.
 
 ### Linux / macOS
@@ -179,8 +214,9 @@ to stop the app and the model server cleanly.
 ./run.sh
 ```
 
-The same steps as `run.ps1`: it builds the runtime with `scripts/build-runtime.sh` the first time, installs
-the UI dependencies, builds the UI and starts the backend. Then open <http://localhost:5173>, and press
+The same steps as `run.ps1`: it builds the runtime with `scripts/build-runtime.sh` and installs the
+private database with `scripts/get-postgres.py` the first time, installs the UI dependencies, builds the
+UI and starts the backend. Then open <http://localhost:5173>, and press
 **Ctrl+C** once in the terminal to stop. If the shell reports `Permission denied`, run
 `chmod +x run.sh scripts/build-runtime.sh` once, or start it with `bash run.sh`.
 
@@ -192,6 +228,7 @@ that installed them, so one folder shared between Windows and WSL cannot run bot
 
 ```bash
 scripts/build-runtime.sh                 # once
+python3 scripts/get-postgres.py          # once
 cd frontend && npm ci && npm run build && cd ..
 cd backend && COMPANION_ADDR=127.0.0.1:5173 cargo run --release --bin companion-backend
 ```
@@ -298,9 +335,11 @@ directories); results carry evidence IDs the model can keep or release as contex
 
 ## Storage, privacy and configuration
 
-- Conversations, settings and records live in `data/` (or an existing `backend/data/`). Set
-  `COMPANION_DATA_DIR` to choose a directory explicitly. Back it up before moving an installation
-  (`scripts/backup-data.py`).
+- Conversations, settings and records live in PostgreSQL: the private database (its files in
+  `data/postgres/`) unless `COMPANION_DATABASE_URL` names another. Attachments, artifacts and logs live
+  in `data/` (or an existing `backend/data/`). Set `COMPANION_DATA_DIR` to choose a directory
+  explicitly. Back up before moving an installation: `cargo run --bin companion-backend -- backup` in
+  `backend/` writes the whole database to `data/backups/<time>.dump` (restore it with `pg_restore`).
 - **Settings > Privacy & boundaries > Keep a record of model requests** (on by default) stores what was
   sent to the model and what it returned, capped at the latest 300 requests, for diagnosing wrong or
   broken answers. The records stay on this PC and can contain file contents the assistant read.
@@ -312,6 +351,7 @@ directories); results carry evidence IDs the model can keep or release as contex
 | --- | --- | --- |
 | `COMPANION_ADDR` | address the backend listens on | `127.0.0.1:3877` (`run.ps1` and `run.sh` use `:5173`) |
 | `COMPANION_DATA_DIR` | data directory | `data/` |
+| `COMPANION_DATABASE_URL` | the PostgreSQL database to use (`postgres://user:password@host:5432/name`) | the private database in `data/postgres/` |
 | `COMPANION_MODELS_DIR` | models directory | `models/` |
 | `COMPANION_FRONTEND_DIR` | compiled UI | `frontend/dist/` |
 | `COMPANION_LLAMA_SERVER_BIN` | a specific `llama-server` | `runtime/bin/`, then `PATH` |
@@ -327,6 +367,10 @@ cd ..\frontend;  npm test;  npm run build
 cd backend && cargo test
 cd ../frontend && npm test && npm run build
 ```
+
+The backend tests use a throwaway private database in `backend/target/test-postgres/` (PostgreSQL
+installed with `scripts/get-postgres.py`), started for the run and stopped after it. Or set
+`COMPANION_TEST_DATABASE_URL` to a PostgreSQL database they may create and drop schemas in.
 
 ## Troubleshooting
 
@@ -346,6 +390,9 @@ cd ../frontend && npm test && npm run build
 - **Something stopped and you want to know why**: the `logs` folder inside the data folder
   (`backend/data/logs` by default, or `COMPANION_DATA_DIR/logs`) keeps `companion.log` and
   `model-server.log`. They survive restarts; the model server's file shows how it ended.
+- **"the private database is not available"**: the message says why. For "PostgreSQL is not
+  installed", run `python scripts/get-postgres.py` (`python3` on Linux); otherwise `postgres.log` in the
+  logs folder has the database's own account.
 - **PowerShell blocks scripts**: follow your organisation's execution policy; do not disable security
   policies globally to run the launcher.
 

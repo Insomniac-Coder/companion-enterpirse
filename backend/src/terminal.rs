@@ -519,11 +519,32 @@ mod job {
         })
     }
 
+    /// This process joins the job too, so everything it starts from now on
+    /// ends with it.
+    #[cfg(test)]
+    pub(super) fn enclose_this_process() -> bool {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentProcess() -> *mut c_void;
+        }
+        job().is_some_and(|job| unsafe { AssignProcessToJobObject(job.0, GetCurrentProcess()) != 0 })
+    }
+
     #[cfg(test)]
     pub(super) fn contains(child: &std::process::Child) -> bool {
         let Some(job) = job() else { return false };
         let mut inside = 0;
         unsafe { IsProcessInJob(child.as_raw_handle() as *mut c_void, job.0, &mut inside) != 0 && inside != 0 }
+    }
+}
+
+/// Tests: every program started from now on (a test database server, say)
+/// ends when the test run does, however it ends.
+#[cfg(test)]
+pub fn end_children_with_this_process() {
+    #[cfg(windows)]
+    if !job::enclose_this_process() {
+        eprintln!("cannot tie this test run's programs to it: they may outlive it");
     }
 }
 

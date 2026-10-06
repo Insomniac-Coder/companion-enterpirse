@@ -21,6 +21,8 @@
 /build/
 /runtime/*
 !/runtime/llama.cpp.lock.json
+# The private PostgreSQL comes from runtime/postgresql.lock.json (scripts/get-postgres.ps1).
+!/runtime/postgresql.lock.json
 /backend/target/
 node_modules/
 /frontend/dist/

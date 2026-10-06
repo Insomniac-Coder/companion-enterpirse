@@ -92,7 +92,8 @@ pub struct AppState {
     pub(crate) settings_update: Arc<tokio::sync::Mutex<()>>,
     /// Serialize model replacement with generation/agent registration.
     runtime_update: Arc<tokio::sync::Mutex<()>>,
-    pub storage: Arc<tokio::sync::Mutex<Storage>>,
+    /// One pool for every request; cheap to clone.
+    pub storage: Storage,
     pub models_dir: PathBuf,
     /// The installation root (runtime/bin, plugins). Set from the resolved
     /// configuration; test states use the models folder's parent.
@@ -220,7 +221,7 @@ pub(crate) fn request_recorder(
             if !state.settings.read().await.privacy.record_model_requests {
                 return;
             }
-            if let Err(error) = state.storage.lock().await.record_model_request(&record) {
+            if let Err(error) = state.storage.record_model_request(&record).await {
                 tracing::warn!("could not keep the model request record: {error}");
             }
         });
@@ -250,13 +251,13 @@ impl AppState {
         // process may end before it gets there.
         let message = crate::shutdown::task_message(reason);
         {
-            let st = self.storage.lock().await;
+            let st = &self.storage;
             for run in &unfinished {
                 if run.spec.conversation_id.is_empty() {
                     continue;
                 }
-                let _ = st.update_message_content(&run.spec.conversation_id, &run.id, &message);
-                let _ = st.finish_task_context(&run.spec.conversation_id, &run.id, "interrupted");
+                let _ = st.update_message_content(&run.spec.conversation_id, &run.id, &message).await;
+                let _ = st.finish_task_context(&run.spec.conversation_id, &run.id, "interrupted").await;
             }
         }
         let _ = self.generations.write().await.cancel_current(&self.storage).await;
@@ -267,34 +268,47 @@ impl AppState {
         self.inference.write().await.unload();
     }
 
+    /// A state on a fresh, empty test database with default settings.
+    #[cfg(test)]
     pub fn new_stub() -> Self {
-        Self::new_with_storage(
-            Storage::open_in_memory().expect("in-memory sqlite"),
+        Self::with_settings(
+            crate::storage::testing::storage(),
+            AppSettings::default().normalized(),
             PathBuf::from("models"),
+            PathBuf::from("data").join("attachments"),
         )
     }
 
-    pub fn new_with_storage(storage: Storage, models_dir: PathBuf) -> Self {
+    /// A state on `storage` with its saved settings, as a restarted program
+    /// sees it; attachments beside the models folder (tests).
+    #[cfg(test)]
+    pub async fn new_with_storage(storage: Storage, models_dir: PathBuf) -> Self {
         let attachments_dir = models_dir
             .parent()
             .map(|p| p.join("data").join("attachments"))
             .unwrap_or_else(|| PathBuf::from("data").join("attachments"));
-        Self::new_with_dirs(storage, models_dir, attachments_dir)
+        Self::new_with_dirs(storage, models_dir, attachments_dir).await
     }
 
-    pub fn new_with_dirs(storage: Storage, models_dir: PathBuf, attachments_dir: PathBuf) -> Self {
-        let artifacts_dir = attachments_dir
-            .parent()
-            .map(|p| p.join("artifacts"))
-            .unwrap_or_else(|| PathBuf::from("data").join("artifacts"));
+    /// A state on `storage` with the settings saved there.
+    pub async fn new_with_dirs(storage: Storage, models_dir: PathBuf, attachments_dir: PathBuf) -> Self {
         let settings = storage
             .load_settings()
+            .await
             .unwrap_or_else(|error| {
                 tracing::warn!("Stored settings could not be read; using safe defaults: {error}");
                 None
             })
             .unwrap_or_default()
             .normalized();
+        Self::with_settings(storage, settings, models_dir, attachments_dir)
+    }
+
+    fn with_settings(storage: Storage, settings: AppSettings, models_dir: PathBuf, attachments_dir: PathBuf) -> Self {
+        let artifacts_dir = attachments_dir
+            .parent()
+            .map(|p| p.join("artifacts"))
+            .unwrap_or_else(|| PathBuf::from("data").join("artifacts"));
         // Only the explicit global preference is durable. Temporary grants and
         // one-time approvals belong to the old process and are never restored.
         let permissions = PermissionManager::new(crate::permissions::autonomy_for_mode(&settings.agent.permission_mode));
@@ -323,7 +337,7 @@ impl AppState {
             settings: Arc::new(tokio::sync::RwLock::new(settings)),
             settings_update: Arc::new(tokio::sync::Mutex::new(())),
             runtime_update: Arc::new(tokio::sync::Mutex::new(())),
-            storage: Arc::new(tokio::sync::Mutex::new(storage)),
+            storage,
             install_root: models_dir
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
@@ -707,10 +721,10 @@ async fn list_models(State(s): State<AppState>) -> Json<Vec<crate::models::Model
     }
     // Tool support as llama.cpp reported it for each file when it was last
     // loaded; the chat template's own source only until then.
-    let st = s.storage.lock().await;
+    let st = &s.storage;
     for model in &mut list {
         let key = crate::calibration::model_key(&model.gguf_path());
-        match st.template_caps_for(&key) {
+        match st.template_caps_for(&key).await {
             Ok(Some(caps)) if caps.tools_supported() != crate::inference::Support::Unknown => {
                 model.tool_calling = caps.tools_supported() == crate::inference::Support::Yes;
                 model.tool_support_source = Some("runtime".into());
@@ -1141,7 +1155,7 @@ async fn fit_context_with_runtime(
         draft_head,
         vram.map(|vram| vram.total_bytes / 1_048_576),
     );
-    let remembered = s.storage.lock().await.fit_decision_for(&key).unwrap_or_else(|error| {
+    let remembered = s.storage.fit_decision_for(&key).await.unwrap_or_else(|error| {
         tracing::warn!("could not read the remembered fit: {error}");
         None
     });
@@ -1183,7 +1197,7 @@ async fn fit_context_with_runtime(
         Ok((mut decision, _)) => {
             decision.free_vram_mib = free_vram_mib;
             tracing::info!(model = %model.id, seconds = started.elapsed().as_secs_f64(), context = decision.context, "fit searched");
-            if let Err(error) = s.storage.lock().await.save_fit_decision(&key, &decision) {
+            if let Err(error) = s.storage.save_fit_decision(&key, &decision).await {
                 tracing::warn!("could not remember the fit: {error}");
             }
             apply_fit_decision(&decision, requested, cfg, None);
@@ -2062,7 +2076,7 @@ async fn start_sidecar(
             crate::agent::reset_chars_per_token();
             if let Some(caps) = caps {
                 let key = crate::calibration::model_key(&sidecar.cfg.model_path);
-                if let Err(error) = s.storage.lock().await.save_template_caps(&key, &caps) {
+                if let Err(error) = s.storage.save_template_caps(&key, &caps).await {
                     tracing::warn!("could not remember the template capabilities: {error}");
                 }
             }
@@ -2514,13 +2528,13 @@ pub(crate) async fn assemble_request_context_with(
             search_default: false,
         });
     };
-    let st = s.storage.lock().await;
+    let st = &s.storage;
     let conv = st
-        .get_conversation(cid)
+        .get_conversation(cid).await
         .map_err(|e| ApiError::internal(e.to_string()))?
         .ok_or_else(|| ApiError::not_found("conversation not found"))?;
     let mut history = st
-        .context_messages_for(cid)
+        .context_messages_for(cid).await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     if let Some(message) = pending_message {
         history.push(Message {
@@ -2531,11 +2545,11 @@ pub(crate) async fn assemble_request_context_with(
             created_at: String::new(),
         });
     }
-    let attachments = st.attachments_for(cid).unwrap_or_default();
+    let attachments = st.attachments_for(cid).await.unwrap_or_default();
     // Resolve the subject once for this request. The snapshot, retrieval and
     // file tools must all use the same root, including conversational follow-ups.
     let chat_workspace = if conv.mode == "code" {
-        let linked = linked_code_workspace(&st, &conv)?;
+        let linked = linked_code_workspace(st, &conv).await?;
         let references = history
             .iter()
             .filter(|message| message.role == "user")
@@ -2559,7 +2573,7 @@ pub(crate) async fn assemble_request_context_with(
         .map(|(_, name, root)| workspace_snapshot(&root.to_string_lossy(), name))
         .unwrap_or_default();
     let memory = st
-        .memory_context(cid, &conv.workspace)
+        .memory_context(cid, &conv.workspace).await
         .map_err(|error| ApiError::internal(format!("Could not read saved memory: {error}")))?
         .text;
     let legacy = legacy_prompt_order();
@@ -2869,7 +2883,7 @@ fn workspace_snapshot(ws_path: &str, ws_name: &str) -> String {
 
 /// Resolve only an explicitly linked project; never guess from the number of
 /// available projects. A stale link is actionable, not permission for a fallback.
-fn linked_code_workspace(
+async fn linked_code_workspace(
     st: &Storage,
     conv: &Conversation,
 ) -> Result<crate::storage::Workspace, ApiError> {
@@ -2880,7 +2894,7 @@ fn linked_code_workspace(
         ));
     }
     let workspace = st
-        .get_workspace(&conv.workspace)
+        .get_workspace(&conv.workspace).await
         .map_err(|error| ApiError::internal(format!("storage error: {error}")))?
         .ok_or_else(|| {
             ApiError::bad(
@@ -3153,7 +3167,7 @@ async fn run_chat_tool_round(
     )
     .await;
     {
-        let st = s.storage.lock().await;
+        let st = &s.storage;
         let _ = st.record_tool_execution(&crate::storage::ToolExecution {
             id: uuid::Uuid::new_v4().to_string(),
             conversation_id: conv.clone().unwrap_or_else(|| "direct".into()),
@@ -3163,7 +3177,7 @@ async fn run_chat_tool_round(
             approved: false,
             approval: "chat (read-only tools)".into(),
             created_at: chrono::Utc::now().to_rfc3339(),
-        });
+        }).await;
     }
     turns.push(ChatTurn::text("assistant", round_text));
     let next_step = if call.name == "search_text" && ok {
@@ -3191,9 +3205,7 @@ async fn chat_artifact_count(state: &AppState, conv: &Option<String>) -> usize {
     };
     state
         .storage
-        .lock()
-        .await
-        .artifacts_for(conv_id)
+        .artifacts_for(conv_id).await
         .map(|rows| rows.len())
         .unwrap_or(0)
 }
@@ -3206,9 +3218,7 @@ async fn emit_chat_activity(
 ) {
     if let Err(error) = state
         .storage
-        .lock()
-        .await
-        .record_message_activity(message_id, &event)
+        .record_message_activity(message_id, &event).await
     {
         tracing::error!("Could not save chat activity: {error}");
     }
@@ -3288,8 +3298,8 @@ async fn run_command_as_chat(
     args: &str,
 ) -> Result<Sse<futures::stream::BoxStream<'static, Result<Event, Infallible>>>, ApiError> {
     if let Some(ref cid) = conv_id {
-        let st = s.storage.lock().await;
-        match st.get_conversation(cid) {
+        let st = &s.storage;
+        match st.get_conversation(cid).await {
             Ok(Some(_)) => {
                 let now = chrono::Utc::now().to_rfc3339();
                 let _ = st.add_message(&Message {
@@ -3305,7 +3315,7 @@ async fn run_command_as_chat(
                         }
                     ),
                     created_at: now,
-                });
+                }).await;
             }
             Ok(None) => return Err(ApiError::not_found("conversation not found")),
             Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
@@ -3317,14 +3327,14 @@ async fn run_command_as_chat(
         Err(e) => (format!("Command failed: {}", e.message), None),
     };
     if let (Some(cid), Ok(_)) = (conv_id, &outcome) {
-        let st = s.storage.lock().await;
+        let st = &s.storage;
         let _ = st.add_message(&Message {
             id: uuid::Uuid::new_v4().to_string(),
             conversation_id: cid,
             role: "assistant".into(),
             content: text.clone(),
             created_at: chrono::Utc::now().to_rfc3339(),
-        });
+        }).await;
     }
     Ok(stream_text(text, action))
 }
@@ -3400,13 +3410,13 @@ async fn chat_sse(
     if intent == MessageIntent::Continue {
         if let Some(cid) = &conv_id {
             let workspace = {
-                let st = s.storage.lock().await;
+                let st = &s.storage;
                 match st
-                    .get_conversation(cid)
+                    .get_conversation(cid).await
                     .map_err(|e| ApiError::internal(e.to_string()))?
                 {
                     Some(conv) if conv.mode == "code" => {
-                        Some(linked_code_workspace(&st, &conv)?.path)
+                        Some(linked_code_workspace(st, &conv).await?.path)
                     }
                     _ => None,
                 }
@@ -3427,13 +3437,13 @@ async fn chat_sse(
     // Verify the conversation exists and persist the user turn first so a
     // crash never silently drops it (§83).
     if let Some(ref cid) = conv_id {
-        let st = s.storage.lock().await;
-        match st.get_conversation(cid) {
+        let st = &s.storage;
+        match st.get_conversation(cid).await {
             Ok(Some(conv)) => {
                 if conv.mode == "code" {
-                    linked_code_workspace(&st, &conv)?;
+                    linked_code_workspace(st, &conv).await?;
                     if intent == MessageIntent::Task {
-                        st.clear_task_context(cid)
+                        st.clear_task_context(cid).await
                             .map_err(|error| ApiError::internal(error.to_string()))?;
                     }
                 }
@@ -3443,7 +3453,7 @@ async fn chat_sse(
                     role: "user".into(),
                     content: req.message.clone(),
                     created_at: chrono::Utc::now().to_rfc3339(),
-                })
+                }).await
                 .map_err(|error| {
                     ApiError::internal(format!("Could not save your message: {error}"))
                 })?;
@@ -3487,14 +3497,14 @@ async fn chat_sse(
             stub_reply(&s, &req.message).await
         };
         if let Some(cid) = conv_id {
-            let st = s.storage.lock().await;
+            let st = &s.storage;
             if let Err(e) = st.add_message(&Message {
                 id: uuid::Uuid::new_v4().to_string(),
                 conversation_id: cid,
                 role: "assistant".into(),
                 content: full.clone(),
                 created_at: chrono::Utc::now().to_rfc3339(),
-            }) {
+            }).await {
                 tracing::warn!("persist assistant message failed: {e}");
             }
         }
@@ -3653,7 +3663,7 @@ async fn chat_sse(
             match crate::search::run_search(&req.message, &scfg).await {
                 Ok((results, provider)) => {
                     let conv = bg_conv.clone().unwrap_or_else(|| "direct".into());
-                    let st = bg_state.storage.lock().await;
+                    let st = &bg_state.storage;
                     let _ = st.record_search_run(&crate::storage::SearchRun {
                         id: uuid::Uuid::new_v4().to_string(),
                         conversation_id: conv,
@@ -3661,8 +3671,7 @@ async fn chat_sse(
                         provider: provider.clone(),
                         result_count: results.len(),
                         created_at: chrono::Utc::now().to_rfc3339(),
-                    });
-                    drop(st);
+                    }).await;
                     if results.is_empty() {
                         web_block = "\n\n[Web search returned no results. Answer from local knowledge and say so.]".into();
                         status("No web results — answering locally");
@@ -3768,9 +3777,9 @@ async fn chat_sse(
                         ));
                     }
                 }
-                let st = bg_state.storage.lock().await;
-                let mut chunks = st.knowledge_for(ws_id).unwrap_or_default();
-                if let Ok(Some(linked)) = st.get_workspace(ws_id) {
+                let st = &bg_state.storage;
+                let mut chunks = st.knowledge_for(ws_id).await.unwrap_or_default();
+                if let Ok(Some(linked)) = st.get_workspace(ws_id).await {
                     let linked_root = std::fs::canonicalize(&linked.path).ok();
                     if let Some(prefix) = linked_root
                         .as_ref()
@@ -3792,7 +3801,6 @@ async fn chat_sse(
                         }
                     }
                 }
-                drop(st);
                 let top = retrieve_knowledge(&chunks, &req.message, 4);
                 if !top.is_empty() {
                     let mut block =
@@ -4130,7 +4138,7 @@ async fn chat_sse(
             None => {
                 if claimed {
                     if let Some(cid) = bg_conv {
-                        let st = bg_state.storage.lock().await;
+                        let st = &bg_state.storage;
                         let mid = bg_id.clone();
                         if let Err(e) = st.add_message(&Message {
                             id: mid.clone(),
@@ -4138,7 +4146,7 @@ async fn chat_sse(
                             role: "assistant".into(),
                             content: stored,
                             created_at: chrono::Utc::now().to_rfc3339(),
-                        }) {
+                        }).await {
                             tracing::warn!("persist assistant message failed: {e}");
                         }
                         // Stage 17: this thread was last processed by this model.
@@ -4150,7 +4158,7 @@ async fn chat_sse(
                             .map(|m| m.id.clone())
                             .unwrap_or_default();
                         if !model.is_empty() {
-                            let _ = st.set_last_model(&cid, &model);
+                            let _ = st.set_last_model(&cid, &model).await;
                         }
                         // Stage 33: per-message telemetry, separate from content.
                         let _ = st.record_metric(&crate::storage::GenerationMetric {
@@ -4164,7 +4172,7 @@ async fn chat_sse(
                             gen_tps: gen_tps.unwrap_or(0.0),
                             timing: Some(timing.clone()),
                             created_at: chrono::Utc::now().to_rfc3339(),
-                        });
+                        }).await;
                     }
                 }
                 let _ = tx.send(Ok(Event::default().event("done").safe_data(
@@ -4190,7 +4198,7 @@ async fn chat_sse(
             Some(e) => {
                 if claimed {
                     if let Some(cid) = &bg_conv {
-                        let st = bg_state.storage.lock().await;
+                        let st = &bg_state.storage;
                         let content = if stored.is_empty() {
                             format!("Inference interrupted: {e}")
                         } else {
@@ -4202,7 +4210,7 @@ async fn chat_sse(
                             role: "assistant".into(),
                             content,
                             created_at: chrono::Utc::now().to_rfc3339(),
-                        }) {
+                        }).await {
                             tracing::error!("Could not preserve interrupted reply: {error}");
                         }
                     }
@@ -4265,8 +4273,8 @@ async fn chat_stop(State(s): State<AppState>) -> Json<crate::generation::CancelO
 async fn list_conversations(
     State(s): State<AppState>,
 ) -> Result<Json<Vec<Conversation>>, ApiError> {
-    let st = s.storage.lock().await;
-    st.list_conversations()
+    let st = &s.storage;
+    st.list_conversations().await
         .map(Json)
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))
 }
@@ -4318,7 +4326,7 @@ async fn create_conversation(
         }
     };
     let workspace = req.workspace.trim().to_string();
-    let st = s.storage.lock().await;
+    let st = &s.storage;
     if mode == "code" {
         if workspace.is_empty() {
             return Err(ApiError::bad(
@@ -4326,7 +4334,7 @@ async fn create_conversation(
                 "Select a project before starting a code session.",
             ));
         }
-        match st.get_workspace(&workspace) {
+        match st.get_workspace(&workspace).await {
             Ok(Some(_)) => {}
             Ok(None) => {
                 return Err(ApiError::bad(
@@ -4350,7 +4358,7 @@ async fn create_conversation(
         priority: "normal".into(),
         related_to: String::new(),
     };
-    st.create_conversation(&c)
+    st.create_conversation(&c).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     tracing::info!(conv = %c.id, "conversation created");
     Ok(Json(c))
@@ -4360,8 +4368,8 @@ async fn get_conversation(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Conversation>, ApiError> {
-    let st = s.storage.lock().await;
-    match st.get_conversation(&id) {
+    let st = &s.storage;
+    match st.get_conversation(&id).await {
         Ok(Some(c)) => Ok(Json(c)),
         Ok(None) => Err(ApiError::not_found("conversation not found")),
         Err(e) => Err(ApiError::internal(format!("storage error: {e}"))),
@@ -4372,8 +4380,8 @@ async fn delete_conversation(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let st = s.storage.lock().await;
-    match st.delete_conversation(&id) {
+    let st = &s.storage;
+    match st.delete_conversation(&id).await {
         Ok(true) => {
             tracing::info!(conv = %id, "conversation deleted");
             Ok(Json(serde_json::json!({"deleted": id})))
@@ -4387,16 +4395,16 @@ async fn list_messages(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
-    let st = s.storage.lock().await;
-    match st.get_conversation(&id) {
+    let st = &s.storage;
+    match st.get_conversation(&id).await {
         Ok(Some(_)) => {
             let messages = st
-                .messages_for(&id)
+                .messages_for(&id).await
                 .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
             // One query for every journal in the conversation instead of one
             // per message (a long session used to issue hundreds).
             let mut journals = st
-                .conversation_activities(&id)
+                .conversation_activities(&id).await
                 .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
             let mut payload = vec![];
             for message in messages {
@@ -4428,8 +4436,8 @@ async fn post_message(
 ) -> Result<Json<Message>, ApiError> {
     validate_role(&req.role)?;
     validate_content(&req.content)?;
-    let st = s.storage.lock().await;
-    match st.get_conversation(&id) {
+    let st = &s.storage;
+    match st.get_conversation(&id).await {
         Ok(Some(_)) => {}
         Ok(None) => return Err(ApiError::not_found("conversation not found")),
         Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
@@ -4441,7 +4449,7 @@ async fn post_message(
         content: req.content,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    st.add_message(&m)
+    st.add_message(&m).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     Ok(Json(m))
 }
@@ -4459,16 +4467,16 @@ async fn edit_message(
     Json(req): Json<EditMessage>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     validate_content(&req.content)?;
-    let st = s.storage.lock().await;
-    match st.get_message(&id, &mid) {
+    let st = &s.storage;
+    match st.get_message(&id, &mid).await {
         Ok(Some(_)) => {}
         Ok(None) => return Err(ApiError::not_found("message not found")),
         Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
     }
-    st.update_message_content(&id, &mid, req.content.trim())
+    st.update_message_content(&id, &mid, req.content.trim()).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     let truncated = st
-        .delete_messages_after(&id, &mid)
+        .delete_messages_after(&id, &mid).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     Ok(Json(
         serde_json::json!({"edited": mid, "truncated": truncated}),
@@ -4701,16 +4709,16 @@ async fn latest_agent_context(
             "usage": context.and_then(|event| event.context_usage.as_ref()),
         })));
     }
-    let storage = s.storage.lock().await;
+    let storage = &s.storage;
     let messages = storage
-        .messages_for(conversation_id)
+        .messages_for(conversation_id).await
         .map_err(|error| ApiError::internal(format!("Could not read context history: {error}")))?;
     for message in messages
         .iter()
         .rev()
         .filter(|message| message.role == "assistant")
     {
-        let events = storage.message_activities(&message.id).map_err(|error| {
+        let events = storage.message_activities(&message.id).await.map_err(|error| {
             ApiError::internal(format!("Could not read recorded context: {error}"))
         })?;
         if let Some(context) = events
@@ -4731,15 +4739,14 @@ async fn conversation_context(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let st = s.storage.lock().await;
-    if matches!(st.get_conversation(&id), Ok(None)) {
+    let st = &s.storage;
+    if matches!(st.get_conversation(&id).await, Ok(None)) {
         return Err(ApiError::not_found("conversation not found"));
     }
     let attachments = st
-        .attachments_for(&id)
+        .attachments_for(&id).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     let attach_chars: usize = attachments.iter().map(|a| a.text_excerpt.len()).sum();
-    drop(st);
     let limit = {
         let mut llama = s.llama.write().await;
         if llama.is_running() {
@@ -4751,11 +4758,11 @@ async fn conversation_context(
     let (total, kept, dropped, tok) = context_numbers(&s, &id).await?;
     // Stage 25 breakdown (§§78–80, §104): category estimates in tokens.
     // chars/4 heuristic, stated as estimate in the UI.
-    let st = s.storage.lock().await;
+    let st = &s.storage;
     // Categorize only the bounded saved input, never historical audit output:
     // the latter may have been pruned from the live agent transcript already.
     let history = st
-        .context_messages_for(&id)
+        .context_messages_for(&id).await
         .map_err(|error| ApiError::internal(format!("Could not read saved context: {error}")))?;
     let saved_turns = build_turns(&history, &[]);
     let attached_turns = build_turns(&history, &attachments);
@@ -4767,15 +4774,14 @@ async fn conversation_context(
         .map(|turn| turn.content.len())
         .sum();
     let workspace = st
-        .get_conversation(&id)
+        .get_conversation(&id).await
         .ok()
         .flatten()
         .map(|conversation| conversation.workspace)
         .unwrap_or_default();
     let memory = st
-        .memory_context(&id, &workspace)
+        .memory_context(&id, &workspace).await
         .map_err(|error| ApiError::internal(format!("Could not read saved memory: {error}")))?;
-    drop(st);
     let attach_tok = estimate_tokens(attached_chars.saturating_sub(saved_chars));
     let tool_tok = (tool_chars / 4) as u32;
     // System instructions are assembled by each runtime path, not part of
@@ -5016,11 +5022,11 @@ async fn list_attachments(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<crate::storage::Attachment>>, ApiError> {
-    let st = s.storage.lock().await;
-    if matches!(st.get_conversation(&id), Ok(None)) {
+    let st = &s.storage;
+    if matches!(st.get_conversation(&id).await, Ok(None)) {
         return Err(ApiError::not_found("conversation not found"));
     }
-    st.attachments_for(&id)
+    st.attachments_for(&id).await
         .map(Json)
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))
 }
@@ -5059,8 +5065,8 @@ async fn add_attachment(
 ) -> Result<Json<crate::storage::Attachment>, ApiError> {
     const MAX_ATTACH_BYTES: usize = 5_000_000;
     const EXCERPT_CHARS: usize = 20_000;
-    let st = s.storage.lock().await;
-    if matches!(st.get_conversation(&id), Ok(None)) {
+    let st = &s.storage;
+    if matches!(st.get_conversation(&id).await, Ok(None)) {
         return Err(ApiError::not_found("conversation not found"));
     }
     let safe =
@@ -5127,7 +5133,7 @@ async fn add_attachment(
             status: "ready".into(),
             created_at: chrono::Utc::now().to_rfc3339(),
         };
-        st.add_attachment(&a)
+        st.add_attachment(&a).await
             .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
         return Ok(Json(a));
     }
@@ -5162,7 +5168,7 @@ async fn add_attachment(
             status,
             created_at: chrono::Utc::now().to_rfc3339(),
         };
-        st.add_attachment(&a)
+        st.add_attachment(&a).await
             .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
         return Ok(Json(a));
     }
@@ -5195,7 +5201,7 @@ async fn add_attachment(
         status: "ready".into(),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    st.add_attachment(&a)
+    st.add_attachment(&a).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     Ok(Json(a))
 }
@@ -5204,14 +5210,14 @@ async fn delete_attachment(
     State(s): State<AppState>,
     Path((id, aid)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let st = s.storage.lock().await;
+    let st = &s.storage;
     let atts = st
-        .attachments_for(&id)
+        .attachments_for(&id).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     match atts.iter().find(|a| a.id == aid).cloned() {
         None => Err(ApiError::not_found("attachment not found")),
         Some(a) => {
-            st.delete_attachment(&id, &aid)
+            st.delete_attachment(&id, &aid).await
                 .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
             let _ = std::fs::remove_file(s.attachments_dir.join(&id).join(&a.filename));
             Ok(Json(serde_json::json!({"deleted": aid})))
@@ -5233,15 +5239,14 @@ async fn attachment_file(
     State(s): State<AppState>,
     Path((id, aid)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let st = s.storage.lock().await;
+    let st = &s.storage;
     let atts = st
-        .attachments_for(&id)
+        .attachments_for(&id).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     let att = atts
         .into_iter()
         .find(|a| a.id == aid)
         .ok_or_else(|| ApiError::not_found("unknown attachment"))?;
-    drop(st);
     let bytes = std::fs::read(s.attachments_dir.join(&id).join(&att.filename))
         .map_err(|_| ApiError::not_found("attachment file missing from disk"))?;
     use axum::body::Body;
@@ -5257,9 +5262,7 @@ async fn list_artifacts(
     axum::extract::Query(q): axum::extract::Query<ArtifactQuery>,
 ) -> Result<Json<Vec<crate::storage::ArtifactRow>>, ApiError> {
     s.storage
-        .lock()
-        .await
-        .artifacts_for(&q.conversation_id)
+        .artifacts_for(&q.conversation_id).await
         .map(Json)
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))
 }
@@ -5269,7 +5272,7 @@ async fn artifact_file(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let row = match s.storage.lock().await.get_artifact(&id) {
+    let row = match s.storage.get_artifact(&id).await {
         Ok(Some(r)) => r,
         Ok(None) => return Err(ApiError::not_found("unknown artifact")),
         Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
@@ -5413,7 +5416,7 @@ async fn execute_tool(
                 } else {
                     req.conversation_id.clone()
                 };
-                let st = s.storage.lock().await;
+                let st = &s.storage;
                 let _ = st.record_search_run(&crate::storage::SearchRun {
                     id: uuid::Uuid::new_v4().to_string(),
                     conversation_id: conv.clone(),
@@ -5421,7 +5424,7 @@ async fn execute_tool(
                     provider: provider.clone(),
                     result_count: results.len(),
                     created_at: chrono::Utc::now().to_rfc3339(),
-                });
+                }).await;
                 let out = serde_json::json!({"provider": provider, "results": results});
                 let _ = st.record_tool_execution(&crate::storage::ToolExecution {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -5432,7 +5435,7 @@ async fn execute_tool(
                     approved: true,
                     approval: approval.into(),
                     created_at: chrono::Utc::now().to_rfc3339(),
-                });
+                }).await;
                 Ok(Json(
                     serde_json::json!({"ok": true, "output": out, "exit_code": Option::<i32>::None, "approved_via": "once"}),
                 ))
@@ -5495,7 +5498,7 @@ async fn record_tool_call(
     ok: bool,
     result: &str,
 ) {
-    let st = s.storage.lock().await;
+    let st = &s.storage;
     let _ = st.record_tool_execution(&crate::storage::ToolExecution {
         id: uuid::Uuid::new_v4().to_string(),
         conversation_id: conversation_id.into(),
@@ -5505,7 +5508,7 @@ async fn record_tool_call(
         approved: ok,
         approval: approval.into(),
         created_at: chrono::Utc::now().to_rfc3339(),
-    });
+    }).await;
 }
 
 /// The folder a direct tool call may work in: a saved project, or a folder
@@ -5520,9 +5523,7 @@ async fn saved_project_folder(s: &AppState, requested: &str) -> Result<std::path
     })?;
     let projects = s
         .storage
-        .lock()
-        .await
-        .list_workspaces()
+        .list_workspaces().await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     let inside = projects
         .iter()
@@ -5606,8 +5607,8 @@ async fn list_tool_executions(
     State(s): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<ExecQuery>,
 ) -> Result<Json<Vec<crate::storage::ToolExecution>>, ApiError> {
-    let st = s.storage.lock().await;
-    st.tool_executions_for(&q.conversation_id, q.limit.clamp(1, 200))
+    let st = &s.storage;
+    st.tool_executions_for(&q.conversation_id, q.limit.clamp(1, 200)).await
         .map(Json)
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))
 }
@@ -5719,7 +5720,7 @@ async fn answering_intent(s: &AppState, conversation_id: &str, text: &str) -> Me
 
 async fn latest_reply_asks_in(s: &AppState, conversation_id: &str) -> bool {
     !conversation_id.is_empty()
-        && latest_reply_asks(&s.storage.lock().await.messages_for(conversation_id).unwrap_or_default())
+        && latest_reply_asks(&s.storage.messages_for(conversation_id).await.unwrap_or_default())
 }
 
 /// The latest assistant reply ends by asking the user something.
@@ -5745,8 +5746,8 @@ async fn conversational_reply(
 ) -> Result<serde_json::Value, ApiError> {
     let message_id = uuid::Uuid::new_v4().to_string();
     if !conversation_id.trim().is_empty() {
-        let st = s.storage.lock().await;
-        match st.get_conversation(conversation_id) {
+        let st = &s.storage;
+        match st.get_conversation(conversation_id).await {
             Ok(Some(_)) => {}
             Ok(None) => return Err(ApiError::not_found("conversation not found")),
             Err(error) => return Err(ApiError::internal(format!("storage error: {error}"))),
@@ -5761,7 +5762,7 @@ async fn conversational_reply(
                 role: role.into(),
                 content: content.into(),
                 created_at: now_rfc3339(),
-            })
+            }).await
             .map_err(|error| ApiError::internal(format!("Could not save the reply: {error}")))?;
         }
     }
@@ -5782,9 +5783,7 @@ async fn resolve_continuation(
 ) -> Result<Continuation, ApiError> {
     let context = s
         .storage
-        .lock()
-        .await
-        .task_context(conversation_id)
+        .task_context(conversation_id).await
         .map_err(|error| ApiError::internal(format!("Could not read task context: {error}")))?;
     let Some(mut context) = context else {
         return Ok(Continuation::Reply("needs_task", "What would you like me to continue? There is no saved unfinished task or proposed plan for this session."));
@@ -5897,12 +5896,12 @@ async fn run_agent(
     if !req.conversation_id.trim().is_empty() {
         // Read before taking storage, the order the chat path uses.
         let current_model = s.models.read().await.current().map(|model| model.id.clone()).unwrap_or_default();
-        let st = s.storage.lock().await;
-        match st.get_conversation(req.conversation_id.trim()) {
+        let st = &s.storage;
+        match st.get_conversation(req.conversation_id.trim()).await {
             Ok(Some(conversation)) => {
                 conversation_reasoning = conversation.reasoning_default;
                 if conversation.mode == "code" {
-                    let linked = linked_code_workspace(&st, &conversation)?;
+                    let linked = linked_code_workspace(st, &conversation).await?;
                     let linked_root = std::fs::canonicalize(&linked.path).map_err(|error| {
                         ApiError::bad(
                             format!("project unavailable: {error}"),
@@ -5925,13 +5924,13 @@ async fn run_agent(
                     role: "user".into(),
                     content: req.task.trim().to_string(),
                     created_at: chrono::Utc::now().to_rfc3339(),
-                })
+                }).await
                 .map_err(|error| ApiError::internal(format!("storage error: {error}")))?;
                 // This session is now worked on by the loaded model, as a chat
                 // reply records. Agent runs never did, so a code session last
                 // used with another model kept its "Last used with" notice.
                 if !current_model.is_empty() {
-                    let _ = st.set_last_model(req.conversation_id.trim(), &current_model);
+                    let _ = st.set_last_model(req.conversation_id.trim(), &current_model).await;
                 }
             }
             Ok(None) => return Err(ApiError::not_found("conversation not found")),
@@ -5999,14 +5998,14 @@ async fn spawn_agent_run(
         handle: std::sync::Mutex::new(None),
     });
     if !run.spec.conversation_id.is_empty() {
-        let st = s.storage.lock().await;
+        let st = &s.storage;
         st.add_message(&Message {
             id: run.id.clone(),
             conversation_id: run.spec.conversation_id.clone(),
             role: "assistant".into(),
             content: "Work is starting…".into(),
             created_at: run.started_at.clone(),
-        })
+        }).await
         .map_err(|error| ApiError::internal(format!("Could not save the run: {error}")))?;
         st.save_task_context(&crate::storage::TaskContext {
             conversation_id: run.spec.conversation_id.clone(),
@@ -6017,7 +6016,7 @@ async fn spawn_agent_run(
             task: run.spec.task.clone(),
             run_id: run.id.clone(),
             status: "active".into(),
-        })
+        }).await
         .map_err(|error| ApiError::internal(format!("Could not save task context: {error}")))?;
     }
     let journal = s.storage.clone();
@@ -6025,22 +6024,24 @@ async fn spawn_agent_run(
     let journal_cid = run.spec.conversation_id.clone();
     tokio::spawn(async move {
         while let Some(event) = activity_rx.recv().await {
-            let st = journal.lock().await;
-            if let Err(error) = st.record_message_activity(&journal_mid, &event) {
+            let st = &journal;
+            let last = matches!(event.state, AgentState::Completed | AgentState::Failed | AgentState::Cancelled);
+            let saved = if last && !journal_cid.is_empty() {
+                st.finish_message(&journal_cid, &journal_mid, &event).await
+            } else {
+                st.record_message_activity(&journal_mid, &event).await
+            };
+            if let Err(error) = saved {
                 tracing::error!("Could not persist agent activity: {error}");
             }
-            if matches!(
-                event.state,
-                AgentState::Completed | AgentState::Failed | AgentState::Cancelled
-            ) {
+            if last {
                 if !journal_cid.is_empty() {
-                    let _ = st.update_message_content(&journal_cid, &journal_mid, &event.message);
                     let status = match event.state {
                         AgentState::Completed if mode == AgentMode::Plan && crate::agent_runner::presents_plan(&event) => "planned",
                         AgentState::Completed => "completed",
                         _ => "interrupted",
                     };
-                    if let Err(error) = st.finish_task_context(&journal_cid, &journal_mid, status) {
+                    if let Err(error) = st.finish_task_context(&journal_cid, &journal_mid, status).await {
                         tracing::error!("Could not persist task outcome: {error}");
                     }
                 }
@@ -6338,10 +6339,10 @@ async fn command_workspace(
         ));
     }
     if let Some(cid) = conv_id {
-        let st = s.storage.lock().await;
-        if let Ok(Some(conv)) = st.get_conversation(cid) {
+        let st = &s.storage;
+        if let Ok(Some(conv)) = st.get_conversation(cid).await {
             if !conv.workspace.is_empty() {
-                if let Ok(Some(ws)) = st.get_workspace(&conv.workspace) {
+                if let Ok(Some(ws)) = st.get_workspace(&conv.workspace).await {
                     let pb = std::path::PathBuf::from(&ws.path);
                     if pb.is_dir() {
                         return Ok(pb);
@@ -6422,10 +6423,10 @@ async fn run_slash_command(
             Ok(O::Message(context_text(s, &cid).await?))
         }
         "clear" => {
-            let st = s.storage.lock().await;
+            let st = &s.storage;
             let (model_id, mode, workspace, reasoning_default, search_default) = match &conv_id {
                 Some(cid) => st
-                    .get_conversation(cid)
+                    .get_conversation(cid).await
                     .unwrap_or(None)
                     .map(|c| {
                         (
@@ -6439,7 +6440,6 @@ async fn run_slash_command(
                     .unwrap_or_default(),
                 None => Default::default(),
             };
-            drop(st);
             let (model_id, mode, workspace): (String, String, String) = (model_id, mode, workspace);
             let c = Conversation {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -6455,9 +6455,7 @@ async fn run_slash_command(
                 related_to: String::new(),
             };
             s.storage
-                .lock()
-                .await
-                .create_conversation(&c)
+                .create_conversation(&c).await
                 .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
             Ok(O::NewConversation { id: c.id.clone(), message: "New conversation started. The previous one remains available in history. Workspace, model and permissions are unchanged — /clear starts fresh context, /compact preserves continuity.".into() })
         }
@@ -6599,9 +6597,9 @@ async fn run_slash_command(
         "retry" => {
             let cid = conv_id
                 .ok_or_else(|| ApiError::bad("no conversation", "Run /retry inside a chat."))?;
-            let st = s.storage.lock().await;
+            let st = &s.storage;
             let last_user = st
-                .messages_for(&cid)
+                .messages_for(&cid).await
                 .map_err(|e| ApiError::internal(format!("storage error: {e}")))?
                 .into_iter()
                 .rev()
@@ -6665,29 +6663,29 @@ async fn system_status_text(s: &AppState, conv_id: Option<&str>) -> String {
 }
 
 async fn context_numbers(s: &AppState, cid: &str) -> Result<(usize, usize, usize, u32), ApiError> {
-    let st = s.storage.lock().await;
-    if matches!(st.get_conversation(cid), Ok(None)) {
+    let st = &s.storage;
+    if matches!(st.get_conversation(cid).await, Ok(None)) {
         return Err(ApiError::not_found("conversation not found"));
     }
     let total = st
-        .messages_for(cid)
+        .messages_for(cid).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?
         .len();
     let history = st
-        .context_messages_for(cid)
+        .context_messages_for(cid).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     let attachments = st
-        .attachments_for(cid)
+        .attachments_for(cid).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     let turns = build_turns(&history, &attachments);
     let workspace = st
-        .get_conversation(cid)
+        .get_conversation(cid).await
         .ok()
         .flatten()
         .map(|conversation| conversation.workspace)
         .unwrap_or_default();
     let memory = st
-        .memory_context(cid, &workspace)
+        .memory_context(cid, &workspace).await
         .map_err(|error| ApiError::internal(format!("Could not read saved memory: {error}")))?;
     let chars: usize = turns.iter().map(|t| t.content.len()).sum::<usize>() + memory.text.len();
     Ok((
@@ -6793,7 +6791,7 @@ const COMPACTION_HEADER: &str = "[Compacted context — summary of";
 /// fit in `max_chars`, at least two (the new message and the reply before
 /// it), at most `max_keep`.
 async fn recent_messages_within(s: &AppState, cid: &str, max_chars: usize, max_keep: usize) -> usize {
-    let history = s.storage.lock().await.messages_for(cid).unwrap_or_default();
+    let history = s.storage.messages_for(cid).await.unwrap_or_default();
     let mut chars = 0usize;
     let mut keep = 0usize;
     for message in history.iter().rev() {
@@ -6887,15 +6885,15 @@ async fn compact_conversation_keeping(
 ) -> Result<CompactStats, ApiError> {
     let keep_recent = keep_recent.clamp(1, 200);
     let (history, previous_summary, covered) = {
-        let st = s.storage.lock().await;
-        if matches!(st.get_conversation(cid), Ok(None)) {
+        let st = &s.storage;
+        if matches!(st.get_conversation(cid).await, Ok(None)) {
             return Err(ApiError::not_found("conversation not found"));
         }
         let history = st
-            .messages_for(cid)
+            .messages_for(cid).await
             .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
         let view = st
-            .context_messages_for(cid)
+            .context_messages_for(cid).await
             .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
         let summary = view
             .first()
@@ -6960,11 +6958,11 @@ async fn compact_conversation_keeping(
         });
     }
     {
-        let st = s.storage.lock().await;
+        let st = &s.storage;
         // Reject stale summaries if the user edited/truncated the source while
         // inference was running. Newly appended messages are safe to retain.
         let all = st
-            .messages_for(cid)
+            .messages_for(cid).await
             .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
         if all.len() < end
             || !all
@@ -6980,7 +6978,7 @@ async fn compact_conversation_keeping(
         let ids: Vec<String> = history[..end].iter().map(|message| message.id.clone()).collect();
         st.save_context_summary(cid, &ids, &format!(
             "{COMPACTION_HEADER} {end} older messages; original history preserved]\n{summary}"
-        )).map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
+        )).await.map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     }
     let saved = before_chars.saturating_sub(after_chars);
     let pct = if before_chars > 0 {
@@ -7027,18 +7025,18 @@ async fn prepare_conversation(
         }
         // Snapshot genuine saved context without claiming it was submitted.
         let (conv_model, history_n, attach_n, memory_n) = {
-            let st = bg.storage.lock().await;
-            match st.get_conversation(&id) {
+            let st = &bg.storage;
+            match st.get_conversation(&id).await {
                 Ok(Some(c)) => {
-                    let h = st.messages_for(&id).unwrap_or_default();
+                    let h = st.messages_for(&id).await.unwrap_or_default();
                     if c.mode == "code" {
-                        if let Err(error) = linked_code_workspace(&st, &c) {
+                        if let Err(error) = linked_code_workspace(st, &c).await {
                             fail(error.message);
                             return;
                         }
                     }
-                    let a = st.attachments_for(&id).unwrap_or_default().len();
-                    let memory = match st.memory_context(&id, &c.workspace) {
+                    let a = st.attachments_for(&id).await.unwrap_or_default().len();
+                    let memory = match st.memory_context(&id, &c.workspace).await {
                         Ok(memory) => memory.entries,
                         Err(error) => {
                             fail(format!("Could not read saved memory: {error}"));
@@ -7151,8 +7149,8 @@ async fn prepare_conversation(
         );
         // This records the selection, not a fabricated cache-prefill operation.
         {
-            let st = bg.storage.lock().await;
-            let _ = st.set_last_model(&id, &target);
+            let st = &bg.storage;
+            let _ = st.set_last_model(&id, &target).await;
         }
         let _ = tx.send(Ok(Event::default().event("done").safe_data(
             serde_json::json!({"ready": true, "model": target, "history": history_n, "memory_entries": memory_n,
@@ -7184,19 +7182,18 @@ async fn conversation_compatibility(
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<CompatQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let st = s.storage.lock().await;
-    let conv = match st.get_conversation(&id) {
+    let st = &s.storage;
+    let conv = match st.get_conversation(&id).await {
         Ok(Some(c)) => c,
         Ok(None) => return Err(ApiError::not_found("conversation not found")),
         Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
     };
     let history = st
-        .messages_for(&id)
+        .messages_for(&id).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     let attachments = st
-        .attachments_for(&id)
+        .attachments_for(&id).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
-    drop(st);
     let target_id = if q.model_id.trim().is_empty() {
         conv.model_id.clone()
     } else {
@@ -7281,6 +7278,7 @@ struct NewWorkspace {
 /// Open the operating system's folder chooser. This keeps filesystem paths
 /// out of the normal UX while returning only the folder the user selected.
 async fn pick_folder() -> Result<Json<serde_json::Value>, ApiError> {
+    #[cfg(not(target_os = "linux"))]
     let picked = tokio::task::spawn_blocking(|| {
         rfd::FileDialog::new()
             .set_title("Choose a project folder")
@@ -7288,6 +7286,23 @@ async fn pick_folder() -> Result<Json<serde_json::Value>, ApiError> {
     })
     .await
     .map_err(|error| ApiError::internal(format!("folder picker failed: {error}")))?;
+    // Cancelled, or no desktop to ask (a server): no folder.
+    #[cfg(target_os = "linux")]
+    let picked = async {
+        let chosen = ashpd::desktop::file_chooser::SelectedFiles::open_file()
+            .title("Choose a project folder")
+            .directory(true)
+            .modal(true)
+            .send()
+            .await?
+            .response()?;
+        Ok::<_, ashpd::Error>(chosen.uris().first().and_then(|uri| uri.to_file_path().ok()))
+    }
+    .await
+    .unwrap_or_else(|error| {
+        tracing::info!(%error, "no folder chosen");
+        None
+    });
     Ok(Json(serde_json::json!({
         "path": picked.map(|path| path.to_string_lossy().into_owned())
     })))
@@ -7297,9 +7312,7 @@ async fn list_workspaces(
     State(s): State<AppState>,
 ) -> Result<Json<Vec<crate::storage::Workspace>>, ApiError> {
     s.storage
-        .lock()
-        .await
-        .list_workspaces()
+        .list_workspaces().await
         .map(Json)
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))
 }
@@ -7351,9 +7364,7 @@ async fn create_workspace(
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     s.storage
-        .lock()
-        .await
-        .create_workspace(&w)
+        .create_workspace(&w).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     Ok(Json(w))
 }
@@ -7395,7 +7406,7 @@ async fn get_workspace(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<crate::storage::Workspace>, ApiError> {
-    match s.storage.lock().await.get_workspace(&id) {
+    match s.storage.get_workspace(&id).await {
         Ok(Some(w)) => Ok(Json(w)),
         Ok(None) => Err(ApiError::not_found("unknown workspace")),
         Err(e) => Err(ApiError::internal(format!("storage error: {e}"))),
@@ -7419,12 +7430,12 @@ async fn delete_workspace(
     axum::extract::Query(query): axum::extract::Query<RemoveProjectQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let with_tasks = query.tasks == "delete";
-    let storage = s.storage.lock().await;
-    if storage.get_workspace(&id).ok().flatten().is_none() {
+    let storage = &s.storage;
+    if storage.get_workspace(&id).await.ok().flatten().is_none() {
         return Err(ApiError::not_found("unknown workspace"));
     }
     let chats = storage
-        .conversations_in_workspace(&id)
+        .conversations_in_workspace(&id).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     // A run still working in one of these chats would keep writing to a
     // conversation that is being deleted underneath it.
@@ -7447,12 +7458,12 @@ async fn delete_workspace(
     let mut removed_chats = 0usize;
     if with_tasks {
         for chat in &chats {
-            if storage.delete_conversation(chat).unwrap_or(false) {
+            if storage.delete_conversation(chat).await.unwrap_or(false) {
                 removed_chats += 1;
             }
         }
     }
-    match storage.delete_workspace(&id) {
+    match storage.delete_workspace(&id).await {
         Ok(true) => Ok(Json(serde_json::json!({
             "deleted": id,
             "chats": chats.len(),
@@ -7476,7 +7487,7 @@ async fn workspace_instructions(
         "PROJECT.md",
         "README.md",
     ];
-    let ws = match s.storage.lock().await.get_workspace(&id) {
+    let ws = match s.storage.get_workspace(&id).await {
         Ok(Some(w)) => w,
         Ok(None) => return Err(ApiError::not_found("unknown workspace")),
         Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
@@ -7504,7 +7515,7 @@ async fn workspace_diff(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let ws = match s.storage.lock().await.get_workspace(&id) {
+    let ws = match s.storage.get_workspace(&id).await {
         Ok(Some(w)) => w,
         Ok(None) => return Err(ApiError::not_found("unknown workspace")),
         Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
@@ -7549,7 +7560,7 @@ fn resolve_workspace_root(
 }
 
 async fn load_workspace(s: &AppState, id: &str) -> Result<crate::storage::Workspace, ApiError> {
-    match s.storage.lock().await.get_workspace(id) {
+    match s.storage.get_workspace(id).await {
         Ok(Some(w)) => Ok(w),
         Ok(None) => Err(ApiError::not_found("unknown workspace")),
         Err(e) => Err(ApiError::internal(format!("storage error: {e}"))),
@@ -7690,7 +7701,7 @@ async fn ingest_knowledge(
             "Pick an existing file or folder.",
         ));
     }
-    let st = s.storage.lock().await;
+    let st = &s.storage;
     let mut chunks_added = 0;
     let mut files_indexed = 0;
     // resolve() canonicalizes existing targets (\\?\ prefix on Windows), so
@@ -7715,17 +7726,10 @@ async fn ingest_knowledge(
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| f.to_string_lossy().into_owned())
             });
-        let _ = st.clear_knowledge_path(&id, &rel_path);
-        for (i, piece) in chunk_text(&text).into_iter().enumerate().take(200) {
-            let _ = st.add_knowledge_chunk(&crate::storage::KnowledgeChunk {
-                id: uuid::Uuid::new_v4().to_string(),
-                workspace_id: id.clone(),
-                path: rel_path.clone(),
-                chunk_idx: i as i64,
-                text: piece,
-            });
-            chunks_added += 1;
-        }
+        let pieces: Vec<String> = chunk_text(&text).into_iter().take(200).collect();
+        st.replace_knowledge_path(&id, &rel_path, &pieces).await
+            .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
+        chunks_added += pieces.len();
         files_indexed += 1;
     }
     Ok(Json(serde_json::json!({
@@ -7739,9 +7743,9 @@ async fn list_knowledge(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     load_workspace(&s, &id).await?;
-    let st = s.storage.lock().await;
+    let st = &s.storage;
     let paths = st
-        .knowledge_paths(&id)
+        .knowledge_paths(&id).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     let total: i64 = paths.iter().map(|(_, n)| n).sum();
     Ok(Json(serde_json::json!({
@@ -7756,18 +7760,18 @@ async fn clear_knowledge(
     Json(req): Json<IngestReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     load_workspace(&s, &id).await?;
-    let st = s.storage.lock().await;
+    let st = &s.storage;
     let removed = if req.path.trim().is_empty() {
         let paths = st
-            .knowledge_paths(&id)
+            .knowledge_paths(&id).await
             .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
         let mut n = 0;
         for (p, _) in paths {
-            n += st.clear_knowledge_path(&id, &p).unwrap_or(0);
+            n += st.clear_knowledge_path(&id, &p).await.unwrap_or(0);
         }
         n
     } else {
-        st.clear_knowledge_path(&id, req.path.trim())
+        st.clear_knowledge_path(&id, req.path.trim()).await
             .map_err(|e| ApiError::internal(format!("storage error: {e}")))?
     };
     Ok(Json(serde_json::json!({"removed": removed})))
@@ -7782,13 +7786,13 @@ async fn conversation_metrics(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let st = s.storage.lock().await;
-    if matches!(st.get_conversation(&id), Ok(None)) {
+    let st = &s.storage;
+    if matches!(st.get_conversation(&id).await, Ok(None)) {
         return Err(ApiError::not_found("conversation not found"));
     }
-    let history = st.messages_for(&id).unwrap_or_default();
+    let history = st.messages_for(&id).await.unwrap_or_default();
     let metrics = st
-        .metrics_for(&id)
+        .metrics_for(&id).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     let out: Vec<serde_json::Value> = metrics
         .into_iter()
@@ -7995,7 +7999,7 @@ async fn doctor(State(s): State<AppState>) -> Json<serde_json::Value> {
         "ok",
         "doctor ran against the live API".into(),
     );
-    match s.storage.lock().await.list_conversations() {
+    match s.storage.list_conversations().await {
         Ok(n) => row(
             "database",
             "Database",
@@ -8084,8 +8088,8 @@ async fn doctor(State(s): State<AppState>) -> Json<serde_json::Value> {
         }
     }
     {
-        let st = s.storage.lock().await;
-        match st.list_workspaces() {
+        let st = &s.storage;
+        match st.list_workspaces().await {
             Ok(ws) => {
                 let missing: Vec<String> = ws
                     .iter()
@@ -8163,9 +8167,7 @@ async fn setup_status(State(s): State<AppState>) -> Json<serde_json::Value> {
     let running = s.llama.write().await.is_running();
     let convs = s
         .storage
-        .lock()
-        .await
-        .list_conversations()
+        .list_conversations().await
         .map(|v| v.len())
         .unwrap_or(0);
     let steps = vec![
@@ -8284,12 +8286,13 @@ async fn patch_conversation(
     Json(req): Json<PatchConv>,
 ) -> Result<Json<Conversation>, ApiError> {
     let scope_changed = req.mode.is_some() || req.workspace.is_some();
-    let st = s.storage.lock().await;
-    let mut c = match st.get_conversation(&id) {
+    let st = &s.storage;
+    let mut c = match st.get_conversation(&id).await {
         Ok(Some(c)) => c,
         Ok(None) => return Err(ApiError::not_found("conversation not found")),
         Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
     };
+    let before = c.clone();
     if let Some(t) = req.title {
         if t.len() > MAX_TITLE_CHARS {
             return Err(ApiError::bad(
@@ -8322,9 +8325,9 @@ async fn patch_conversation(
         // can still be set before the first message, or when the session has no
         // registered project to keep.
         if w != c.workspace && !c.workspace.trim().is_empty() {
-            let storage_error = |e: rusqlite::Error| ApiError::internal(format!("storage error: {e}"));
-            let project_kept = st.get_workspace(&c.workspace).map_err(storage_error)?.is_some();
-            if project_kept && st.message_count(&c.id).map_err(storage_error)? > 0 {
+            let storage_error = |e: sqlx::Error| ApiError::internal(format!("storage error: {e}"));
+            let project_kept = st.get_workspace(&c.workspace).await.map_err(storage_error)?.is_some();
+            if project_kept && st.message_count(&c.id).await.map_err(storage_error)? > 0 {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
                     "this session already works in another project",
@@ -8333,7 +8336,7 @@ async fn patch_conversation(
             }
         }
         if !w.is_empty() {
-            match st.get_workspace(&w) {
+            match st.get_workspace(&w).await {
                 Ok(Some(_)) => c.workspace = w,
                 Ok(None) => return Err(ApiError::not_found(format!("unknown workspace '{w}'"))),
                 Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
@@ -8352,9 +8355,9 @@ async fn patch_conversation(
         c.last_model = lm;
     }
     if scope_changed && c.mode == "code" {
-        linked_code_workspace(&st, &c)?;
+        linked_code_workspace(st, &c).await?;
     }
-    st.update_conversation(&c)
+    st.update_conversation(&before, &c).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     Ok(Json(c))
 }
@@ -8372,8 +8375,8 @@ async fn fork_conversation(
     Json(req): Json<ForkReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let (src, n) = {
-        let st = s.storage.lock().await;
-        let src = match st.get_conversation(&id) {
+        let st = &s.storage;
+        let src = match st.get_conversation(&id).await {
             Ok(Some(c)) => c,
             Ok(None) => return Err(ApiError::not_found("conversation not found")),
             Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
@@ -8396,10 +8399,10 @@ async fn fork_conversation(
             last_model: src.last_model.clone(),
             priority: src.priority.clone(),
             related_to: src.related_to.clone(),
-        })
+        }).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
         let n = st
-            .fork_messages(&id, &dst_id, &chrono::Utc::now().to_rfc3339())
+            .fork_messages(&id, &dst_id, &chrono::Utc::now().to_rfc3339()).await
             .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
         (dst_id, n)
     };
@@ -8458,17 +8461,17 @@ async fn share_conversation(
             "Share into a different conversation.",
         ));
     }
-    let st = s.storage.lock().await;
-    let src_title = match st.get_conversation(&id) {
+    let st = &s.storage;
+    let src_title = match st.get_conversation(&id).await {
         Ok(Some(c)) => c.title,
         Ok(None) => return Err(ApiError::not_found("conversation not found")),
         Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
     };
-    if matches!(st.get_conversation(&req.target_id), Ok(None)) {
+    if matches!(st.get_conversation(&req.target_id).await, Ok(None)) {
         return Err(ApiError::not_found("target conversation not found"));
     }
     let history = st
-        .messages_for(&id)
+        .messages_for(&id).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     let take = req.turns.clamp(1, 20);
     let start = history.len().saturating_sub(take);
@@ -8512,7 +8515,7 @@ async fn share_conversation(
     }
     if req.attachments {
         let atts = st
-            .attachments_for(&id)
+            .attachments_for(&id).await
             .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
         if atts.is_empty() {
             package.push_str("\nAttachments: none\n");
@@ -8531,12 +8534,12 @@ async fn share_conversation(
     }
     if req.memory {
         let tgt_ws = st
-            .get_conversation(&req.target_id)
+            .get_conversation(&req.target_id).await
             .ok()
             .flatten()
             .map(|c| c.workspace)
             .unwrap_or_default();
-        let mems = st.memory_export(&id, &tgt_ws).unwrap_or_default();
+        let mems = st.memory_export(&id, &tgt_ws).await.unwrap_or_default();
         if mems.is_empty() {
             package.push_str("\nMemory: none visible to source\n");
         } else {
@@ -8556,7 +8559,7 @@ async fn share_conversation(
         role: "user".into(),
         content: package,
         created_at: chrono::Utc::now().to_rfc3339(),
-    })
+    }).await
     .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     Ok(Json(
         serde_json::json!({"shared": req.target_id, "turns": shared_turns}),
@@ -8568,11 +8571,10 @@ async fn share_conversation(
 /// COLD = everything else. KV residency itself is llama-server's slots —
 /// history here is always the source of truth (§122).
 async fn list_sessions(State(s): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
-    let st = s.storage.lock().await;
+    let st = &s.storage;
     let convs = st
-        .list_conversations()
+        .list_conversations().await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
-    drop(st);
     let generating: std::collections::HashSet<String> = {
         let mut set = std::collections::HashSet::new();
         if let Some(cid) = s.generations.read().await.active_conversation() {
@@ -8653,12 +8655,13 @@ async fn patch_session(
     Path(id): Path<String>,
     Json(req): Json<PatchSession>,
 ) -> Result<Json<Conversation>, ApiError> {
-    let st = s.storage.lock().await;
-    let mut c = match st.get_conversation(&id) {
+    let st = &s.storage;
+    let mut c = match st.get_conversation(&id).await {
         Ok(Some(c)) => c,
         Ok(None) => return Err(ApiError::not_found("conversation not found")),
         Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
     };
+    let before = c.clone();
     if let Some(p) = req.priority {
         if !["background", "normal", "high"].contains(&p.as_str()) {
             return Err(ApiError::bad(
@@ -8669,12 +8672,12 @@ async fn patch_session(
         c.priority = p;
     }
     if let Some(r) = req.related_to {
-        if !r.is_empty() && r != id && matches!(st.get_conversation(&r), Ok(None)) {
+        if !r.is_empty() && r != id && matches!(st.get_conversation(&r).await, Ok(None)) {
             return Err(ApiError::not_found("related session not found"));
         }
         c.related_to = r;
     }
-    st.update_conversation(&c)
+    st.update_conversation(&before, &c).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     Ok(Json(c))
 }
@@ -8758,11 +8761,10 @@ async fn sessions_recovery(State(s): State<AppState>) -> Result<Json<serde_json:
         .current()
         .map(|m| m.id.clone())
         .unwrap_or_default();
-    let st = s.storage.lock().await;
+    let st = &s.storage;
     let convs = st
-        .list_conversations()
+        .list_conversations().await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
-    drop(st);
     let busy: Vec<String> = {
         let mut b = Vec::new();
         if let Some(cid) = s.generations.read().await.active_conversation() {
@@ -8801,11 +8803,10 @@ async fn session_action(
     Path(id): Path<String>,
     Json(req): Json<SessionAction>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let st = s.storage.lock().await;
-    if matches!(st.get_conversation(&id), Ok(None)) {
+    let st = &s.storage;
+    if matches!(st.get_conversation(&id).await, Ok(None)) {
         return Err(ApiError::not_found("conversation not found"));
     }
-    drop(st);
     match req.action.as_str() {
         "pause" | "stop" => {
             let mut acted = Vec::new();
@@ -8993,9 +8994,7 @@ async fn put_permission_mode(
     next.agent.permission_mode = req.mode.clone();
     next.agent.autonomous_enabled = req.mode == "auto";
     s.storage
-        .lock()
-        .await
-        .save_settings(&next)
+        .save_settings(&next).await
         .map_err(|error| {
             ApiError::internal(format!("Could not save permission preference: {error}"))
         })?;
@@ -9177,9 +9176,7 @@ async fn put_settings(
         ));
     }
     s.storage
-        .lock()
-        .await
-        .save_settings(&next)
+        .save_settings(&next).await
         .map_err(|error| ApiError::internal(format!("Could not save settings: {error}")))?;
     s.permissions.write().await.autonomy = crate::permissions::autonomy_for_mode(&next.agent.permission_mode);
     *s.settings.write().await = next.clone();
@@ -9260,9 +9257,8 @@ async fn system_overview(State(s): State<AppState>) -> Json<serde_json::Value> {
     };
     // Attribution (§132): live inference/agent work is measured-or-estimated,
     // everything else is honestly unknown.
-    let st = s.storage.lock().await;
-    let convs = st.list_conversations().unwrap_or_default();
-    drop(st);
+    let st = &s.storage;
+    let convs = st.list_conversations().await.unwrap_or_default();
     let mut active = std::collections::HashSet::new();
     if let Some(cid) = s.generations.read().await.active_conversation() {
         if !cid.is_empty() {
@@ -9388,8 +9384,8 @@ async fn list_memory(
     let ws = q.get("workspace_id").cloned().unwrap_or_default();
     // Resolve workspace from the conversation when not given explicitly.
     let ws = if ws.is_empty() && !conv.is_empty() {
-        let st = s.storage.lock().await;
-        st.get_conversation(&conv)
+        let st = &s.storage;
+        st.get_conversation(&conv).await
             .ok()
             .flatten()
             .map(|c| c.workspace)
@@ -9398,9 +9394,7 @@ async fn list_memory(
         ws
     };
     s.storage
-        .lock()
-        .await
-        .memories_for(&conv, &ws)
+        .memories_for(&conv, &ws).await
         .map(Json)
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))
 }
@@ -9453,9 +9447,7 @@ async fn add_memory(
         last_used: now,
     };
     s.storage
-        .lock()
-        .await
-        .add_memory(&m)
+        .add_memory(&m).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     Ok(Json(m))
 }
@@ -9464,7 +9456,7 @@ async fn delete_memory(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    match s.storage.lock().await.delete_memory(&id) {
+    match s.storage.delete_memory(&id).await {
         Ok(true) => Ok(Json(serde_json::json!({"deleted": id}))),
         Ok(false) => Err(ApiError::not_found("unknown memory")),
         Err(e) => Err(ApiError::internal(format!("storage error: {e}"))),
@@ -9495,8 +9487,8 @@ async fn share_memory(
             "Use conversation, workspace or global.",
         ));
     }
-    let st = s.storage.lock().await;
-    let src = match st.get_memory(&id) {
+    let st = &s.storage;
+    let src = match st.get_memory(&id).await {
         Ok(Some(m)) => m,
         Ok(None) => return Err(ApiError::not_found("unknown memory")),
         Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
@@ -9515,7 +9507,7 @@ async fn share_memory(
         created_at: now.clone(),
         last_used: now,
     };
-    st.add_memory(&copy)
+    st.add_memory(&copy).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     Ok(Json(
         serde_json::json!({"shared": copy.id, "scope": copy.scope}),
@@ -9529,28 +9521,28 @@ async fn conversation_timeline(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let st = s.storage.lock().await;
-    if matches!(st.get_conversation(&id), Ok(None)) {
+    let st = &s.storage;
+    if matches!(st.get_conversation(&id).await, Ok(None)) {
         return Err(ApiError::not_found("conversation not found"));
     }
     let mut events: Vec<serde_json::Value> = Vec::new();
-    if let Ok(c) = st.get_conversation(&id) {
+    if let Ok(c) = st.get_conversation(&id).await {
         if let Some(c) = c {
             events.push(serde_json::json!({"kind": "session", "label": "Session started", "at": c.created_at}));
         }
     }
-    for a in st.attachments_for(&id).unwrap_or_default() {
+    for a in st.attachments_for(&id).await.unwrap_or_default() {
         events.push(serde_json::json!({"kind": "attachment", "label": format!("Attached {}", a.filename), "at": a.created_at}));
     }
-    for m in st.messages_for(&id).unwrap_or_default() {
+    for m in st.messages_for(&id).await.unwrap_or_default() {
         if m.content.starts_with("[Compacted context") {
             events.push(serde_json::json!({"kind": "compaction", "label": "Context compacted", "at": m.created_at}));
         }
     }
-    for t in st.tool_executions_for(&id, 200).unwrap_or_default() {
+    for t in st.tool_executions_for(&id, 200).await.unwrap_or_default() {
         events.push(serde_json::json!({"kind": "tool", "label": format!("Tool: {}", t.tool), "at": t.created_at}));
     }
-    for a in st.artifacts_for(&id).unwrap_or_default() {
+    for a in st.artifacts_for(&id).await.unwrap_or_default() {
         events.push(serde_json::json!({"kind": "artifact", "label": format!("Generated {}", a.filename), "at": a.created_at}));
     }
     events.sort_by(|a, b| a["at"].as_str().cmp(&b["at"].as_str()));
@@ -9589,14 +9581,13 @@ async fn attachment_budget(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let st = s.storage.lock().await;
-    if matches!(st.get_conversation(&id), Ok(None)) {
+    let st = &s.storage;
+    if matches!(st.get_conversation(&id).await, Ok(None)) {
         return Err(ApiError::not_found("conversation not found"));
     }
     let atts = st
-        .attachments_for(&id)
+        .attachments_for(&id).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
-    drop(st);
     let images = atts.iter().filter(|a| a.kind == "image").count();
     let partial = atts.iter().filter(|a| a.status == "partial").count();
     let unsupported = atts.iter().filter(|a| a.status == "unsupported").count();
@@ -9653,7 +9644,7 @@ async fn artifact_info(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let row = match s.storage.lock().await.get_artifact(&id) {
+    let row = match s.storage.get_artifact(&id).await {
         Ok(Some(r)) => r,
         Ok(None) => return Err(ApiError::not_found("unknown artifact")),
         Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
@@ -9767,9 +9758,7 @@ async fn model_calibration(
     let key = crate::calibration::model_key(&model.gguf_path());
     let latest = s
         .storage
-        .lock()
-        .await
-        .calibrations_for(&model.id, &key)
+        .calibrations_for(&model.id, &key).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?
         .into_iter()
         .next();
@@ -9997,9 +9986,7 @@ async fn calibrate_model(
         let key = crate::calibration::model_key(&gguf);
         let previous = bg
             .storage
-            .lock()
-            .await
-            .calibrations_for(&model.id, &key)
+            .calibrations_for(&model.id, &key).await
             .unwrap_or_default()
             .into_iter()
             .find(|earlier| earlier.environment.comparable(&environment));
@@ -10023,7 +10010,7 @@ async fn calibrate_model(
             micro_batches,
             micro_batch,
         };
-        if let Err(error) = bg.storage.lock().await.save_calibration(&calibration) {
+        if let Err(error) = bg.storage.save_calibration(&calibration).await {
             fail(format!("Measured, but could not save the calibration: {error}"));
             return;
         }
@@ -10048,9 +10035,7 @@ async fn latest_calibration(
     let key = crate::calibration::model_key(&model.gguf_path());
     let calibrations = s
         .storage
-        .lock()
-        .await
-        .calibrations_for(&model.id, &key)
+        .calibrations_for(&model.id, &key).await
         .unwrap_or_default();
     let latest = calibrations.into_iter().next()?;
     let now = calibration_environment(s, server).await;
@@ -10416,9 +10401,7 @@ mod tests {
             assert!(
                 state
                     .storage
-                    .lock()
-                    .await
-                    .load_settings()
+                    .load_settings().await
                     .unwrap()
                     .unwrap()
                     .agent
@@ -10600,15 +10583,13 @@ Would you like me to fix it?")]));
             .to_string();
         state
             .storage
-            .lock()
-            .await
             .save_task_context(&crate::storage::TaskContext {
                 conversation_id: cid.clone(),
                 workspace: "unused".into(),
                 task: "Fix subtraction".into(),
                 run_id: "planned-run".into(),
                 status: "planned".into(),
-            })
+            }).await
             .unwrap();
         let response = app.clone().oneshot(json_req("POST", "/api/agent/run", serde_json::json!({"conversation_id":cid,"workspace":"does-not-exist","task":"looks good to me"}))).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -10634,9 +10615,9 @@ Would you like me to fix it?")]));
             state.agent_active.load(std::sync::atomic::Ordering::SeqCst),
             0
         );
-        let st = state.storage.lock().await;
-        assert_eq!(st.messages_for(&cid).unwrap().len(), 4);
-        assert_eq!(st.task_context(&cid).unwrap().unwrap().status, "planned");
+        let st = &state.storage;
+        assert_eq!(st.messages_for(&cid).await.unwrap().len(), 4);
+        assert_eq!(st.task_context(&cid).await.unwrap().unwrap().status, "planned");
     }
 
     #[tokio::test]
@@ -10660,9 +10641,7 @@ Would you like me to fix it?")]));
             context.status = status.into();
             state
                 .storage
-                .lock()
-                .await
-                .save_task_context(&context)
+                .save_task_context(&context).await
                 .unwrap();
             assert!(
                 matches!(resolve_continuation(&state, "session", &root).await.unwrap(), Continuation::Task(task) if task == context.task)
@@ -10671,9 +10650,7 @@ Would you like me to fix it?")]));
         context.status = "completed".into();
         state
             .storage
-            .lock()
-            .await
-            .save_task_context(&context)
+            .save_task_context(&context).await
             .unwrap();
         assert!(matches!(
             resolve_continuation(&state, "session", &root)
@@ -10688,9 +10665,7 @@ Would you like me to fix it?")]));
             .into_owned();
         state
             .storage
-            .lock()
-            .await
-            .save_task_context(&context)
+            .save_task_context(&context).await
             .unwrap();
         assert!(matches!(
             resolve_continuation(&state, "session", &root)
@@ -10745,23 +10720,19 @@ Would you like me to fix it?")]));
             .to_string();
         let path = state
             .storage
-            .lock()
-            .await
-            .get_workspace(&workspace)
+            .get_workspace(&workspace).await
             .unwrap()
             .unwrap()
             .path;
         state
             .storage
-            .lock()
-            .await
             .save_task_context(&crate::storage::TaskContext {
                 conversation_id: cid.clone(),
                 workspace: path,
                 task: "Fix subtraction".into(),
                 run_id: "plan".into(),
                 status: "planned".into(),
-            })
+            }).await
             .unwrap();
         let response = app
             .clone()
@@ -10775,9 +10746,7 @@ Would you like me to fix it?")]));
         assert_eq!(response.status(), StatusCode::OK);
         assert!(state
             .storage
-            .lock()
-            .await
-            .task_context(&cid)
+            .task_context(&cid).await
             .unwrap()
             .is_none());
         let response = app
@@ -10798,12 +10767,10 @@ Would you like me to fix it?")]));
     async fn permission_preference_survives_restart_but_action_grants_do_not() {
         let root =
             std::env::temp_dir().join(format!("companion-preferences-{}", uuid::Uuid::new_v4()));
-        let database = root.join("companion.db");
+        // One database, opened three times as three restarts would.
+        let database = crate::storage::testing::storage();
         {
-            let state = AppState::new_with_storage(
-                Storage::open_persistent(&database).unwrap(),
-                root.join("models"),
-            );
+            let state = AppState::new_with_storage(database.reopened(), root.join("models")).await;
             assert_eq!(
                 get_permission_mode(State(state.clone())).await.0["mode"],
                 "ask"
@@ -10823,10 +10790,7 @@ Would you like me to fix it?")]));
                 .grant_session("write_file", "project");
         }
         {
-            let state = AppState::new_with_storage(
-                Storage::open_persistent(&database).unwrap(),
-                root.join("models"),
-            );
+            let state = AppState::new_with_storage(database.reopened(), root.join("models")).await;
             assert_eq!(
                 get_permission_mode(State(state.clone())).await.0["mode"],
                 "auto"
@@ -10867,10 +10831,7 @@ Would you like me to fix it?")]));
             let _ = put_settings(State(state), Json(settings)).await.unwrap();
         }
         {
-            let state = AppState::new_with_storage(
-                Storage::open_persistent(&database).unwrap(),
-                root.join("models"),
-            );
+            let state = AppState::new_with_storage(database.reopened(), root.join("models")).await;
             assert_eq!(
                 get_permission_mode(State(state.clone())).await.0["mode"],
                 "ask"
@@ -10893,8 +10854,6 @@ Would you like me to fix it?")]));
                 );
             }
         }
-        std::fs::remove_file(database).unwrap();
-        std::fs::remove_dir(root).unwrap();
     }
 
     #[tokio::test]
@@ -10994,7 +10953,7 @@ Would you like me to fix it?")]));
             .as_str()
             .unwrap()
             .to_string();
-        let storage = state.storage.lock().await;
+        let storage = &state.storage;
         storage
             .add_message(&Message {
                 id: "context-agent-reply".into(),
@@ -11002,7 +10961,7 @@ Would you like me to fix it?")]));
                 role: "assistant".into(),
                 content: "Done.".into(),
                 created_at: "now".into(),
-            })
+            }).await
             .unwrap();
         storage
             .record_message_activity(
@@ -11017,7 +10976,7 @@ Would you like me to fix it?")]));
                     Some("x".repeat(100_000)),
                     None,
                 ),
-            )
+            ).await
             .unwrap();
         let first = crate::agent::AgentContextUsage::for_turns(
             &[ChatTurn::text("user", "older input")],
@@ -11030,7 +10989,7 @@ Would you like me to fix it?")]));
             .record_message_activity(
                 "context-agent-reply",
                 &crate::agent::AgentEvent::context(crate::agent::AgentState::Planning, 1, first),
-            )
+            ).await
             .unwrap();
         let latest = crate::agent::AgentContextUsage::for_turns(
             &[
@@ -11046,9 +11005,8 @@ Would you like me to fix it?")]));
             .record_message_activity(
                 "context-agent-reply",
                 &crate::agent::AgentEvent::context(crate::agent::AgentState::Planning, 2, latest),
-            )
+            ).await
             .unwrap();
-        drop(storage);
         let result = conversation_context(State(state), Path(conversation))
             .await
             .unwrap()
@@ -11079,8 +11037,6 @@ Would you like me to fix it?")]));
             .to_string();
         state
             .storage
-            .lock()
-            .await
             .add_memory(&crate::storage::MemoryEntry {
                 id: "saved".into(),
                 scope: "conversation".into(),
@@ -11089,13 +11045,11 @@ Would you like me to fix it?")]));
                 source: "user".into(),
                 created_at: "now".into(),
                 last_used: "now".into(),
-            })
+            }).await
             .unwrap();
         let expected = state
             .storage
-            .lock()
-            .await
-            .memory_context(&conversation, "")
+            .memory_context(&conversation, "").await
             .unwrap();
         let result = conversation_context(State(state), Path(conversation))
             .await
@@ -11586,9 +11540,7 @@ Would you like me to fix it?")]));
         assert!(state.settings.read().await.runtime_auto);
         assert!(state
             .storage
-            .lock()
-            .await
-            .load_settings()
+            .load_settings().await
             .unwrap()
             .is_none());
     }
@@ -11978,7 +11930,7 @@ Would you like me to fix it?")]));
             r#"{"id":"tiny","name":"Tiny","architecture":"llama","quantization":"Q4_K_M","parameters":"1B","context_length":4096,"vision":false,"tool_calling":false}"#,
         )
         .unwrap();
-        let state = AppState::new_with_storage(Storage::open_in_memory().unwrap(), dir.clone());
+        let state = AppState::new_with_storage(crate::storage::testing::storage(), dir.clone()).await;
         {
             let (found, _) = crate::models::scan_models_dir(&dir);
             let mut mm = state.models.write().await;
@@ -12043,19 +11995,17 @@ Would you like me to fix it?")]));
 
     /// A router whose state has `path` saved as a project, as the screens do
     /// before any tool runs in it.
-    fn app_with_project(path: &str) -> Router {
+    async fn app_with_project(path: &str) -> Router {
         let state = AppState::new_stub();
         state
             .storage
-            .try_lock()
-            .unwrap()
             .create_workspace(&crate::storage::Workspace {
                 id: uuid::Uuid::new_v4().to_string(),
                 name: "project".into(),
                 path: path.into(),
                 build_system: String::new(),
                 created_at: chrono::Utc::now().to_rfc3339(),
-            })
+            }).await
             .unwrap();
         router(state)
     }
@@ -12078,7 +12028,7 @@ Would you like me to fix it?")]));
         std::fs::create_dir_all(std::path::Path::new(&project).join("src")).unwrap();
         std::fs::write(std::path::Path::new(&project).join("src").join("b.txt"), "inside").unwrap();
         let inner = std::path::Path::new(&project).join("src").to_string_lossy().into_owned();
-        let a = app_with_project(&project);
+        let a = app_with_project(&project).await;
         let r = a
             .clone()
             .oneshot(json_req(
@@ -12151,7 +12101,7 @@ Would you like me to fix it?")]));
     #[tokio::test]
     async fn tool_gate_requires_approval_then_allows_once() {
         let ws = tool_ws();
-        let a = app_with_project(&ws);
+        let a = app_with_project(&ws).await;
         // The default Ask mode runs a read without asking (as Claude Code
         // does) and asks before a file edit.
         let r = a
@@ -12222,7 +12172,7 @@ Would you like me to fix it?")]));
     #[tokio::test]
     async fn tool_session_grant_and_audit() {
         let ws = tool_ws();
-        let a = app_with_project(&ws);
+        let a = app_with_project(&ws).await;
         // Grant session for write_file (MODERATE) with an approval.
         let r = a.clone().oneshot(json_req("POST", "/api/tools/execute",
             exec_body(&ws, "write_file", serde_json::json!({"path": "s.txt", "content": "v"}),
@@ -12377,7 +12327,7 @@ Would you like me to fix it?")]));
     #[tokio::test]
     async fn web_search_tool_needs_consent() {
         let ws = tool_ws();
-        let a = app_with_project(&ws);
+        let a = app_with_project(&ws).await;
         let r = a
             .oneshot(json_req(
                 "POST",
@@ -12563,7 +12513,7 @@ Would you like me to fix it?")]));
             r#"{"id":"big","name":"Big","architecture":"qwen2","quantization":"Q4_K_M","parameters":"14B","context_length":32768,"vision":false,"tool_calling":true}"#,
         )
         .unwrap();
-        let state = AppState::new_with_storage(Storage::open_in_memory().unwrap(), dir.clone());
+        let state = AppState::new_with_storage(crate::storage::testing::storage(), dir.clone()).await;
         {
             let (found, _) = crate::models::scan_models_dir(&dir);
             let mut mm = state.models.write().await;
@@ -12613,7 +12563,7 @@ Would you like me to fix it?")]));
             r#"{"id":"plain","name":"Plain","architecture":"llama","quantization":"Q4_K_M","parameters":"1B","context_length":4096,"vision":false,"tool_calling":false}"#,
         )
         .unwrap();
-        let state = AppState::new_with_storage(Storage::open_in_memory().unwrap(), dir.clone());
+        let state = AppState::new_with_storage(crate::storage::testing::storage(), dir.clone()).await;
         {
             let (found, _) = crate::models::scan_models_dir(&dir);
             let mut mm = state.models.write().await;
@@ -13198,7 +13148,7 @@ Would you like me to fix it?")]));
             r#"{"id":"opt8","name":"Opt8","architecture":"llama","quantization":"Q4_K_M","parameters":"8B","context_length":32768,"vision":false,"tool_calling":true}"#,
         )
         .unwrap();
-        let state = AppState::new_with_storage(Storage::open_in_memory().unwrap(), dir.clone());
+        let state = AppState::new_with_storage(crate::storage::testing::storage(), dir.clone()).await;
         {
             let (found, _) = crate::models::scan_models_dir(&dir);
             let mut mm = state.models.write().await;
@@ -13417,13 +13367,13 @@ Would you like me to fix it?")]));
     }
 
     async fn add_test_message(state: &AppState, conversation: &str) {
-        state.storage.lock().await.add_message(&Message {
+        state.storage.add_message(&Message {
             id: uuid::Uuid::new_v4().to_string(),
             conversation_id: conversation.to_string(),
             role: "user".into(),
             content: "Inspect this project".into(),
             created_at: "now".into(),
-        }).unwrap();
+        }).await.unwrap();
     }
 
     #[tokio::test]
@@ -13454,7 +13404,7 @@ Would you like me to fix it?")]));
         // Naming the project it already has is not a move.
         let (status, body) = patch_workspace(&a, &conversation, serde_json::json!({"mode": "code", "workspace": second, "title": "Renamed"})).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let kept = state.storage.lock().await.get_conversation(&conversation).unwrap().unwrap();
+        let kept = state.storage.get_conversation(&conversation).await.unwrap().unwrap();
         assert_eq!(kept.workspace, second);
         assert_eq!(kept.title, "Renamed");
     }
@@ -13466,9 +13416,7 @@ Would you like me to fix it?")]));
         let (a, gone_project) = seed_workspace(a, "Gone").await;
         let folder = state
             .storage
-            .lock()
-            .await
-            .get_workspace(&gone_project)
+            .get_workspace(&gone_project).await
             .unwrap()
             .unwrap()
             .path;
@@ -13507,7 +13455,7 @@ Would you like me to fix it?")]));
         let body = body_json(response).await;
         assert_eq!(body["chats"], 1, "{body}");
         assert_eq!(body["chats_deleted"], 0, "{body}");
-        assert!(state.storage.lock().await.get_conversation(&elsewhere).unwrap().is_some());
+        assert!(state.storage.get_conversation(&elsewhere).await.unwrap().is_some());
 
         // Asked to, it takes them with it - and only them.
         let response = a
@@ -13525,12 +13473,11 @@ Would you like me to fix it?")]));
         let body = body_json(response).await;
         assert_eq!(body["chats"], 2, "{body}");
         assert_eq!(body["chats_deleted"], 2, "{body}");
-        let storage = state.storage.lock().await;
-        assert!(storage.get_conversation(&first).unwrap().is_none());
-        assert!(storage.get_conversation(&second).unwrap().is_none());
-        assert!(storage.get_conversation(&elsewhere).unwrap().is_some(), "another project's task is untouched");
-        assert!(storage.get_workspace(&gone_project).unwrap().is_none());
-        drop(storage);
+        let storage = &state.storage;
+        assert!(storage.get_conversation(&first).await.unwrap().is_none());
+        assert!(storage.get_conversation(&second).await.unwrap().is_none());
+        assert!(storage.get_conversation(&elsewhere).await.unwrap().is_some(), "another project's task is untouched");
+        assert!(storage.get_workspace(&gone_project).await.unwrap().is_none());
 
         // The user's own files are never what "remove project" means.
         assert!(std::path::Path::new(&folder).is_dir(), "the folder on disk stays: {folder}");
@@ -13757,9 +13704,7 @@ Would you like me to fix it?")]));
         }
         let events = state
             .storage
-            .lock()
-            .await
-            .message_activities("live-exploration")
+            .message_activities("live-exploration").await
             .unwrap();
         assert!(
             events
@@ -13839,9 +13784,7 @@ Would you like me to fix it?")]));
         assert!(turns.last().unwrap().content.contains("Kept"));
         let events = state
             .storage
-            .lock()
-            .await
-            .message_activities("chunk-reply")
+            .message_activities("chunk-reply").await
             .unwrap();
         assert!(
             events[1]
@@ -13924,9 +13867,7 @@ Would you like me to fix it?")]));
         );
         let events = state
             .storage
-            .lock()
-            .await
-            .message_activities("inspection-reply")
+            .message_activities("inspection-reply").await
             .unwrap();
         assert_eq!(events[0].kind, "tool_started");
         assert_eq!(events[1].kind, "tool_result");
@@ -13941,9 +13882,7 @@ Would you like me to fix it?")]));
         assert!(!root.join("blocked.txt").exists());
         let events = state
             .storage
-            .lock()
-            .await
-            .message_activities("inspection-reply")
+            .message_activities("inspection-reply").await
             .unwrap();
         assert_eq!(events.last().unwrap().kind, "tool_error");
         assert!(events.last().unwrap().diff.is_none());

@@ -20,6 +20,14 @@ fork to drop the model weights (Git LFS); commit ids differ from the Companion's
   Owner decision, same day: conversation export removed (audit records cover it); "Save logs as a zip"
   (`GET /api/logs/archive`) shares the program's own logs. Backend 529 passed, frontend 114. The owner's disk is short on space: build
   with `CARGO_INCREMENTAL=0` and `CARGO_PROFILE_DEV_DEBUG=0` (about 1 GB instead of 14).
+- **State (2026-10-06, later):** Phase 1 tasks 1 (PostgreSQL) and 2 (SQLite import) done; see the
+  Progress table in `docs/enterprise/PHASE1-TASKS.md`. Owner decision: Windows and Linux both, for the
+  whole project. Without `COMPANION_DATABASE_URL` the backend runs a private PostgreSQL from
+  `runtime/pgsql/` (`python scripts/get-postgres.py` installs it; the run scripts do it on first run).
+  Tests need that install or `COMPANION_TEST_DATABASE_URL`. Linux is checked in WSL Ubuntu: a copy of the
+  tree in `~/companion-linux` there; building PostgreSQL needs bison and flex (WSL has no passwordless
+  sudo, so for the check they were unpacked into `~/buildtools`, not installed). Next: task 3 (sign-in,
+  not enforced on the laptop).
 - Everything below this section is the Companion's own handoff, kept as it was at the fork.
 
 # Handoff — start here

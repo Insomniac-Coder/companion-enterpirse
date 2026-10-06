@@ -74,7 +74,7 @@ impl GenerationTracker {
     /// Safe to call when idle (returns `stopped: false`).
     pub async fn cancel_current(
         &mut self,
-        storage: &tokio::sync::Mutex<crate::storage::Storage>,
+        storage: &crate::storage::Storage,
     ) -> CancelOutcome {
         let Some(gen) = self.current.take() else {
             return CancelOutcome {
@@ -95,7 +95,7 @@ impl GenerationTracker {
         let mut kept = 0usize;
         if claimed {
             if let (Some(cid), true) = (gen.conversation_id.clone(), !text.is_empty()) {
-                let st = storage.lock().await;
+                let st = storage;
                 if st
                     .add_message(&crate::storage::Message {
                         id: gen.id.clone(),
@@ -103,19 +103,19 @@ impl GenerationTracker {
                         role: "assistant".into(),
                         content: text.clone(),
                         created_at: chrono::Utc::now().to_rfc3339(),
-                    })
+                    }).await
                     .is_ok()
                 {
                     kept = text.len();
                     if st
-                        .message_activities(&gen.id)
+                        .message_activities(&gen.id).await
                         .map(|events| !events.is_empty())
                         .unwrap_or(false)
                     {
                         let _ = st.record_message_activity(&gen.id, &crate::agent::AgentEvent::activity(
                             "status", crate::agent::AgentState::Cancelled,
                             "Stopped by you. Completed inspections and the partial response were kept.".into(), 0,
-                        ));
+                        )).await;
                     }
                 }
             }
@@ -135,10 +135,8 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_persists_partial_and_is_idempotent() {
-        let storage = tokio::sync::Mutex::new(crate::storage::Storage::open_in_memory().unwrap());
+        let storage = crate::storage::testing::storage();
         storage
-            .lock()
-            .await
             .create_conversation(&crate::storage::Conversation {
                 id: "c1".into(),
                 title: "t".into(),
@@ -151,7 +149,7 @@ mod tests {
                 last_model: "".into(),
                 priority: "normal".into(),
                 related_to: "".into(),
-            })
+            }).await
             .unwrap();
 
         let mut tracker = GenerationTracker::new();
@@ -178,19 +176,19 @@ mod tests {
         assert!(out.stopped);
         assert_eq!(out.id.as_deref(), Some("g1"));
         assert!(out.chars_kept > 0);
-        let msgs = storage.lock().await.messages_for("c1").unwrap();
+        let msgs = storage.messages_for("c1").await.unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Hello wo", "persist exactly what streamed");
 
         // Second cancel finds nothing and persists nothing more.
         let out = tracker.cancel_current(&storage).await;
         assert!(!out.stopped);
-        assert_eq!(storage.lock().await.messages_for("c1").unwrap().len(), 1);
+        assert_eq!(storage.messages_for("c1").await.unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn cancel_without_conversation_keeps_nothing_but_reports_stopped() {
-        let storage = tokio::sync::Mutex::new(crate::storage::Storage::open_in_memory().unwrap());
+        let storage = crate::storage::testing::storage();
         let mut tracker = GenerationTracker::new();
         tracker.insert(ActiveGeneration {
             id: "g2".into(),

@@ -9,7 +9,10 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   (§100) keeps the door open for a C++ llama.cpp core later.
 - Frontend: React + TypeScript + Vite (§6). Tailwind deferred; plain CSS
   shell now to keep Stage 1 dependency-free.
-- DB: SQLite via rusqlite `bundled` (§20, §70).
+- DB: PostgreSQL through sqlx, one connection pool shared by every request (enterprise Phase 1, task 1,
+  2026-10-06; it replaced SQLite and the one lock every request waited on). Schema changes are numbered
+  files in `backend/migrations/`. Without `COMPANION_DATABASE_URL`, `pgsql.rs` runs a private PostgreSQL
+  from `runtime/pgsql/` (Windows and Linux). rusqlite remains only to import a Companion's SQLite history.
 
 ## Modules (§101) → `backend/src/`
 | Spec module | File | Status |
@@ -526,7 +529,8 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
 - Models: `POST /api/models/scan` registers `<models>/*/metadata.json` (§9).
 - Settings `PUT` validates context &gt; 0, temp 0–2, iterations 1–200.
 - Agent `POST /api/agent/run` requires non-empty task + workspace (§27).
-- DB: `data/companion.db` (WAL). Falls back to in-memory with a loud error log.
+- DB: PostgreSQL (`COMPANION_DATABASE_URL`, or the private one with its files in `data/postgres/`).
+  Startup stops with an error when the database cannot be opened; there is no in-memory fallback.
 
 ## Security invariants (§92–93)
 - `LLM → ToolRequest → PermissionManager → Tool → OS`. No direct OS access.

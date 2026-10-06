@@ -1532,7 +1532,7 @@ async fn preview_for_run(
                             size_bytes: bytes.len() as u64,
                             created_at: chrono::Utc::now().to_rfc3339(),
                         };
-                        let stored = state.storage.lock().await.record_artifact(&row);
+                        let stored = state.storage.record_artifact(&row).await;
                         let _ = std::fs::remove_file(picture);
                         if stored.is_ok() {
                             text.push_str(&format!(
@@ -2593,9 +2593,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
     } else {
         state
             .storage
-            .lock()
-            .await
-            .context_messages_for(&spec.conversation_id)
+            .context_messages_for(&spec.conversation_id).await
             .unwrap_or_default()
             .into_iter()
             .filter(|message| message.role == "user")
@@ -2745,18 +2743,18 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
     // Each run starts fresh inference, not fresh product memory. Carry the
     // session's derived context and attachment excerpts into follow-up tasks.
     if !spec.conversation_id.is_empty() {
-        let st = state.storage.lock().await;
+        let st = &state.storage;
         let workspace = st
-            .get_conversation(&spec.conversation_id)
+            .get_conversation(&spec.conversation_id).await
             .ok()
             .flatten()
             .map(|conversation| conversation.workspace)
             .unwrap_or_default();
-        if let Ok(memory) = st.memory_context(&spec.conversation_id, &workspace) {
+        if let Ok(memory) = st.memory_context(&spec.conversation_id, &workspace).await {
             transcript[0].content.push_str(&memory.text);
         }
         let mut history = st
-            .context_messages_for(&spec.conversation_id)
+            .context_messages_for(&spec.conversation_id).await
             .unwrap_or_default();
         history.retain(|message| message.id != run.id);
         if history
@@ -2767,7 +2765,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             task_message = history.pop();
         }
         let attachments = st
-            .attachments_for(&spec.conversation_id)
+            .attachments_for(&spec.conversation_id).await
             .unwrap_or_default();
         let budget = crate::api::history_char_budget(cfg.n_ctx, transcript[0].content.len());
         let (turns, owners) = crate::api::build_turns_with_owners(&history, &attachments, budget);
@@ -2813,9 +2811,9 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
     // it starts with the host's record of that work and the project's notes.
     if !spec.conversation_id.is_empty() {
         let executions = {
-            let storage = state.storage.lock().await;
+            let storage = &state.storage;
             storage
-                .tool_executions_for(&spec.conversation_id, 150)
+                .tool_executions_for(&spec.conversation_id, 150).await
                 .unwrap_or_default()
                 .into_iter()
                 .rev()
@@ -4871,7 +4869,7 @@ async fn execute_web_search(
             } else {
                 run.spec.conversation_id.clone()
             };
-            let st = state.storage.lock().await;
+            let st = &state.storage;
             let _ = st.record_search_run(&crate::storage::SearchRun {
                 id: uuid::Uuid::new_v4().to_string(),
                 conversation_id: conv.clone(),
@@ -4879,7 +4877,7 @@ async fn execute_web_search(
                 provider: provider.clone(),
                 result_count: results.len(),
                 created_at: chrono::Utc::now().to_rfc3339(),
-            });
+            }).await;
             let mut text = format!("Web results via {provider}:\n");
             for (i, r) in results.iter().enumerate() {
                 text.push_str(&format!(
@@ -4899,7 +4897,7 @@ async fn execute_web_search(
                 approved: true,
                 approval: approval.into(),
                 created_at: chrono::Utc::now().to_rfc3339(),
-            });
+            }).await;
             text
         }
         Err(e) => format!(
@@ -5112,7 +5110,7 @@ async fn audit_tool(state: &crate::api::AppState, run: &LiveRun, call: &ToolCall
     } else {
         run.spec.conversation_id.clone()
     };
-    let st = state.storage.lock().await;
+    let st = &state.storage;
     let _ = st.record_tool_execution(&crate::storage::ToolExecution {
         id: uuid::Uuid::new_v4().to_string(),
         conversation_id: conv,
@@ -5122,7 +5120,7 @@ async fn audit_tool(state: &crate::api::AppState, run: &LiveRun, call: &ToolCall
         approved: true,
         approval: approval.into(),
         created_at: chrono::Utc::now().to_rfc3339(),
-    });
+    }).await;
 }
 
 /// A cancelled run's last word: the user's doing, or Companion closing.
@@ -5148,11 +5146,11 @@ async fn persist_final(state: &crate::api::AppState, run: &LiveRun, content: &st
     if run.spec.conversation_id.trim().is_empty() {
         return;
     }
-    let st = state.storage.lock().await;
-    if !matches!(st.get_conversation(&run.spec.conversation_id), Ok(Some(_))) {
+    let st = &state.storage;
+    if !matches!(st.get_conversation(&run.spec.conversation_id).await, Ok(Some(_))) {
         return;
     }
-    let _ = st.update_message_content(&run.spec.conversation_id, &run.id, content);
+    let _ = st.update_message_content(&run.spec.conversation_id, &run.id, content).await;
 }
 
 #[cfg(test)]
@@ -5482,7 +5480,7 @@ CONTENT>>>
         // The test caller holds settings_update just as the real setters do.
         let mut settings = state.settings.read().await.clone();
         settings.agent.autonomous_enabled = true;
-        state.storage.lock().await.save_settings(&settings).unwrap();
+        state.storage.save_settings(&settings).await.unwrap();
         *state.settings.write().await = settings;
         state.permissions.write().await.autonomy = crate::permissions::AutonomyLevel::Autonomous;
     }

@@ -354,11 +354,13 @@ mod tests {
 
         // With a package marker the plain form works and is used.
         std::fs::write(dir.join("tests/__init__.py"), "").unwrap();
-        assert_eq!(plan(&dir).unwrap().steps[0].command, "python -m unittest discover -q -s tests -t .");
+        // Whichever name this PC has Python under (python3 on most Linux).
+        let python = python_program().unwrap_or("python");
+        assert_eq!(plan(&dir).unwrap().steps[0].command, format!("{python} -m unittest discover -q -s tests -t ."));
 
         // pytest when the project says so.
         std::fs::write(dir.join("pyproject.toml"), "[tool.pytest.ini_options]\n").unwrap();
-        assert_eq!(plan(&dir).unwrap().steps[0].command, "python -m pytest -q");
+        assert_eq!(plan(&dir).unwrap().steps[0].command, format!("{python} -m pytest -q"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

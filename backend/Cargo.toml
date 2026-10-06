@@ -18,9 +18,13 @@ serde_json = { version = "1", features = ["preserve_order"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+# PostgreSQL (Phase 1): one database for every installation. rusqlite stays to
+# read a Companion's old database file during the one-off import.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "json", "tls-rustls-ring"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+percent-encoding = "2"
 sysinfo = "0.30"
 futures = "0.3"
 tower = { version = "0.4", features = ["util"] }
@@ -31,7 +35,15 @@ regex = "1"
 image = "0.25"
 base64 = "0.22"
 rust_xlsxwriter = "0.90"
+
+# The folder chooser. On Linux, the desktop's own chooser through the XDG
+# portal (D-Bus): rfd would need the Wayland development files to build,
+# also on a server with no screen.
+[target.'cfg(not(target_os = "linux"))'.dependencies]
 rfd = "0.15"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.11", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }

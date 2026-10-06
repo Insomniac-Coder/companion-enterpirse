@@ -1,0 +1,1863 @@
+{
+ "summary": "Scope: users, conversations and settings (storage.rs, settings.rs, config.rs, main.rs, shutdown.rs, logbuf.rs, logfile.rs, generation.rs, documents.rs, vision.rs, plus the AppState/router/request-context/chat/conversation/settings/memory handlers in api.rs). Overall picture: the backend has no idea who is calling. No record has an owner, and every handler fetches by id with no ownership check. All data goes through ONE SQLite connection behind ONE global lock (93 lock sites), and the code relies on SQLite-only features: rowid ordering, INSERT OR REPLACE, LIMIT -1, PRAGMAs, migrations run on every open, and no foreign keys or cascades. ONE settings object (a JSON blob under the key 'app_settings') is read straight from memory on about 20 request paths. ONE chat reply can run at a time for the whole app: a new message from anyone cancels the running reply, and Stop stops whatever is running. Files (attachments, artifacts, logs) sit in folders next to the program. Startup and shutdown assume this process is the only one: opening the database marks every unfinished task in it as interrupted, and closing writes 'Companion was closed' into every running task. The 18 tables split three ways. Ten hold user data and need an owner, either directly or through their conversation: conversations, messages, message_activities, context_summaries, session_task_context, attachments, artifacts, memory_entries, generation_metrics, model_requests. Three are audit-like and need user and device ids: tool_executions, search_runs, model_requests. Four belong to the model pool manager and are tied to one machine: runtime_calibrations, model_template_caps, runtime_fit_decisions, plus the settings blob's runtime and hardware sections. knowledge_chunks becomes pgvector. Of the settings fields, many are saved but never enforced anywhere: the file size limits, folder limits, network policy, command timeout, log redaction, log level, the output folder and the whole 'advanced' section. Making admin control real is new work, not a move. The chat path (chat_sse) has clear places to add sign-in, the policy checks, document search, the outgoing-data scan, routing and audit (listed in its item). But in code-mode chats, chat itself, and not only the agent, reads the user's project folder: listing, snapshot, read tools, project index, slash commands. The device channel therefore has to serve chat too, not only agent runs.",
+ "items": [
+  {
+   "name": "AppState (shared server state)",
+   "file": "backend/src/api.rs",
+   "lines": "77-109",
+   "what_it_does": "Holds everything requests share: the list of models and the one that is loaded, the one model server process, downloads, the one running chat reply, running agent tasks, resource samples, the one settings object, the one permission level, the one database connection, folder locations for models, attachments and artifacts, model load progress, a cache of project indexes and the model fit preparation.",
+   "assumes": [
+    "one_loaded_model",
+    "in_memory_state",
+    "global_settings",
+    "single_db_file",
+    "pc_files",
+    "pc_processes"
+   ],
+   "destination": "api_server",
+   "change": "Split by role. The API server keeps a database pool, a file storage client, a model gateway client, an optional Redis client and a settings resolver. Model list, model server, downloads, load progress and fit preparation move to the model pool manager. The agent registry and project index cache move to the worker. The running chat reply moves to a shared store keyed by generation. Settings and permissions become per-user values worked out on each request, not one shared copy.",
+   "size": "L",
+   "evidence": "pub models: Arc<RwLock<ModelManager>>, llama: Arc<RwLock<LlamaServerManager>>, generations: Arc<RwLock<GenerationTracker>>, settings: Arc<RwLock<AppSettings>>, storage: Arc<tokio::sync::Mutex<Storage>>, attachments_dir: PathBuf, repo_index: ...HashMap",
+   "confidence": "high"
+  },
+  {
+   "name": "AppState::new_with_dirs / new_with_storage / new_stub",
+   "file": "backend/src/api.rs",
+   "lines": "267-353",
+   "what_it_does": "Builds the shared state at startup. It reads the saved settings from the database once and works out the permission level from them. It puts the attachments and artifacts folders next to the models folder, and creates one HTTP client for downloads and web search.",
+   "assumes": [
+    "global_settings",
+    "single_db_file",
+    "pc_files"
+   ],
+   "destination": "api_server",
+   "change": "Build from configuration instead: database address, file storage bucket or folder, optional Redis address, sign-in provider. Load no settings at boot; resolve them per request (company default, then group override, then user choice) with a short cache that is cleared when settings change. Remove the folder derivation.",
+   "size": "M",
+   "evidence": "let settings = storage.load_settings()...unwrap_or_default().normalized(); let permissions = PermissionManager::new(autonomy_for_mode(&settings.agent.permission_mode)); artifacts_dir = attachments_dir.parent().join(\"artifacts\")",
+   "confidence": "high"
+  },
+  {
+   "name": "request_recorder",
+   "file": "backend/src/api.rs",
+   "lines": "191-228",
+   "what_it_does": "For every model request made by a reply or task, saves the exact request and the model's output in the database in the background, if the privacy switch 'keep a record of model requests' is on.",
+   "assumes": [
+    "global_settings",
+    "single_db_file"
+   ],
+   "destination": "shared_library",
+   "change": "Record the user, the conversation owner, the model pool and copy (or outside provider). The switch becomes an admin logging and retention setting that can be locked. Write to PostgreSQL. Retention is handled by a scheduled job on the worker. Only the owner and auditors can read the records. Feed the same event into the audit log.",
+   "size": "M",
+   "evidence": "if !state.settings.read().await.privacy.record_model_requests { return; } state.storage.lock().await.record_model_request(&record)",
+   "confidence": "high"
+  },
+  {
+   "name": "AppState::shut_down",
+   "file": "backend/src/api.rs",
+   "lines": "230-265",
+   "what_it_does": "When the program closes: cancels every running agent task and waits up to 2 seconds. It writes 'stopped because Companion was closed' into each task's reply and marks each task interrupted. Then it cancels the chat reply and stops the model server.",
+   "assumes": [
+    "in_memory_state",
+    "pc_processes",
+    "one_loaded_model"
+   ],
+   "destination": "worker",
+   "change": "Replace with a drain for each role. The API server stops taking new requests and tells open reply streams to reconnect. The worker gives back its job leases so another worker continues the task (or it waits as paused); it does not write 'closed' into the user's task. The model pool manager stops its own copies. One server restarting must never touch work owned by other servers.",
+   "size": "M",
+   "evidence": "let unfinished = self.agents.read().await.unfinished(); st.update_message_content(...&message); st.finish_task_context(..., \"interrupted\"); self.generations.write().await.cancel_current(..); self.llama.write().await.stop().await",
+   "confidence": "high"
+  },
+  {
+   "name": "router + trusted_loopback_origins + origin/host guard",
+   "file": "backend/src/api.rs",
+   "lines": "429-664",
+   "what_it_does": "Lists every web address of the API (about 100 routes, including a /api/v1 copy). It only accepts browser calls from pages served on localhost ports, and rejects any request whose Host header is not a local address. There is no sign-in.",
+   "assumes": [
+    "loopback_only",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Add sign-in on every route: a Microsoft Entra ID session or token for people, an API key for software. Add role checks per group of routes. Replace the localhost origin list with configured allowed origins. Move admin routes (model load and unload, downloads, calibration, admin settings, doctor, system metrics) to the admin dashboard API. Move PC-only routes (pick folder, project folders, tool execution, git, diff) behind the desktop app's device channel.",
+   "size": "L",
+   "evidence": "origins = trusted_loopback_origins(); ApiError::new(FORBIDDEN, \"Only local Companion hosts are allowed\", \"...LAN access requires a future authenticated mode.\"); [\"localhost\",\"127.0.0.1\",\"[::1]\"]",
+   "confidence": "high"
+  },
+  {
+   "name": "health",
+   "file": "backend/src/api.rs",
+   "lines": "666-672",
+   "what_it_does": "Answers 'ok' with the program's name and version.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "api_server",
+   "change": "Keep as the 'process is alive' check. Add a 'ready' check for the load balancer that confirms the database (and Redis, when used) can be reached.",
+   "size": "S",
+   "evidence": "async fn health() -> Json { \"status\": \"ok\", \"version\": env!(\"CARGO_PKG_VERSION\") }",
+   "confidence": "high"
+  },
+  {
+   "name": "v1_status",
+   "file": "backend/src/api.rs",
+   "lines": "9325-9342",
+   "what_it_does": "Describes the API version and the names of the events the live streams send.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "api_server",
+   "change": "Keep; update it when the stream contract changes (resumable streams, device-channel events). It can also describe the OpenAI-compatible endpoint.",
+   "size": "S",
+   "evidence": "\"api\": \"v1\", \"streams\": { \"chat\": \"POST /api/v1/chat → event: token|status|done|error\" }",
+   "confidence": "high"
+  },
+  {
+   "name": "assemble_request_context / assemble_request_context_with + RequestContext + history_char_budget",
+   "file": "backend/src/api.rs",
+   "lines": "2400-2614",
+   "what_it_does": "Builds what the model sees for a conversation: standing instructions, the saved history that fits the window, attachment excerpts, pictures (read from the attachments folder), saved memories and, for code chats, a listing of the linked project folder. It uses the loaded model's name and whether that model can see images.",
+   "assumes": [
+    "one_loaded_model",
+    "pc_files",
+    "single_db_file",
+    "one_user"
+   ],
+   "destination": "shared_library",
+   "change": "Take the target model's ability profile (window, vision, tool support) from the gateway instead of 'the current model'. Read pictures from file storage. Get the project listing from the desktop app over the device channel; browser users and disconnected apps get none. Load only memories this user owns. Load the conversation only after an ownership check. Used by both the API server (chat) and the worker (agent).",
+   "size": "M",
+   "evidence": "s.models.read().await.current().map(|m| m.name.clone()); linked_code_workspace(&st,&conv)?; workspace_snapshot(&root.to_string_lossy(), name); prepare_conversation_images(&s.attachments_dir, cid, &attachments); st.memory_context(cid, &conv.workspace)",
+   "confidence": "high"
+  },
+  {
+   "name": "build_system_prompt",
+   "file": "backend/src/api.rs",
+   "lines": "2626-2694",
+   "what_it_does": "Writes the standing instructions for a chat or code session. They say the assistant runs 'entirely on the user's PC', and they teach the project-reading tool format.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Use wording that is true for any deployment: server-hosted or outside-provider models are not on the user's PC. Mention project tools only when the desktop app is connected and the model's ability profile supports them. Optionally allow a company-level instructions template set by the admin.",
+   "size": "S",
+   "evidence": "\"You are the Local Companion, a local-first AI assistant running entirely on the user's PC (model: {model_name}).\"",
+   "confidence": "high"
+  },
+  {
+   "name": "workspace_snapshot + linked_code_workspace",
+   "file": "backend/src/api.rs",
+   "lines": "2814-2895",
+   "what_it_does": "Reads the linked project folder on the backend's own disk: its top two levels and an instructions file (AGENTS.md, CLAUDE.md and so on). It checks the folder exists and refuses code chats whose project link is missing or broken.",
+   "assumes": [
+    "pc_files",
+    "single_db_file"
+   ],
+   "destination": "desktop_app",
+   "change": "The desktop app's local tool runner builds the snapshot from an allowed folder and sends it over the device channel. On the server, the link check becomes: the folder belongs to this user's registered device, and the device is online or the request waits.",
+   "size": "M",
+   "evidence": "std::fs::read_dir(&root); std::fs::read_to_string(root.join(cand)); if !std::path::Path::new(&workspace.path).is_dir() { ... \"project directory is unavailable\" }",
+   "confidence": "high"
+  },
+  {
+   "name": "Chat tool offer and document-request helpers (ChatToolOffer, document notes, plain_document_* , tool_name_in)",
+   "file": "backend/src/api.rs",
+   "lines": "2696-2812",
+   "what_it_does": "Decides which tools one chat request offers the model: project read tools only when a project is linked, the document tool only when a file is asked for. It also adds the matching instruction notes. Pure logic.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Build the offer from the model's ability profile, the plugins this user is allowed and has switched on, and the permission mode. Label each tool as a device tool (sent to the desktop app) or a server tool (run on the worker or API server).",
+   "size": "S",
+   "evidence": "ChatToolOffer::for_request(has_workspace, document_requested) -> [\"list_directory\",\"read_file\",\"search_text\",\"system_info\",\"list_processes\",\"manage_context\"] + \"create_document\"",
+   "confidence": "high"
+  },
+  {
+   "name": "build_turns family + prepare_conversation_images",
+   "file": "backend/src/api.rs",
+   "lines": "4474-4660",
+   "what_it_does": "Turns saved messages into model turns within a character budget, putting each attachment excerpt on the message it came with. prepare_conversation_images reads up to four recent pictures from the attachments folder on disk and shrinks them.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "shared_library",
+   "change": "Keep the turn-building logic as is. Read pictures from file storage by attachment id instead of the folder path built from the conversation and file name.",
+   "size": "S",
+   "evidence": "let p = attachments_dir.join(conversation_id).join(&a.filename); std::fs::read(&p)...crate::vision::prepare_image",
+   "confidence": "high"
+  },
+  {
+   "name": "stub_reply",
+   "file": "backend/src/api.rs",
+   "lines": "3231-3240",
+   "what_it_does": "When no model server runs, repeats the user's words back if a model is marked loaded, otherwise says 'No model loaded'.",
+   "assumes": [
+    "one_loaded_model",
+    "in_memory_state"
+   ],
+   "destination": "remove",
+   "change": "Remove. The gateway returns a clear 'model unavailable / starting up' error, or holds the request while the pool adds a copy.",
+   "size": "S",
+   "evidence": "let loaded = s.inference.read().await.is_loaded(); ... \"No model loaded. Load a model first.\"",
+   "confidence": "high"
+  },
+  {
+   "name": "run_command_as_chat",
+   "file": "backend/src/api.rs",
+   "lines": "3278-3326",
+   "what_it_does": "Runs a slash command as a chat turn: saves '/command' as the user's message, runs it, saves the result as the reply and streams it out.",
+   "assumes": [
+    "one_user",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Check that the conversation belongs to the caller; check per-command permission (role and plugin); write an audit record.",
+   "size": "S",
+   "evidence": "st.get_conversation(cid) ... st.add_message(role \"user\", content \"/{name}...\"); run_slash_command(s, conv_id.clone(), name, args)",
+   "confidence": "high"
+  },
+  {
+   "name": "chat_sse (the chat request path)",
+   "file": "backend/src/api.rs",
+   "lines": "3339-4249",
+   "what_it_does": "Handles one chat message end to end. Slash commands and greetings are answered without the model. It continues a saved task when asked, saves the user's message, and finds the one running model server; with none running it writes an explanation. It decides reasoning and web search from the message, then the conversation, then the global settings, and cancels any other running reply in the app. It summarises old history when the context is nearly full, runs a web search when asked, and for code chats adds project-index hints and local document matches. It streams the model's answer, runs up to 24 rounds of project-reading tools on the backend's disk, and saves plain-text documents as artifacts. At the end it saves the reply, the model used and speed figures.",
+   "assumes": [
+    "one_user",
+    "one_loaded_model",
+    "in_memory_state",
+    "global_settings",
+    "single_db_file",
+    "pc_files"
+   ],
+   "destination": "api_server",
+   "change": "Where the new pieces plug in: (1) Sign-in middleware supplies the user before the handler. (2) Ownership check at the conversation lookup (3425-3450). (3) Policy at line 3452, where the global settings are read today: resolve this user's effective settings, check the conversation's model is on the user's allowed list, check the budget before generating. (4) Routing replaces the 'running model server' lookup (3453-3463) and SidecarClient::new(base_url) (3836): the gateway picks the pool for the conversation's model, then the copy by conversation id so the prompt cache is reused, or an outside-provider adapter. (5) Document search replaces knowledge_for/retrieve_knowledge (3767-3806) with a pgvector query over the collections the user may read. (6) Web search (3640-3689) takes provider keys from admin settings and checks the network policy. (7) The outgoing-data scan runs on the final turns just before client.stream (3921), only when the routed target is an outside provider; its decision is audited and can block. (8) Project read tools in code chats (run_chat_tool_round, 3975) go over the device channel to the desktop app, and the reply pauses if the app is offline. (9) Audit records: request accepted, guard decisions, each tool round, completion with token counts (4125-4185). (10) The stream and cancel flag move from an in-process channel and tracker to a shared store (Redis stream when 2+ servers) so another server can resume or stop it. (11) The partial reply is saved at intervals, not only at the end. (12) Remove the global cancel of other replies (3542) and the global 409 while a model loads (3368). (13) Record usage per user for budgets.",
+   "size": "L",
+   "evidence": "s.runtime_update.try_lock() → 409; let settings = s.settings.read().await.clone(); llama.running.as_ref().map(|r| (r.base_url.clone(), r.cfg.clone())); s.generations.write().await.cancel_current(&s.storage).await; st.knowledge_for(ws_id); crate::search::run_search(&req.message,&scfg); client.stream(&turns, max_tokens, &cfg, ...); s.generations.write().await.insert(ActiveGeneration{...}); Sse::new(UnboundedReceiverStream::new(rx))",
+   "confidence": "high"
+  },
+  {
+   "name": "chat_artifact_count + emit_chat_activity",
+   "file": "backend/src/api.rs",
+   "lines": "3184-3214",
+   "what_it_does": "Counts a conversation's artifacts (to tell whether a requested file was made), and saves one step of a code chat's activity journal while sending it to the live stream.",
+   "assumes": [
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "PostgreSQL. Send the stream event through the shared stream when more than one server runs.",
+   "size": "S",
+   "evidence": "state.storage.lock().await.record_message_activity(message_id, &event); tx.send(Event::default().event(\"activity\")...)",
+   "confidence": "high"
+  },
+  {
+   "name": "chat_stop",
+   "file": "backend/src/api.rs",
+   "lines": "4251-4259",
+   "what_it_does": "Stops whatever chat reply is being generated, keeping the partial text. The request names no conversation.",
+   "assumes": [
+    "in_memory_state",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Take a generation or conversation id and check the caller owns it. Set a shared cancel flag (Redis or a database row with notification) that the server streaming the reply watches. Save the partial text from the latest checkpoint.",
+   "size": "M",
+   "evidence": "async fn chat_stop(State(s)) -> Json<CancelOutcome> { s.generations.write().await.cancel_current(&s.storage).await }",
+   "confidence": "high"
+  },
+  {
+   "name": "GenerationTracker / ActiveGeneration / cancel_current",
+   "file": "backend/src/generation.rs",
+   "lines": "17-130",
+   "what_it_does": "Tracks exactly one running chat reply: its cancel flag, the text so far, a 'saved already' flag and its background task. Cancelling flags it, kills the task and saves the partial text exactly once.",
+   "assumes": [
+    "in_memory_state",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Replace with one record per generation in a shared store: owner, conversation, server id, status, last checkpoint. A cancel request reaches whichever server holds the stream. Many generations run at once, with per-user limits. The 'save exactly once' rule becomes a conditional database update.",
+   "size": "M",
+   "evidence": "pub struct GenerationTracker { current: Option<ActiveGeneration> } ... pub fn insert(&mut self, gen) { self.current = Some(gen); }",
+   "confidence": "high"
+  },
+  {
+   "name": "list_conversations",
+   "file": "backend/src/api.rs",
+   "lines": "4261-4268",
+   "what_it_does": "Returns every conversation in the database, newest first.",
+   "assumes": [
+    "one_user",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Return only the signed-in user's conversations (plus any shared with them later), page by page.",
+   "size": "S",
+   "evidence": "st.list_conversations() → SELECT ... FROM conversations ORDER BY created_at DESC",
+   "confidence": "high"
+  },
+  {
+   "name": "create_conversation",
+   "file": "backend/src/api.rs",
+   "lines": "4270-4353",
+   "what_it_does": "Creates a chat or code conversation. Code ones must link to an existing project record.",
+   "assumes": [
+    "one_user",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Set the owner. Check the chosen model is on the user's allowed list. The project link must point to a folder registered on one of this user's devices.",
+   "size": "S",
+   "evidence": "st.get_workspace(&workspace) ... st.create_conversation(&c) (no owner field)",
+   "confidence": "high"
+  },
+  {
+   "name": "get_conversation",
+   "file": "backend/src/api.rs",
+   "lines": "4355-4365",
+   "what_it_does": "Returns one conversation by id.",
+   "assumes": [
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Return 'not found' unless the caller owns it or has been given access (auditors read-only).",
+   "size": "S",
+   "evidence": "st.get_conversation(&id)",
+   "confidence": "high"
+  },
+  {
+   "name": "delete_conversation (handler + Storage::delete_conversation)",
+   "file": "backend/src/api.rs",
+   "lines": "4367-4380",
+   "what_it_does": "Deletes a conversation's messages, tool rows, attachment rows and task state. Artifacts, speed figures, summaries, activity journals, model request records, search records and the files on disk are left behind.",
+   "assumes": [
+    "one_user",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Owner check. Delete everything belonging to the conversation, using database cascades plus a worker job that removes its files from file storage (or a soft delete purged by the retention job). Audit the deletion.",
+   "size": "M",
+   "evidence": "storage.rs 487-505: DELETE FROM messages/tool_executions/attachments/conversations; comment \"Preserve tool history + artifacts on disk\"",
+   "confidence": "high"
+  },
+  {
+   "name": "list_messages",
+   "file": "backend/src/api.rs",
+   "lines": "4382-4412",
+   "what_it_does": "Returns a conversation's messages, each with its activity journal.",
+   "assumes": [
+    "one_user",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Owner check; PostgreSQL; page through long conversations.",
+   "size": "S",
+   "evidence": "st.messages_for(&id); st.conversation_activities(&id)",
+   "confidence": "high"
+  },
+  {
+   "name": "post_message",
+   "file": "backend/src/api.rs",
+   "lines": "4414-4443",
+   "what_it_does": "Adds a message to a conversation with any role: user, assistant or tool.",
+   "assumes": [
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Owner check. Only allow the 'user' role from people; assistant and tool messages come only from the server itself, or a user could forge model replies or tool results. Audit.",
+   "size": "S",
+   "evidence": "validate_role(&req.role) accepts \"user\" | \"assistant\" | \"tool\"; st.add_message(&m)",
+   "confidence": "high"
+  },
+  {
+   "name": "edit_message",
+   "file": "backend/src/api.rs",
+   "lines": "4445-4472",
+   "what_it_does": "Changes a message's text and deletes every later message, restarting the thread from there. It also drops the context summary and task state.",
+   "assumes": [
+    "one_user",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Owner check. Truncation must use an explicit order column instead of SQLite's hidden row number. Run both steps in one transaction. Refuse while a reply or task for that conversation is running on any server.",
+   "size": "S",
+   "evidence": "storage.rs 771-778: DELETE FROM messages WHERE conversation_id=? AND rowid > (SELECT rowid ...)",
+   "confidence": "high"
+  },
+  {
+   "name": "latest_agent_context",
+   "file": "backend/src/api.rs",
+   "lines": "4662-4724",
+   "what_it_does": "Finds how full the context is for the newest agent task in a conversation: from the live task in memory if there is one, otherwise from the saved journal.",
+   "assumes": [
+    "in_memory_state",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Read only from the job and journal tables that the worker writes. The task runs on a worker, not in the API server's memory.",
+   "size": "S",
+   "evidence": "s.agents.read().await.summaries()...registry.get(&summary.id); run.events.lock()",
+   "confidence": "high"
+  },
+  {
+   "name": "conversation_context",
+   "file": "backend/src/api.rs",
+   "lines": "4726-4859",
+   "what_it_does": "Powers the context gauge. Estimates how much of the model window the conversation, attachments, tool output and memories use. It reads the window from the running model server and the compaction and context-size values from the global settings.",
+   "assumes": [
+    "one_loaded_model",
+    "global_settings",
+    "one_user",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Owner check. Take the window from the conversation's model pool profile, and compaction values from this user's effective settings. Remove the per-machine 'fit note'; it belongs to the admin view.",
+   "size": "M",
+   "evidence": "llama.running.as_ref().map(|r| r.cfg.n_ctx); let settings = s.settings.read().await.clone(); settings.inference.context_size; running.cfg.runtime_policy.context_note",
+   "confidence": "high"
+  },
+  {
+   "name": "list_attachments",
+   "file": "backend/src/api.rs",
+   "lines": "5011-5022",
+   "what_it_does": "Lists a conversation's attachments.",
+   "assumes": [
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Owner check.",
+   "size": "S",
+   "evidence": "st.attachments_for(&id)",
+   "confidence": "high"
+  },
+  {
+   "name": "add_attachment",
+   "file": "backend/src/api.rs",
+   "lines": "5024-5182",
+   "what_it_does": "Accepts an uploaded file as text or base64 and writes it to attachments/<conversation>/<file name> on the backend's disk. It keeps a text excerpt (or a picture description, or a rough office-file scan) in the database. The 5 MB limit is fixed in code; the file size setting is ignored. Uploading the same file name twice overwrites the first file's bytes.",
+   "assumes": [
+    "pc_files",
+    "one_user",
+    "one_loaded_model"
+   ],
+   "destination": "api_server",
+   "change": "Upload to file storage under a key made from the attachment id (no name clashes). Take the size limit from the admin file-size setting, checked in the UI first and here second. Owner check. Hand full text extraction of large office files and PDFs to a worker job, which also feeds the search index. Picture descriptions should not depend on the 'current' model.",
+   "size": "M",
+   "evidence": "const MAX_ATTACH_BYTES: usize = 5_000_000; let dir = s.attachments_dir.join(&id); std::fs::write(dir.join(&safe), &bytes); s.models.read().await.current().map(|m| m.vision)",
+   "confidence": "high"
+  },
+  {
+   "name": "delete_attachment",
+   "file": "backend/src/api.rs",
+   "lines": "5184-5201",
+   "what_it_does": "Removes an attachment record and its file on disk.",
+   "assumes": [
+    "pc_files",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Owner check; delete the file storage object; audit.",
+   "size": "S",
+   "evidence": "st.delete_attachment(&id,&aid); std::fs::remove_file(s.attachments_dir.join(&id).join(&a.filename))",
+   "confidence": "high"
+  },
+  {
+   "name": "attachment_file",
+   "file": "backend/src/api.rs",
+   "lines": "5211-5234",
+   "what_it_does": "Sends an attachment's bytes from the backend's disk for the viewer.",
+   "assumes": [
+    "pc_files",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Owner check; stream from file storage or hand back a short-lived signed link.",
+   "size": "S",
+   "evidence": "std::fs::read(s.attachments_dir.join(&id).join(&att.filename))",
+   "confidence": "high"
+  },
+  {
+   "name": "list_artifacts",
+   "file": "backend/src/api.rs",
+   "lines": "5236-5246",
+   "what_it_does": "Lists generated files for the conversation id given in the query.",
+   "assumes": [
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Owner check on the conversation.",
+   "size": "S",
+   "evidence": "artifacts_for(&q.conversation_id)",
+   "confidence": "high"
+  },
+  {
+   "name": "artifact_file",
+   "file": "backend/src/api.rs",
+   "lines": "5248-5274",
+   "what_it_does": "Downloads any artifact by id from the full disk path stored in its record.",
+   "assumes": [
+    "pc_files",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Check the artifact's conversation belongs to the caller. Store a file storage key instead of a full disk path, and stream from it.",
+   "size": "S",
+   "evidence": "s.storage.lock().await.get_artifact(&id); std::fs::read(&row.path)",
+   "confidence": "high"
+  },
+  {
+   "name": "artifact_info",
+   "file": "backend/src/api.rs",
+   "lines": "9623-9650",
+   "what_it_does": "Returns an artifact's details, including its full path on the backend's disk (for 'reveal in folder') and whether a browser can open it.",
+   "assumes": [
+    "pc_files",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Owner check. Drop the disk path. 'Reveal' becomes: the desktop app downloads the file and shows it in the user's own folder.",
+   "size": "S",
+   "evidence": "\"path\": row.path, \"openable_in_browser\": openable",
+   "confidence": "high"
+  },
+  {
+   "name": "attachment_budget",
+   "file": "backend/src/api.rs",
+   "lines": "9558-9602",
+   "what_it_does": "Counts a conversation's attachments and warns about pictures sent to a loaded model that cannot see, and about large totals.",
+   "assumes": [
+    "one_user",
+    "one_loaded_model"
+   ],
+   "destination": "api_server",
+   "change": "Owner check; use the conversation's model ability profile; take size thresholds from admin file limits.",
+   "size": "S",
+   "evidence": "s.models.read().await.current().map(|m| m.vision); if bytes > 50_000_000",
+   "confidence": "high"
+  },
+  {
+   "name": "ocr_status",
+   "file": "backend/src/api.rs",
+   "lines": "9604-9621",
+   "what_it_does": "Starts the 'tesseract' program on the backend machine to see whether text recognition is installed.",
+   "assumes": [
+    "pc_processes"
+   ],
+   "destination": "worker",
+   "change": "Report whether the document-reading workers have OCR, from their registration, instead of starting a program on the API server.",
+   "size": "S",
+   "evidence": "std::process::Command::new(bin).arg(\"--version\").output()",
+   "confidence": "high"
+  },
+  {
+   "name": "list_commands",
+   "file": "backend/src/api.rs",
+   "lines": "6189-6204",
+   "what_it_does": "Returns the slash-command catalogue matching what the user has typed so far.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "api_server",
+   "change": "Filter by the user's role, plugins and whether a desktop app is connected (PC commands hidden in the browser).",
+   "size": "S",
+   "evidence": "crate::commands::complete(&q.q)",
+   "confidence": "high"
+  },
+  {
+   "name": "command_workspace",
+   "file": "backend/src/api.rs",
+   "lines": "6239-6277",
+   "what_it_does": "Finds the folder a slash command works in. A path typed in the chat is used as-is if it exists on the backend's disk; otherwise the conversation's linked project folder is used.",
+   "assumes": [
+    "pc_files",
+    "one_user"
+   ],
+   "destination": "desktop_app",
+   "change": "Folder resolution happens in the desktop app against the folders the user allowed. A path typed in chat must never be opened on a server's disk.",
+   "size": "M",
+   "evidence": "let pb = std::path::PathBuf::from(p.trim()); if pb.is_dir() { return Ok(pb); }",
+   "confidence": "high"
+  },
+  {
+   "name": "run_slash_command",
+   "file": "backend/src/api.rs",
+   "lines": "6279-6532",
+   "what_it_does": "Runs each slash command. /model loads a model for everyone. /status shows the server's hardware. /config prints a settings section. /stop stops whatever reply is running. /clear makes a new conversation. /compact summarises. /search, /find and /diff read the project or run git on the backend's disk. /review, /plan, /init, /build, /test and /run start agent tasks using the global reasoning setting.",
+   "assumes": [
+    "pc_files",
+    "pc_processes",
+    "one_loaded_model",
+    "global_settings",
+    "in_memory_state",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Keep the dispatcher on the API server. /model chooses from the user's allowed models for this conversation; actual loading belongs to the model pool manager or admin. /config shows the user's effective settings, marks locked ones and hides secrets. /stop applies only to this conversation. /search, /find and /diff go over the device channel. Agent commands queue a worker job. Owner and permission checks on all of them.",
+   "size": "M",
+   "evidence": "\"model\" => load_model_by_id(s, args); \"diff\" => crate::terminal::run(SAFE_GIT_DIFF_STAT, &ws, 30); \"stop\" => s.generations.write().await.cancel_current(..); let reasoning = s.settings.read().await.reasoning.default_on; spawn_agent_run(...)",
+   "confidence": "high"
+  },
+  {
+   "name": "system_status_text",
+   "file": "backend/src/api.rs",
+   "lines": "6534-6581",
+   "what_it_does": "Text for /status: the loaded model, its window, the backend machine's processor, memory and graphics card, and the number of live agent tasks.",
+   "assumes": [
+    "one_loaded_model",
+    "in_memory_state"
+   ],
+   "destination": "api_server",
+   "change": "Show the conversation's model and pool health, and the user's running jobs. Machine hardware belongs in the admin dashboard.",
+   "size": "S",
+   "evidence": "crate::hardware::detect(); s.agents.read().await.summaries()",
+   "confidence": "high"
+  },
+  {
+   "name": "context_numbers + context_text",
+   "file": "backend/src/api.rs",
+   "lines": "6583-6633",
+   "what_it_does": "Counts messages kept and dropped and estimates tokens for /context, measured against the running model's window.",
+   "assumes": [
+    "one_loaded_model",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Use the conversation's model profile for the window; owner check.",
+   "size": "S",
+   "evidence": "llama.running.as_ref().map(|r| r.cfg.n_ctx)",
+   "confidence": "high"
+  },
+  {
+   "name": "config_text",
+   "file": "backend/src/api.rs",
+   "lines": "6635-6652",
+   "what_it_does": "Prints one section of the global settings into the chat, hiding only the web search key.",
+   "assumes": [
+    "global_settings"
+   ],
+   "destination": "api_server",
+   "change": "Print this user's effective settings with lock markers. Hide every admin secret, and admin-only sections from non-admins.",
+   "size": "S",
+   "evidence": "serde_json::to_value(s.settings.read().await.clone()); v[\"search\"][\"brave_key\"] = \"***\"",
+   "confidence": "high"
+  },
+  {
+   "name": "compact_conversation",
+   "file": "backend/src/api.rs",
+   "lines": "6691-6702",
+   "what_it_does": "Manual compaction: takes 'how many recent messages to keep' from the global settings and summarises the rest.",
+   "assumes": [
+    "global_settings"
+   ],
+   "destination": "api_server",
+   "change": "Use the user's effective compaction value, an admin default that can be locked.",
+   "size": "S",
+   "evidence": "s.settings.read().await.memory.compaction_keep_turns.clamp(2, 200)",
+   "confidence": "high"
+  },
+  {
+   "name": "recent_messages_within",
+   "file": "backend/src/api.rs",
+   "lines": "6708-6723",
+   "what_it_does": "Counts how many of the newest messages fit in a character allowance (at least 2).",
+   "assumes": [
+    "single_db_file"
+   ],
+   "destination": "shared_library",
+   "change": "Only the database call changes (PostgreSQL).",
+   "size": "S",
+   "evidence": "s.storage.lock().await.messages_for(cid)",
+   "confidence": "high"
+  },
+  {
+   "name": "summarize_conversation_chunk",
+   "file": "backend/src/api.rs",
+   "lines": "6725-6748",
+   "what_it_does": "Asks the model to update the running summary with a chunk of messages, with reasoning turned off.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Call through the model gateway (any pool or provider) instead of a direct model-server client. If the summarising model is an outside provider, the outgoing-data scan applies.",
+   "size": "S",
+   "evidence": "client.chat_turns_without_reasoning(&[ChatTurn::text(\"user\", prompt)], max_tokens, cfg)",
+   "confidence": "high"
+  },
+  {
+   "name": "fold_conversation_summary",
+   "file": "backend/src/api.rs",
+   "lines": "6750-6790",
+   "what_it_does": "Feeds old messages to the summariser in pieces sized to the model's window, shortening very long messages.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Unchanged except that the window comes from the routed model's profile.",
+   "size": "S",
+   "evidence": "let summary_tokens = (cfg.n_ctx / 6).clamp(256, 1024)",
+   "confidence": "high"
+  },
+  {
+   "name": "compact_conversation_keeping",
+   "file": "backend/src/api.rs",
+   "lines": "6792-6911",
+   "what_it_does": "Summarises everything but the newest N messages using the running model server. If nothing changed meanwhile, it saves the summary as a view in front of the history; the original messages stay.",
+   "assumes": [
+    "one_loaded_model",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Route through the gateway to the conversation's model, or an admin-chosen summariser. Lock the conversation row (or check a version number) so two servers cannot compact the same conversation at once. Manual and 'reduce' compaction may run as a worker job. Owner check.",
+   "size": "M",
+   "evidence": "llama.running.as_ref().map(|r| (r.base_url.clone(), r.cfg.clone())); \"compaction needs inference running\"; st.save_context_summary(cid, &ids, ...)",
+   "confidence": "high"
+  },
+  {
+   "name": "compact_endpoint",
+   "file": "backend/src/api.rs",
+   "lines": "9551-9556",
+   "what_it_does": "Web address for manual compaction.",
+   "assumes": [
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Owner check; optionally queue as a job.",
+   "size": "S",
+   "evidence": "compact_conversation(&s, &id).await.map(Json)",
+   "confidence": "high"
+  },
+  {
+   "name": "conversation_metrics",
+   "file": "backend/src/api.rs",
+   "lines": "7697-7728",
+   "what_it_does": "Per-reply speed and token figures for a conversation.",
+   "assumes": [
+    "one_user",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Owner check; also show which pool or provider served each reply.",
+   "size": "S",
+   "evidence": "st.metrics_for(&id)",
+   "confidence": "high"
+  },
+  {
+   "name": "doctor",
+   "file": "backend/src/api.rs",
+   "lines": "7904-8070",
+   "what_it_does": "Health checklist: the SQLite database is readable, the models folder exists, the model-server program exists, a model is running, the server's memory and graphics card, project folders exist, the search provider, and the artifacts folder can be created.",
+   "assumes": [
+    "single_db_file",
+    "pc_files",
+    "one_loaded_model"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin version: checks for PostgreSQL, Redis, file storage, each model pool, workers and the sign-in provider. User version: 'service reachable, desktop app connected, allowed folders reachable', with the folder checks done by the desktop app.",
+   "size": "M",
+   "evidence": "format!(\"SQLite readable ({} conversations)\"); s.models_dir.is_dir(); SidecarBinary::detect(&s.runtime_dir()); std::fs::create_dir_all(&s.artifacts_dir)",
+   "confidence": "high"
+  },
+  {
+   "name": "setup_status",
+   "file": "backend/src/api.rs",
+   "lines": "8072-8107",
+   "what_it_does": "First-run wizard: is the model-server program installed, is a model file present, is a model running, has a conversation been started.",
+   "assumes": [
+    "one_loaded_model",
+    "pc_files",
+    "one_user"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Installation setup (program, models, pools) becomes an admin dashboard flow. The user's first run becomes 'signed in, desktop app paired, a model allowed'.",
+   "size": "S",
+   "evidence": "SidecarBinary::detect(...).is_ok(); \"needs_setup\": !binary || ggufs == 0",
+   "confidence": "high"
+  },
+  {
+   "name": "patch_conversation",
+   "file": "backend/src/api.rs",
+   "lines": "8180-8279",
+   "what_it_does": "Changes a conversation's title, model, mode, linked project, reasoning and search defaults, or 'last model'. A conversation with messages cannot move to another project.",
+   "assumes": [
+    "one_user",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Owner check. The model must be on the user's allowed list. The project must be one of this user's registered device folders.",
+   "size": "S",
+   "evidence": "if let Some(m) = req.model_id { c.model_id = m; } st.get_workspace(&w)",
+   "confidence": "high"
+  },
+  {
+   "name": "fork_conversation",
+   "file": "backend/src/api.rs",
+   "lines": "8281-8339",
+   "what_it_does": "Copies a conversation with its messages, activity and attachment records into a new one, and copies the attachment files on disk into the new conversation's folder.",
+   "assumes": [
+    "one_user",
+    "pc_files",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Owner check; new owner = caller. Copy file storage objects (or share them with reference counting). Do the database copy in one transaction.",
+   "size": "S",
+   "evidence": "st.fork_messages(&id, &dst_id, ...); std::fs::copy(e.path(), dst_dir.join(e.file_name()))",
+   "confidence": "high"
+  },
+  {
+   "name": "share_conversation",
+   "file": "backend/src/api.rs",
+   "lines": "8341-8483",
+   "what_it_does": "Builds a text package (recent messages, attachment excerpts, memories, key decisions) from one conversation and posts it as a user message into any other conversation id.",
+   "assumes": [
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Both conversations must belong to the caller, or the target must be shared with them. Audit, because data moves between conversations.",
+   "size": "S",
+   "evidence": "st.add_message(&Message { conversation_id: req.target_id.clone(), role: \"user\", content: package, ... })",
+   "confidence": "high"
+  },
+  {
+   "name": "list_sessions",
+   "file": "backend/src/api.rs",
+   "lines": "8485-8559",
+   "what_it_does": "Lists every conversation marked active, warm or cold. 'Active' means it holds the one running reply or a live agent task in this process; 'warm' means the one model server is running.",
+   "assumes": [
+    "one_user",
+    "in_memory_state",
+    "one_loaded_model"
+   ],
+   "destination": "api_server",
+   "change": "Owner filter. Activity comes from the shared generation and job tables. Drop 'warm/cold', which no longer means anything with model pools, or show the pool state for the conversation's model.",
+   "size": "M",
+   "evidence": "s.generations.read().await.active_conversation(); s.agents.read().await.summaries(); let warm = llama.is_running()",
+   "confidence": "high"
+  },
+  {
+   "name": "patch_session",
+   "file": "backend/src/api.rs",
+   "lines": "8561-8599",
+   "what_it_does": "Sets a conversation's priority (background, normal, high) and its 'related to' link.",
+   "assumes": [
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Owner check; the related conversation must also be the caller's. Priority can feed the job queue only within the user's own jobs, with an admin cap.",
+   "size": "S",
+   "evidence": "c.priority = p; c.related_to = r; st.update_conversation(&c)",
+   "confidence": "high"
+  },
+  {
+   "name": "export_conversation",
+   "file": "backend/src/api.rs",
+   "lines": "8601-8738",
+   "what_it_does": "Exports a conversation as JSON: transcript, every tool call and result, activity journal, artifact and attachment names, every recorded model request, the running model server's settings, and the last 1,000 lines of the whole program's log.",
+   "assumes": [
+    "one_user",
+    "in_memory_state",
+    "one_loaded_model"
+   ],
+   "destination": "api_server",
+   "change": "Owner (or auditor) check. Remove the app-wide log, or replace it with central log lines filtered to this conversation's request ids, for admins only. Store the runtime details per request at the time it ran, not 'what is running now'. Audit the export. Run large exports as a worker job writing to file storage.",
+   "size": "M",
+   "evidence": "\"app_log\": crate::logbuf::global().recent(1_000); s.llama.read().await.running.as_ref() → runtime_snapshot",
+   "confidence": "high"
+  },
+  {
+   "name": "sessions_recovery",
+   "file": "backend/src/api.rs",
+   "lines": "8740-8781",
+   "what_it_does": "Lists conversations last answered by a different model from the one loaded now ('stale'), and the conversation holding the one running reply ('busy').",
+   "assumes": [
+    "one_loaded_model",
+    "in_memory_state",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Rework. With several models served, 'stale model' disappears. Recovery becomes 'your tasks paused because the desktop app disconnected or a worker stopped', read from the job table for this user.",
+   "size": "M",
+   "evidence": "filter(|c| !c.last_model.is_empty() && c.last_model != loaded)",
+   "confidence": "high"
+  },
+  {
+   "name": "session_action",
+   "file": "backend/src/api.rs",
+   "lines": "8783-8855",
+   "what_it_does": "Pause or stop: stops the running reply if it belongs to this conversation, and cancels its live agent tasks in this process. Reduce: runs compaction.",
+   "assumes": [
+    "in_memory_state",
+    "one_user",
+    "one_loaded_model"
+   ],
+   "destination": "api_server",
+   "change": "Owner check. Stop through the shared cancel flag for replies and a cancel request on the job row that the worker picks up. 'Reduce' queues a compaction.",
+   "size": "M",
+   "evidence": "s.generations.read().await.active_conversation(); run.cancel.cancel(); h.abort(); compact_conversation(&s, &id)",
+   "confidence": "high"
+  },
+  {
+   "name": "conversation_timeline",
+   "file": "backend/src/api.rs",
+   "lines": "9499-9535",
+   "what_it_does": "Puts a conversation's start, attachments, tool calls and artifacts into one dated list. It also looks for compaction messages that compaction no longer writes.",
+   "assumes": [
+    "one_user",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Owner check. Read compaction events from the summary table instead of message text. Sort by real timestamps.",
+   "size": "S",
+   "evidence": "if m.content.starts_with(\"[Compacted context\") (compaction now writes context_summaries, not messages)",
+   "confidence": "high"
+  },
+  {
+   "name": "get_settings",
+   "file": "backend/src/api.rs",
+   "lines": "8857-8859",
+   "what_it_does": "Returns the whole global settings object, including the web search provider key.",
+   "assumes": [
+    "global_settings",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Return this user's effective settings (company, then group, then user), with a 'locked by admin' flag per field, admin-only sections read-only or hidden, and no secrets ever.",
+   "size": "M",
+   "evidence": "Json(s.settings.read().await.clone()) — includes search.brave_key",
+   "confidence": "high"
+  },
+  {
+   "name": "get_permission_mode / put_permission_mode",
+   "file": "backend/src/api.rs",
+   "lines": "8955-8985",
+   "what_it_does": "Reads or sets the single permission mode (ask, accept edits, plan, auto). Saving changes the approval level for everyone and immediately releases waiting approvals of every task that the new mode allows.",
+   "assumes": [
+    "global_settings",
+    "in_memory_state",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Store the mode as the user's preference, capped at the admin's maximum for their group. It applies only to that user's tasks. Releasing waiting approvals affects only that user's runs, signalled to the worker, while the desktop app keeps its own approval prompts. Audit the change.",
+   "size": "M",
+   "evidence": "next.agent.permission_mode = req.mode; s.storage.lock().await.save_settings(&next); s.permissions.write().await.autonomy = autonomy; resume_auto_approved_runs(&s)",
+   "confidence": "high"
+  },
+  {
+   "name": "resume_auto_approved_runs",
+   "file": "backend/src/api.rs",
+   "lines": "8987-9044",
+   "what_it_does": "Goes through every agent task waiting for approval in this process. It approves any whose pending action the new permission mode allows, except web search unless the mode is Auto.",
+   "assumes": [
+    "in_memory_state",
+    "one_user",
+    "global_settings"
+   ],
+   "destination": "worker",
+   "change": "Runs on the worker that holds each run, only for the user who changed the mode, triggered by a job-table update or message. Device actions are approved on the desktop app when the mode requires it.",
+   "size": "M",
+   "evidence": "registry.summaries().filter(|run| run.state == WaitingPermission) ... tx.send(ApprovalDecision::Approved { session: false })",
+   "confidence": "high"
+  },
+  {
+   "name": "put_settings",
+   "file": "backend/src/api.rs",
+   "lines": "9046-9169",
+   "what_it_does": "Checks and saves the whole settings object: sampling ranges, manual hardware values, compaction, cache precision, reasoning budget, search provider. It applies the permission level, releases waiting approvals, and starts a new model fit search when context or runtime settings changed.",
+   "assumes": [
+    "global_settings",
+    "one_user",
+    "single_db_file"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Split in two. (a) A user preferences endpoint on the API server accepts only user-owned fields, refuses locked ones, and caps permission mode and model choice. (b) An admin settings endpoint for company and group levels with locks, with every change audited. Share one validation set with the frontend. Refits go to the model pool manager. Tell all servers their settings cache is stale (version number or Redis message).",
+   "size": "L",
+   "evidence": "let next = next.reconciled_with(&previous); s.storage.lock().await.save_settings(&next); *s.settings.write().await = next.clone(); spawn_fit_preparation(&s, ...)",
+   "confidence": "high"
+  },
+  {
+   "name": "AppSettings (whole object, defaults)",
+   "file": "backend/src/settings.rs",
+   "lines": "296-462",
+   "what_it_does": "The one settings object for the whole app, with 17 sections and defaults. It is saved as one JSON text in the database.",
+   "assumes": [
+    "global_settings"
+   ],
+   "destination": "shared_library",
+   "change": "Split the type into admin settings (company default, optional group override, per-field lock) and user preferences. A resolver merges company, then group, then user into 'effective settings' for each request. Keep the tolerant loading of old saves, so existing single-user data can be imported.",
+   "size": "L",
+   "evidence": "pub struct AppSettings { runtime_auto, runtime, general, inference, hardware, agent, security, reasoning, search, output_dir, appearance, workspace, memory, files, keyboard, privacy, network, advanced, diagnostics }",
+   "confidence": "high"
+  },
+  {
+   "name": "AppSettings sections: runtime_auto + RuntimeSettings (speculative, kv_cache, cache_reuse, context_fit, mode)",
+   "file": "backend/src/settings.rs",
+   "lines": "243-303",
+   "what_it_does": "Model server tuning: draft decoding, cache precision, cache reuse, whether to shrink the context to fit the graphics card, and the speed profile (auto, fastest, balanced, light, manual).",
+   "assumes": [
+    "global_settings",
+    "one_loaded_model"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Admin-only, set per model pool (llama.cpp copies) and possibly per machine type. Not visible as user settings.",
+   "size": "M",
+   "evidence": "pub struct RuntimeSettings { speculative, kv_cache, cache_reuse, context_fit, mode }; read by start_sidecar (api.rs 1869) and prepare_fits (api.rs 1673)",
+   "confidence": "high"
+  },
+  {
+   "name": "AppSettings sections: GeneralSettings (theme, default_model, language)",
+   "file": "backend/src/settings.rs",
+   "lines": "5-10",
+   "what_it_does": "Theme (a duplicate of appearance.theme), the model picked first, and interface language.",
+   "assumes": [
+    "global_settings"
+   ],
+   "destination": "api_server",
+   "change": "User preference. default_model must be from the user's allowed list; the admin sets the company default and may lock it. Drop the duplicate theme field.",
+   "size": "S",
+   "evidence": "api.rs 1688 models.sort_by_key(|model| model.id != settings.general.default_model); api.rs 8896 registry.get(&settings.general.default_model)",
+   "confidence": "high"
+  },
+  {
+   "name": "AppSettings sections: InferenceSettings (context_size, temperature, top_p, top_k, repeat_penalty, batch_size)",
+   "file": "backend/src/settings.rs",
+   "lines": "12-20",
+   "what_it_does": "Context window and batch size for the model server, plus sampling values for replies.",
+   "assumes": [
+    "global_settings",
+    "one_loaded_model"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Context size and batch size: admin, per model pool (pool manager). Sampling values: admin default per model, lockable, with an optional user override if not locked.",
+   "size": "S",
+   "evidence": "put_settings validates context_size, temperature, top_p, top_k, repeat_penalty, batch_size; conversation_context reads settings.inference.context_size",
+   "confidence": "medium"
+  },
+  {
+   "name": "AppSettings sections: HardwareSettings (threads, poll, priority, gpu backend/layers, flash attention, kv on GPU)",
+   "file": "backend/src/settings.rs",
+   "lines": "22-38, 419-437",
+   "what_it_does": "Manual model-server hardware values. The default thread count is detected from the processor of the machine running the backend.",
+   "assumes": [
+    "global_settings",
+    "one_loaded_model"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Admin-only, per pool and machine. The default must be detected on the machine that runs the model copy, not on the API server.",
+   "size": "M",
+   "evidence": "cpu_threads: crate::cpu_topology::detect().map(|topology| topology.physical_count() as u32)",
+   "confidence": "high"
+  },
+  {
+   "name": "AppSettings sections: AgentSettings (command_timeout_secs, autonomous_enabled, permission_mode)",
+   "file": "backend/src/settings.rs",
+   "lines": "40-49, 105-142",
+   "what_it_does": "Command time limit (stored but never read), the old Auto switch (kept as a mirror of the mode), and the permission mode.",
+   "assumes": [
+    "global_settings"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Command timeout: admin setting, actually enforced by the desktop app's tool runner and the worker. Permission mode: user choice up to the admin's maximum per group. Remove the old Auto mirror once old clients are gone.",
+   "size": "M",
+   "evidence": "grep: command_timeout_secs appears only in settings.rs; permission_mode read in api.rs 8956, new_with_dirs",
+   "confidence": "high"
+  },
+  {
+   "name": "AppSettings sections: SecuritySettings + NetworkSettings (allowed_dirs, blocked_dirs, network, policy, trusted_hosts)",
+   "file": "backend/src/settings.rs",
+   "lines": "51-56, 174-179",
+   "what_it_does": "Folder allow and block lists and network policy, stored twice (security.network and network.policy). None of it is read anywhere in the backend or frontend.",
+   "assumes": [
+    "global_settings"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin settings with locks: folder limits are pushed to and enforced by the desktop app (the user may narrow them further); network policy is enforced by the gateway, web search and MCP plugins on the server. Merge the duplicate network fields. This is new enforcement work.",
+   "size": "M",
+   "evidence": "grep allowed_dirs|blocked_dirs|trusted_hosts|security.network|network.policy: no reads outside settings.rs; not in frontend/src",
+   "confidence": "high"
+  },
+  {
+   "name": "AppSettings sections: ReasoningSettings (default_on, budget)",
+   "file": "backend/src/settings.rs",
+   "lines": "198-228",
+   "what_it_does": "Whether reasoning is on by default and how deep it goes.",
+   "assumes": [
+    "global_settings"
+   ],
+   "destination": "api_server",
+   "change": "User preference. The admin may cap the budget or lock reasoning off for cost.",
+   "size": "S",
+   "evidence": "chat_sse 3515 settings.reasoning.default_on; run_slash_command 6444/6492; reasoning_preface(&settings.reasoning.budget, ..)",
+   "confidence": "high"
+  },
+  {
+   "name": "AppSettings sections: SearchSettings (provider, brave_key, custom_url, max_results, timeout_secs, autonomous)",
+   "file": "backend/src/settings.rs",
+   "lines": "207-241",
+   "what_it_does": "Web search provider, its key and address, result count, time limit, and whether agent tasks may search on their own.",
+   "assumes": [
+    "global_settings"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin. The provider key moves to a secret store and is never returned to clients. The task-search policy is an admin default that can be locked, with the user able to narrow it.",
+   "size": "M",
+   "evidence": "chat_sse 3642-3648 builds SearchConfig from settings.search.*; resume_auto_approved_runs reads search.autonomous; get_settings returns brave_key",
+   "confidence": "high"
+  },
+  {
+   "name": "AppSettings sections: AppearanceSettings, KeyboardSettings, Diagnostics show_* fields",
+   "file": "backend/src/settings.rs",
+   "lines": "58-65, 152-157, 191-197",
+   "what_it_does": "Theme, density, reduced motion, shortcuts, and whether to show speed figures. Only the frontend reads them.",
+   "assumes": [
+    "global_settings"
+   ],
+   "destination": "api_server",
+   "change": "User preferences stored per user on the server (so they follow the user across the desktop app and browser), with company defaults.",
+   "size": "S",
+   "evidence": "frontend App.tsx 234-249 reads keyboard.command_palette and appearance.reduce_motion; no backend reads",
+   "confidence": "high"
+  },
+  {
+   "name": "AppSettings sections: WorkspaceSettings (default_dir, confirm_outside_copy)",
+   "file": "backend/src/settings.rs",
+   "lines": "67-72",
+   "what_it_does": "Default project folder and whether to confirm copies outside the project. The backend never reads them.",
+   "assumes": [
+    "global_settings",
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Per-user, per-device setting held by the desktop app, since it names folders on that PC.",
+   "size": "S",
+   "evidence": "grep default_dir|confirm_outside_copy: no reads outside settings.rs",
+   "confidence": "high"
+  },
+  {
+   "name": "AppSettings sections: MemorySettings (auto_compact, compaction_keep_turns, share_across_modes, compact_at_pct)",
+   "file": "backend/src/settings.rs",
+   "lines": "74-103",
+   "what_it_does": "Automatic summarising of long conversations: on or off, how many recent messages to keep, and at what fullness to start. share_across_modes is never read.",
+   "assumes": [
+    "global_settings"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin default that can be locked; the user may change it if not locked. Read from effective settings in chat_sse and the agent loop. Drop share_across_modes.",
+   "size": "S",
+   "evidence": "chat_sse 3548 settings.memory.auto_compaction(); agent_runner.rs 2832 CompactionPolicy::from_settings(&state.settings.read().await.memory)",
+   "confidence": "high"
+  },
+  {
+   "name": "AppSettings sections: FilesSettings (max_attach_mb, max_image_mb, ocr_enabled)",
+   "file": "backend/src/settings.rs",
+   "lines": "144-150",
+   "what_it_does": "Attachment and picture size limits and an OCR switch. None of them are read. The real limits are fixed in code: 5 MB attachments, 8 MB pictures, 20 MB artifacts.",
+   "assumes": [
+    "global_settings"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin file limits, enforced in the UI first and in add_attachment, vision and documents::store second.",
+   "size": "M",
+   "evidence": "add_attachment const MAX_ATTACH_BYTES = 5_000_000; vision.rs MAX_IMAGE_BYTES = 8_000_000; documents.rs bytes.len() > 20_000_000; grep max_attach_mb: no reads",
+   "confidence": "high"
+  },
+  {
+   "name": "AppSettings sections: PrivacySettings + Diagnostics log_level (telemetry, log_redaction, record_model_requests, log_level)",
+   "file": "backend/src/settings.rs",
+   "lines": "159-172, 191-197",
+   "what_it_does": "Logging and recording choices. Only record_model_requests is read; telemetry, log redaction and log level are stored but unused.",
+   "assumes": [
+    "global_settings"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin logging and retention settings: how long request records, audit and logs are kept, redaction on or off, log level. Enforce them in the logging setup and the retention job.",
+   "size": "S",
+   "evidence": "request_recorder reads privacy.record_model_requests; grep log_redaction|telemetry|log_level: no backend reads",
+   "confidence": "high"
+  },
+  {
+   "name": "AppSettings sections: AdvancedSettings + output_dir + Preset/apply_preset",
+   "file": "backend/src/settings.rs",
+   "lines": "181-189, 311, 464-498",
+   "what_it_does": "Old cache, offload, micro-batch, parallel-session and port values, an output folder name, and preset tables. None are used outside tests.",
+   "assumes": [
+    "global_settings"
+   ],
+   "destination": "remove",
+   "change": "Remove. Real equivalents (parallel slots, ports) belong to the pool manager's per-pool configuration.",
+   "size": "S",
+   "evidence": "grep server_port|parallel_sessions|microbatch|output_dir|apply_preset: only settings.rs and tests",
+   "confidence": "high"
+  },
+  {
+   "name": "AppSettings::normalized / reconciled_with",
+   "file": "backend/src/settings.rs",
+   "lines": "105-142",
+   "what_it_does": "Translates values written by older versions, and works out what an old screen meant when it only flipped an old switch.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Keep, for importing existing single-user databases. Once the old screens are gone, the reconcile step can be removed.",
+   "size": "S",
+   "evidence": "if self.memory.auto_compact == \"ask\" { ... } self.runtime_auto = self.runtime.mode != \"manual\"",
+   "confidence": "high"
+  },
+  {
+   "name": "Storage struct + open / open_persistent / open_in_memory",
+   "file": "backend/src/storage.rs",
+   "lines": "183-253",
+   "what_it_does": "One SQLite connection to one database file. Opening it creates the folder, sets SQLite options (write-ahead log, 5 s wait for a busy file, memory scratch), runs the schema update and marks unfinished tasks as interrupted, every time.",
+   "assumes": [
+    "single_db_file",
+    "pc_files"
+   ],
+   "destination": "shared_library",
+   "change": "Replace with a PostgreSQL connection pool and async methods; about 90 call sites drop the single global lock. Schema updates run once as a deploy step, not on every server start. Interrupted-run recovery moves to the worker. For the single-machine Windows install, ship PostgreSQL (or an embedded one) rather than keeping SQLite as a second code path.",
+   "size": "L",
+   "evidence": "pub struct Storage { conn: Connection }; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; s.migrate()?; s.recover_interrupted_activity()?; api.rs storage: Arc<tokio::sync::Mutex<Storage>>",
+   "confidence": "high"
+  },
+  {
+   "name": "Storage::migrate (schema and indexes)",
+   "file": "backend/src/storage.rs",
+   "lines": "255-417",
+   "what_it_does": "Creates 18 tables if missing. It adds missing columns by trying to select them and then altering the table, and creates lookup indexes. There are no foreign keys, cascades, full-text search or SQL JSON functions; JSON is stored as text and parsed in code.",
+   "assumes": [
+    "single_db_file"
+   ],
+   "destination": "shared_library",
+   "change": "Versioned PostgreSQL migration files. Text dates become timestamptz, 0/1 integers become boolean, JSON text becomes jsonb, REAL becomes double precision. Add owner_id (and device_id where relevant), foreign keys with ON DELETE CASCADE, and explicit order columns (bigserial) in place of SQLite's hidden row number. Write a one-off importer from existing SQLite files.",
+   "size": "L",
+   "evidence": "CREATE TABLE IF NOT EXISTS ...; .prepare(&format!(\"SELECT {column} FROM {table} LIMIT 0\")).is_ok() then ALTER TABLE ... ADD COLUMN",
+   "confidence": "high"
+  },
+  {
+   "name": "settings table + load_settings / save_settings",
+   "file": "backend/src/storage.rs",
+   "lines": "188-212, 279-280",
+   "what_it_does": "Stores the whole settings object as one JSON text under the key 'app_settings' in a key/value table.",
+   "assumes": [
+    "single_db_file",
+    "global_settings"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "New tables: company settings, group settings (per group), user preferences (per user), and locks (field path, level, who set it). Use jsonb with a version number so servers can drop their cache. Every admin change writes an audit record.",
+   "size": "M",
+   "evidence": "SELECT value FROM settings WHERE key='app_settings'; INSERT ... ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+   "confidence": "high"
+  },
+  {
+   "name": "conversations table + create/update/set_last_model/list/get/conversations_in_workspace",
+   "file": "backend/src/storage.rs",
+   "lines": "257-259, 346-379, 419-485, 945-954",
+   "what_it_does": "One row per conversation: title, model, creation time (as text), mode, linked project id, reasoning and search defaults, last model used, priority, related conversation. The list returns all rows.",
+   "assumes": [
+    "one_user",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Add owner_id (required), with an index on owner and time. Every query filters by owner. created_at becomes timestamptz. last_model becomes informational only. The project link becomes a reference to a user-device folder.",
+   "size": "M",
+   "evidence": "SELECT ... FROM conversations ORDER BY created_at DESC (no WHERE)",
+   "confidence": "high"
+  },
+  {
+   "name": "messages table + add/count/messages_for/get/update_message_content/delete_messages_after/delete_messages",
+   "file": "backend/src/storage.rs",
+   "lines": "260-262, 507-538, 736-790",
+   "what_it_does": "Conversation messages. Their order comes from SQLite's hidden row number, because timestamps collide. Editing a message drops the conversation's summary; truncation deletes by row number.",
+   "assumes": [
+    "single_db_file",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Owned through the conversation (cascade delete). Add an explicit order column (bigserial or per-conversation sequence) and use it for ordering and truncation. Wrap update plus truncate in one transaction.",
+   "size": "M",
+   "evidence": "ORDER BY rowid (\"rowid order = insertion order, stable even when timestamps collide\"); rowid > (SELECT rowid ...)",
+   "confidence": "high"
+  },
+  {
+   "name": "message_activities table + record/conversation_activities/message_activities",
+   "file": "backend/src/storage.rs",
+   "lines": "307-309, 596-644",
+   "what_it_does": "Step-by-step journal of each reply or task (states, thoughts, tool starts and results) as JSON text. It has no key of its own and is ordered by row number.",
+   "assumes": [
+    "single_db_file"
+   ],
+   "destination": "worker",
+   "change": "Written by the worker (and API server for chat). Add a bigserial id for order, JSON as jsonb, a foreign key to messages with cascade. Large tool outputs may go to file storage.",
+   "size": "S",
+   "evidence": "CREATE TABLE message_activities(message_id TEXT NOT NULL, event_json TEXT NOT NULL); ORDER BY a.rowid",
+   "confidence": "high"
+  },
+  {
+   "name": "context_summaries table + context_messages_for / save_context_summary",
+   "file": "backend/src/storage.rs",
+   "lines": "304-306, 540-594",
+   "what_it_does": "One running summary per conversation and the ids of the messages it replaces. Used in place of those messages when building model requests.",
+   "assumes": [
+    "single_db_file"
+   ],
+   "destination": "shared_library",
+   "change": "Owned through the conversation (cascade). Store the id list as jsonb. Add a version number so two servers compacting at once cannot overwrite each other.",
+   "size": "S",
+   "evidence": "INSERT INTO context_summaries ... ON CONFLICT(conversation_id) DO UPDATE",
+   "confidence": "high"
+  },
+  {
+   "name": "session_task_context table + save/get/finish/clear_task_context",
+   "file": "backend/src/storage.rs",
+   "lines": "310-312, 646-683",
+   "what_it_does": "Remembers each code conversation's latest task, its run id, project folder path and status, so 'continue' can resume it.",
+   "assumes": [
+    "single_db_file",
+    "pc_files"
+   ],
+   "destination": "worker",
+   "change": "Merge into the job table (one row per agent run with owner, device, folder, status, lease). The folder is identified by device plus folder id, not a server disk path.",
+   "size": "S",
+   "evidence": "session_task_context(conversation_id PK, workspace, task, run_id, status); resolve_continuation compares std::fs::canonicalize(workspace)",
+   "confidence": "high"
+  },
+  {
+   "name": "Storage::recover_interrupted_activity (startup recovery)",
+   "file": "backend/src/storage.rs",
+   "lines": "685-734",
+   "what_it_does": "Each time the database is opened, marks every 'active' task in the database as interrupted. It also adds an 'Interrupted when the runtime closed' entry to every reply whose journal did not finish, scanning all messages.",
+   "assumes": [
+    "single_db_file",
+    "in_memory_state"
+   ],
+   "destination": "worker",
+   "change": "Replace with leases. Each running job has a worker id and a heartbeat; a job counts as interrupted only when its lease expires. Another worker then resumes it, or it waits as 'paused' (also when the desktop app disconnects). Remove from database opening entirely.",
+   "size": "M",
+   "evidence": "UPDATE session_task_context SET status='interrupted' WHERE status='active'; SELECT m.id ... FROM messages m JOIN message_activities a ON a.rowid=(SELECT MAX(rowid) ...)",
+   "confidence": "high"
+  },
+  {
+   "name": "attachments table + add/attachments_for/delete_attachment",
+   "file": "backend/src/storage.rs",
+   "lines": "273-278, 792-825",
+   "what_it_does": "Attachment records: name, type, size, text excerpt, kind, processing status. The bytes are on disk.",
+   "assumes": [
+    "single_db_file",
+    "pc_files"
+   ],
+   "destination": "api_server",
+   "change": "Owned through the conversation (cascade). Add a file storage key column. Processing status is updated by the document-reading worker job.",
+   "size": "S",
+   "evidence": "\"The bytes live on disk under data/attachments/<conv>/; only extracted text is stored in-DB.\"",
+   "confidence": "high"
+  },
+  {
+   "name": "tool_executions table + record_tool_execution / tool_executions_for",
+   "file": "backend/src/storage.rs",
+   "lines": "263-267, 827-855",
+   "what_it_does": "Log of tool calls (tool, arguments, result, approved or not) per conversation. Read by export and timeline.",
+   "assumes": [
+    "single_db_file",
+    "one_user"
+   ],
+   "destination": "worker",
+   "change": "Add user id, device id and run id. Also send each call to the tamper-evident audit log; this table stays the user-visible history. Store large results in file storage.",
+   "size": "M",
+   "evidence": "tool_executions(id, conversation_id, tool, args, result, approved, created_at); written by api.rs audit() 5491",
+   "confidence": "high"
+  },
+  {
+   "name": "artifacts table + record_artifact / artifacts_for / get_artifact",
+   "file": "backend/src/storage.rs",
+   "lines": "268-272, 857-901",
+   "what_it_does": "Generated-file records holding a full disk path. get_artifact looks an artifact up by id alone.",
+   "assumes": [
+    "single_db_file",
+    "pc_files",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Replace the path with a file storage key. Owned through the conversation (cascade, plus object deletion). Lookups always go through an owner check.",
+   "size": "S",
+   "evidence": "artifacts(..., path TEXT NOT NULL, ...); SELECT ... FROM artifacts WHERE id=?",
+   "confidence": "high"
+  },
+  {
+   "name": "workspaces table + create/list/get/delete_workspace",
+   "file": "backend/src/storage.rs",
+   "lines": "281-284, 903-961",
+   "what_it_does": "Projects: a name, a folder path on the backend's disk and the detected build system. Everyone sees all of them.",
+   "assumes": [
+    "pc_files",
+    "one_user",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Becomes a per-user list of folders on registered devices: owner_id, device_id, the folder path as the desktop app reports it, and an allowed flag the desktop app confirms. Build system detection runs on the desktop app.",
+   "size": "M",
+   "evidence": "workspaces(id, name, path, build_system, created_at); SELECT ... FROM workspaces ORDER BY created_at",
+   "confidence": "high"
+  },
+  {
+   "name": "search_runs table + record_search_run",
+   "file": "backend/src/storage.rs",
+   "lines": "285-288, 963-971",
+   "what_it_does": "Record of each web search: query, provider, result count.",
+   "assumes": [
+    "single_db_file",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Add the user; also write it to the audit log (data leaving the company).",
+   "size": "S",
+   "evidence": "INSERT INTO search_runs(id,conversation_id,query,provider,result_count,created_at)",
+   "confidence": "high"
+  },
+  {
+   "name": "memory_entries table + add/memories_for/delete/get/touch/memory_export/memory_context",
+   "file": "backend/src/storage.rs",
+   "lines": "289-293, 973-1108",
+   "what_it_does": "Saved memories scoped to a conversation, a project or 'global'. memory_context builds a text block of at most 2,000 characters that is added to model requests. 'Global' means every row with that scope in the database.",
+   "assumes": [
+    "one_user",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Add owner_id. 'Global' becomes 'all of this user's conversations'. Company- or group-wide memories, if wanted, are admin-managed with their own scope. delete, get and share check the owner.",
+   "size": "M",
+   "evidence": "WHERE scope='global' OR (scope IN ('conversation','session') AND scope_id=?) OR (scope='workspace' AND scope_id=?)",
+   "confidence": "high"
+  },
+  {
+   "name": "knowledge_chunks table + add_knowledge_chunk/knowledge_paths/clear_knowledge_path/knowledge_for",
+   "file": "backend/src/storage.rs",
+   "lines": "294-297, 1110-1149",
+   "what_it_does": "Text pieces of a project's documents, used for keyword-overlap lookups in code chats.",
+   "assumes": [
+    "single_db_file",
+    "pc_files"
+   ],
+   "destination": "worker",
+   "change": "Move to PostgreSQL with pgvector. Reading documents in is a worker job (files come from file storage or from the desktop app over the device channel). Collections are scoped to an owner or group, with access checks at search time on the API server.",
+   "size": "L",
+   "evidence": "knowledge_chunks(id, workspace_id, path, chunk_idx, text); chat_sse 3768 st.knowledge_for(ws_id); retrieve_knowledge",
+   "confidence": "high"
+  },
+  {
+   "name": "generation_metrics table + record_metric / metrics_for",
+   "file": "backend/src/storage.rs",
+   "lines": "298-303, 334-339, 1290-1334",
+   "what_it_does": "Per-reply token counts, speed and timing (timing as JSON text).",
+   "assumes": [
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Add user, pool and copy (or provider), and cost. These rows feed per-user budgets and admin usage reports. Timing becomes jsonb.",
+   "size": "M",
+   "evidence": "INSERT OR REPLACE INTO generation_metrics(...timing_json)",
+   "confidence": "high"
+  },
+  {
+   "name": "runtime_calibrations + model_template_caps + runtime_fit_decisions tables and their save/read functions",
+   "file": "backend/src/storage.rs",
+   "lines": "313-317, 328-331, 1151-1182, 1220-1261",
+   "what_it_does": "Remembers per model file what speed measurements found, what the model's chat template supports, and which memory-fit decision was made, on this machine's hardware.",
+   "assumes": [
+    "single_db_file",
+    "one_loaded_model"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Owned by the model pool manager. Keys include the machine or node hardware fingerprint as well as the model file, because a pool spans machines. Template capabilities feed the model's ability profile used by the gateway.",
+   "size": "M",
+   "evidence": "INSERT OR REPLACE INTO runtime_calibrations / model_template_caps / runtime_fit_decisions",
+   "confidence": "high"
+  },
+  {
+   "name": "model_requests table + record_model_request / model_requests_for + ModelRequestRecord",
+   "file": "backend/src/storage.rs",
+   "lines": "318-327, 1184-1218, 1263-1288, 1369-1398",
+   "what_it_does": "Keeps the full text of every model request and its output (picture data removed). After each insert it trims the whole table to the newest 300 rows and about 50 MB. Its 'owner_id' column means the reply or task id, not a person.",
+   "assumes": [
+    "single_db_file",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Add user_id and rename owner_id to source_id to avoid confusion. Retention per admin policy, run by a scheduled worker job, not a global trim on every insert. Replace the SQLite-only 'LIMIT -1 OFFSET' and 'INSERT OR REPLACE'. Readable only by the owner and auditors.",
+   "size": "M",
+   "evidence": "DELETE FROM model_requests WHERE id IN (SELECT id ... LIMIT -1 OFFSET ?); MODEL_REQUEST_ROWS = 300; MODEL_REQUEST_BYTES = 50_000_000",
+   "confidence": "high"
+  },
+  {
+   "name": "Storage::fork_messages",
+   "file": "backend/src/storage.rs",
+   "lines": "1336-1366",
+   "what_it_does": "Copies every message, its journal and the attachment records from one conversation to another, one row at a time, with no transaction.",
+   "assumes": [
+    "single_db_file"
+   ],
+   "destination": "shared_library",
+   "change": "One transaction with set-based copies (INSERT ... SELECT).",
+   "size": "S",
+   "evidence": "for m in msgs { self.add_message(..); for event in activities { self.record_message_activity(..) } }",
+   "confidence": "high"
+  },
+  {
+   "name": "AppConfig::from_env + installation_root + default_data_dir + db_path",
+   "file": "backend/src/config.rs",
+   "lines": "5-94",
+   "what_it_does": "Finds the install folder from the program's location; picks the data, models and frontend folders; listens on 127.0.0.1:3877 by default; warns if two history databases exist.",
+   "assumes": [
+    "pc_files",
+    "loopback_only",
+    "single_db_file"
+   ],
+   "destination": "shared_library",
+   "change": "Configuration from environment or a file: role (api, worker, pool manager), database address, optional Redis address, file storage (S3, MinIO or a folder), sign-in provider details, listen address. A models folder only for the pool manager in local mode. Drop the two-database detection.",
+   "size": "M",
+   "evidence": "std::env::var(\"COMPANION_ADDR\").unwrap_or_else(|_| \"127.0.0.1:3877\".into()); fn db_path(&self) -> PathBuf { self.data_dir.join(\"companion.db\") }",
+   "confidence": "high"
+  },
+  {
+   "name": "main: logging setup",
+   "file": "backend/src/main.rs",
+   "lines": "56-75, 82",
+   "what_it_does": "Sends every log record to the console, to an in-memory tail of recent lines, and to a rotating file in the data folder.",
+   "assumes": [
+    "in_memory_state",
+    "pc_files"
+   ],
+   "destination": "shared_library",
+   "change": "Structured logs on standard output (collected by the platform) carrying request, user and role ids. Rotating files only for the single-machine Windows install. Drop the in-memory tail.",
+   "size": "M",
+   "evidence": ".with_writer(logbuf::global().clone()) ... .with_writer(|| logfile::AppFileWriter); logfile::init(&cfg.data_dir.join(\"logs\"))",
+   "confidence": "high"
+  },
+  {
+   "name": "main: startup sequence (data folder, database, state, model scan, fit preparation)",
+   "file": "backend/src/main.rs",
+   "lines": "77-137",
+   "what_it_does": "Creates the data folder, opens the database (stops the program if it cannot), builds the shared state, registers the model files found in the models folder, and schedules a memory-fit search for each model 20 seconds later.",
+   "assumes": [
+    "pc_files",
+    "single_db_file",
+    "one_loaded_model"
+   ],
+   "destination": "shared_library",
+   "change": "Start by role. The API server connects to PostgreSQL and file storage and serves HTTP. The worker starts its job loop. The pool manager scans or registers models and runs fit preparation. Database migrations run as a separate step before rollout.",
+   "size": "M",
+   "evidence": "storage::Storage::open_persistent(&cfg.db_path()); models::scan_models_dir(&cfg.models_dir); api::spawn_fit_preparation(&state, Duration::from_secs(20))",
+   "confidence": "high"
+  },
+  {
+   "name": "main: non-loopback warning",
+   "file": "backend/src/main.rs",
+   "lines": "139-145",
+   "what_it_does": "Warns when the listen address is not local, because the API has no sign-in.",
+   "assumes": [
+    "loopback_only"
+   ],
+   "destination": "remove",
+   "change": "Remove once sign-in is in place; refuse to start without sign-in settings, except in an explicit local development mode.",
+   "size": "S",
+   "evidence": "\"COMPANION_ADDR={} is not loopback; the API has no auth. Prefer 127.0.0.1.\"",
+   "confidence": "high"
+  },
+  {
+   "name": "main: resource sampler",
+   "file": "backend/src/main.rs",
+   "lines": "147-161",
+   "what_it_does": "Every 2 seconds, samples this machine's processor, memory and graphics use, counting the one running reply plus the local agent tasks as 'active'.",
+   "assumes": [
+    "in_memory_state",
+    "one_loaded_model"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Machine and graphics metrics come from each model node (exported for the admin dashboard). Activity counts come from the shared generation and job tables.",
+   "size": "S",
+   "evidence": "gens.try_read().map(|t| t.current_id().is_some() as usize) + counter.load(..); tokio::spawn(crate::metrics::sampler(log, active))",
+   "confidence": "high"
+  },
+  {
+   "name": "main: serving the built frontend",
+   "file": "backend/src/main.rs",
+   "lines": "163-192",
+   "what_it_does": "Serves the built React pages from a folder as the fallback for unknown addresses, with 'do not cache' on pages.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "The desktop app bundles the screens. The browser version is served by static hosting or the API server from built files; the admin dashboard is a separate web app.",
+   "size": "S",
+   "evidence": ".fallback_service(ServeDir::new(&cfg.frontend_dir).fallback(ServeFile::new(index)))",
+   "confidence": "high"
+  },
+  {
+   "name": "main: listen, graceful shutdown, StopRequest, stop_requested",
+   "file": "backend/src/main.rs",
+   "lines": "193-340",
+   "what_it_does": "Listens for requests. It reacts to Ctrl+C, window close, Windows sign-out or shutdown, and SIGTERM or SIGHUP by running the close procedure, then exits.",
+   "assumes": [
+    "in_memory_state",
+    "pc_processes"
+   ],
+   "destination": "shared_library",
+   "change": "Keep SIGTERM handling for Kubernetes: stop taking requests, tell open streams to reconnect, give back job leases within the grace period. On a single Windows machine, run as a Windows service and handle service stop, not console-window events.",
+   "size": "M",
+   "evidence": "axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(state)); windows::ctrl_close(); state.shut_down(reason).await; std::process::exit(0)",
+   "confidence": "high"
+  },
+  {
+   "name": "shutdown::begin / reason / task_message",
+   "file": "backend/src/shutdown.rs",
+   "lines": "8-25",
+   "what_it_does": "Remembers, for the whole process, that Companion is closing and why, and words the message written into a task cut short by closing.",
+   "assumes": [
+    "in_memory_state"
+   ],
+   "destination": "worker",
+   "change": "Becomes a per-worker 'draining' flag. Tasks are handed to another worker or paused, so the message should say 'paused, will continue', not 'Companion was closed'.",
+   "size": "S",
+   "evidence": "static REASON: OnceLock<String>; \"Stopped: Companion was closed while this task was running ({reason})\"",
+   "confidence": "high"
+  },
+  {
+   "name": "logbuf::LogTail (global in-memory log tail)",
+   "file": "backend/src/logbuf.rs",
+   "lines": "11-90",
+   "what_it_does": "Keeps this process's last 2,000 log lines in memory so a conversation export can carry them.",
+   "assumes": [
+    "in_memory_state"
+   ],
+   "destination": "remove",
+   "change": "Remove. Admins read central logs filtered by request or conversation id from the admin dashboard. User exports must not include app-wide logs.",
+   "size": "S",
+   "evidence": "const CAPACITY: usize = 2_000; pub fn global() -> &'static LogTail",
+   "confidence": "high"
+  },
+  {
+   "name": "logfile: init / app / model_server / model_server_note / RotatingLog / AppFileWriter",
+   "file": "backend/src/logfile.rs",
+   "lines": "16-151",
+   "what_it_does": "Writes the app's log and the model server's output to logs/companion.log and logs/model-server.log in the data folder, rotating at 4 MB and keeping 2 older files.",
+   "assumes": [
+    "pc_files",
+    "one_loaded_model"
+   ],
+   "destination": "shared_library",
+   "change": "File logs only for the single-machine install, with retention from admin logging settings. In Kubernetes, log to standard output. The model server log moves to the pool manager, one stream per copy, tagged with the copy id.",
+   "size": "S",
+   "evidence": "MAX_BYTES = 4*1024*1024; KEEP = 2; dir.join(\"companion.log\"); dir.join(\"model-server.log\")",
+   "confidence": "high"
+  },
+  {
+   "name": "logfile::LineStamper",
+   "file": "backend/src/logfile.rs",
+   "lines": "153-197",
+   "what_it_does": "Adds the arrival time to each line of model server output. Pure logic.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Unchanged; used by the pool manager for each copy's output.",
+   "size": "S",
+   "evidence": "pub struct LineStamper { pending: Vec<u8> }",
+   "confidence": "high"
+  },
+  {
+   "name": "documents: render, renderers, mime_for, missing_content, content_summary, requested_document_kind",
+   "file": "backend/src/documents.rs",
+   "lines": "22-165, 200-537, 578-619, 729-767",
+   "what_it_does": "Turns a structured description from the model into a real file (text, markdown, CSV, HTML, JSON, Excel, Word, PDF, PowerPoint), and spots requests that name a file type (English keywords). Pure logic.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Unchanged. The file-type keyword list is English only; extend it if the interface language setting covers other languages.",
+   "size": "S",
+   "evidence": "pub fn render(kind: &str, spec: &serde_json::Value) -> Result<(Vec<u8>, String), String>",
+   "confidence": "high"
+  },
+  {
+   "name": "documents::store",
+   "file": "backend/src/documents.rs",
+   "lines": "167-198",
+   "what_it_does": "Writes a generated file to artifacts/<conversation>/<name> on the backend's disk, replacing a file of the same name, then re-reads it to check it is valid. Limit 20 MB, fixed in code.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "shared_library",
+   "change": "Check the file in memory, then upload to file storage under a key that includes the artifact id (no overwrites). Size limit from the admin file-size setting.",
+   "size": "S",
+   "evidence": "let dir = artifacts_dir.join(conv); std::fs::write(&path, bytes); if bytes.len() > 20_000_000",
+   "confidence": "high"
+  },
+  {
+   "name": "documents::save_plain_document",
+   "file": "backend/src/documents.rs",
+   "lines": "539-576",
+   "what_it_does": "Saves a model's plain-text reply as a document in the conversation's artifacts and records it.",
+   "assumes": [
+    "pc_files",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "File storage plus a PostgreSQL row; owner through the conversation.",
+   "size": "S",
+   "evidence": "store(artifacts_dir, conversation_id, filename, text.as_bytes()); storage.lock().await.record_artifact(&row)",
+   "confidence": "high"
+  },
+  {
+   "name": "documents::execute_create_document",
+   "file": "backend/src/documents.rs",
+   "lines": "621-727",
+   "what_it_does": "The 'create document' tool. It tidies the model's arguments, renders the file, stores it in the conversation's artifacts (not in the user's project) and records it.",
+   "assumes": [
+    "pc_files",
+    "single_db_file"
+   ],
+   "destination": "worker",
+   "change": "A server-side tool, run wherever the loop runs (worker for agent tasks, API server for chat), writing to file storage. It is not a device tool, because it never touches the user's project.",
+   "size": "S",
+   "evidence": "\"saved {} ... to this conversation's Artifacts panel, outside the workspace\"",
+   "confidence": "high"
+  },
+  {
+   "name": "vision::prepare_image / image_excerpt / is_image_mime",
+   "file": "backend/src/vision.rs",
+   "lines": "11-105",
+   "what_it_does": "Turns picture bytes upright, shrinks them to at most 1568 pixels per side, re-saves them as JPEG for the model, and writes an honest placeholder for models that cannot see. Pure logic.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Unchanged, except the 8 MB limit should come from the admin picture-size setting. The bytes come from file storage.",
+   "size": "S",
+   "evidence": "pub const MAX_SIDE_PX: u32 = 1568; pub const MAX_IMAGE_BYTES: usize = 8_000_000",
+   "confidence": "high"
+  },
+  {
+   "name": "list_memory / add_memory / delete_memory / share_memory",
+   "file": "backend/src/api.rs",
+   "lines": "9344-9497",
+   "what_it_does": "List memories visible to a conversation or project; add one (conversation, project or global scope); delete any memory by id; copy a memory into another scope or target id.",
+   "assumes": [
+    "one_user",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Set and check the owner on every call. 'Global' means this user only. Targets (conversation or project) must belong to the caller. Audit deletions and shares.",
+   "size": "S",
+   "evidence": "s.storage.lock().await.delete_memory(&id) (no owner); share_memory scope_id: req.target_id.clone()",
+   "confidence": "high"
+  }
+ ],
+ "surprises": [
+  {
+   "title": "Only one chat reply can run in the whole app; any new message cancels it",
+   "why_it_matters": "With many users, user B sending a message stops user A's reply mid-stream, and any user's Stop stops whoever is generating. Stop and session actions take no owner. Chat is also refused with 409 for everyone while any model loads. The single-slot tracker has to be replaced (one record per generation, shared cancel flag), not just moved behind a lock.",
+   "evidence": "chat_sse: s.generations.write().await.cancel_current(&s.storage).await (\"A new turn supersedes any running one\"); GenerationTracker { current: Option<ActiveGeneration> }; chat_stop has no conversation parameter; s.runtime_update.try_lock() → CONFLICT",
+   "file": "backend/src/api.rs",
+   "lines": "3368-3374, 3541-3542, 4257-4259"
+  },
+  {
+   "name_placeholder": "",
+   "title": "Opening the database marks every unfinished task as interrupted",
+   "why_it_matters": "With several API servers and workers sharing one PostgreSQL, a restart of any one process would mark every other process's live tasks as interrupted and cancelled. Recovery has to become lease or heartbeat based on the worker, and must come out of the database-open path.",
+   "evidence": "open_persistent → s.recover_interrupted_activity(); UPDATE session_task_context SET status='interrupted' WHERE status='active'; appends AgentState::Cancelled 'Interrupted when the runtime closed' to every unfinished journal",
+   "file": "backend/src/storage.rs",
+   "lines": "221-253, 685-734"
+  },
+  {
+   "title": "No ownership checks anywhere; every record is reachable by id",
+   "why_it_matters": "Once more than one user exists, any signed-in user could read, delete or post into anyone's conversations, artifacts, attachments and memories by id. share_conversation writes into any target conversation, post_message accepts assistant and tool roles (forged replies), and the 'global' memory scope reaches every user's prompts. Adding owner_id to the tables is not enough: every one of the ~60 handlers in scope needs an owner filter, which suggests one shared 'load conversation for this user' helper.",
+   "evidence": "get_artifact: SELECT ... FROM artifacts WHERE id=?; delete_memory: DELETE FROM memory_entries WHERE id=?; memories_for: WHERE scope='global' OR ...; validate_role accepts \"assistant\" | \"tool\"",
+   "file": "backend/src/storage.rs",
+   "lines": "885-901, 990-1019"
+  },
+  {
+   "title": "Conversation export carries the whole program's log",
+   "why_it_matters": "A user's export includes the last 1,000 log lines of the process, which with many users means other users' activity (ids, errors, model loads). With several servers it is also only one server's partial log. Remove it from user exports.",
+   "evidence": "\"app_log\": crate::logbuf::global().recent(1_000)",
+   "file": "backend/src/api.rs",
+   "lines": "8732-8736"
+  },
+  {
+   "title": "The web search key is sent to the browser",
+   "why_it_matters": "GET /api/settings returns the whole settings object, including search.brave_key; only the /config chat command hides it. The design gives search keys to the admin, so secrets need their own store and must never be returned by any user-facing settings endpoint.",
+   "evidence": "async fn get_settings(...) { Json(s.settings.read().await.clone()) } vs config_text: v[\"search\"][\"brave_key\"] = \"***\"",
+   "file": "backend/src/api.rs",
+   "lines": "6636-6640, 8857-8859"
+  },
+  {
+   "title": "Many admin-owned settings in the design are stored but never enforced today",
+   "why_it_matters": "Folder limits (allowed_dirs, blocked_dirs), network policy and trusted hosts, the command timeout, file size limits, OCR switch, log redaction, telemetry, log level, output_dir and the whole 'advanced' section are never read by the backend (or the frontend). The real limits are constants: 5 MB attachments, 8 MB pictures, 20 MB artifacts. The plan must count enforcing these (in the desktop app, gateway and upload paths) as new work, not a move.",
+   "evidence": "grep max_attach_mb|allowed_dirs|blocked_dirs|trusted_hosts|log_redaction|command_timeout_secs|output_dir|server_port|parallel_sessions → only settings.rs; add_attachment const MAX_ATTACH_BYTES: usize = 5_000_000",
+   "file": "backend/src/settings.rs",
+   "lines": "40-56, 144-197"
+  },
+  {
+   "title": "Chat itself, not only the agent, touches the user's project folder",
+   "why_it_matters": "The design sends agent tools over the device channel. But code-mode chat also reads the PC directly: the project listing and instructions file go into every prompt, up to 24 rounds of read and search tools run in chat, the project index and document chunks come from the folder, and /search, /find and /diff run on the backend's disk. The device channel must serve the API server's chat path too, with request-response timing inside a live reply, or chat must hand code questions to a worker.",
+   "evidence": "assemble_request_context → workspace_snapshot(std::fs::read_dir); chat_sse → run_chat_tool_round(...), cached_repo_index(..), st.knowledge_for(ws_id); run_slash_command \"diff\" → crate::terminal::run(SAFE_GIT_DIFF_STAT, &ws, 30); command_workspace accepts any typed path that is_dir()",
+   "file": "backend/src/api.rs",
+   "lines": "2554-2557, 3752-3808, 3975-3987, 6239-6255, 6416-6429"
+  },
+  {
+   "title": "Changing the permission mode changes it for everyone and approves other people's waiting actions",
+   "why_it_matters": "put_permission_mode and put_settings set one approval level for the whole process, then release every waiting approval the new mode allows across all tasks. In a multi-user system, one user switching to Auto would approve other users' pending file edits. Mode, cap and release have to be per user, with release signalled to the worker that holds the run.",
+   "evidence": "s.permissions.write().await.autonomy = autonomy; resume_auto_approved_runs iterates registry.summaries() for every WaitingPermission run",
+   "file": "backend/src/api.rs",
+   "lines": "8960-9044, 9158-9160"
+  },
+  {
+   "title": "All database access is serialised through one connection and one lock, and the access layer is synchronous",
+   "why_it_matters": "93 places take the single tokio Mutex on one rusqlite connection; each request holds it while doing several queries, sometimes across awaits on other locks. Moving to PostgreSQL is not a driver swap: the access layer becomes async with a pool, every call site changes, and multi-step updates need explicit transactions (fork, edit-and-truncate, delete cascade, compaction check-then-save). Size this as L on its own.",
+   "evidence": "pub storage: Arc<tokio::sync::Mutex<Storage>>; pub struct Storage { conn: Connection }; Grep count storage.lock(): api.rs 83, agent_runner.rs 7, generation.rs 3",
+   "file": "backend/src/api.rs",
+   "lines": "95"
+  },
+  {
+   "title": "SQLite-only behaviour the PostgreSQL move must replace",
+   "why_it_matters": "Order and truncation depend on SQLite's hidden row number (messages, activities, attachments, artifacts, metrics). There are SQLite PRAGMAs, INSERT OR REPLACE, 'LIMIT -1 OFFSET', 0/1 integers as booleans, text timestamps, JSON in text columns, and a home-made 'add column if missing' migration run on every open. There are no foreign keys, so deleting a conversation orphans artifacts, metrics, summaries, journals, model request records, search records, memories and every file on disk. No full-text search or SQL JSON functions are used, which makes the move simpler.",
+   "evidence": "ORDER BY rowid; rowid > (SELECT rowid ...); a.rowid=(SELECT MAX(rowid) ...); INSERT OR REPLACE INTO ...; LIMIT -1 OFFSET ?; PRAGMA journal_mode=WAL; SELECT {column} FROM {table} LIMIT 0",
+   "file": "backend/src/storage.rs",
+   "lines": "245-248, 334-403, 487-505, 523-526, 771-778, 1196-1199"
+  },
+  {
+   "title": "Model request records are trimmed globally, and 'owner_id' there means a reply id, not a person",
+   "why_it_matters": "Every insert trims the whole table to 300 rows and about 50 MB. With many users only minutes of history survive, and one heavy user removes everyone else's records. These rows hold full prompts (sensitive) and are on by default. The existing column name owner_id clashes with the new 'every record has an owner' rule; rename it before adding user ownership.",
+   "evidence": "pub const MODEL_REQUEST_ROWS: usize = 300; pub const MODEL_REQUEST_BYTES: usize = 50_000_000; /// The reply message or agent run the request belonged to. pub owner_id: String",
+   "file": "backend/src/storage.rs",
+   "lines": "1184-1218, 1369-1383"
+  },
+  {
+   "title": "Chat and context screens are built around 'the current loaded model'",
+   "why_it_matters": "Replies go to whichever model is running, not the conversation's chosen model. Vision support, the context window, the speed figures' model id and the 'stale model' recovery list all read the one current model. With several models served, the conversation's model_id must drive routing and the ability profile, and the 'stale / resume / discard' recovery flow loses its meaning.",
+   "evidence": "s.models.read().await.current().map(|m| m.vision); llama.running.as_ref().map(|r| (r.base_url.clone(), r.cfg.clone())); sessions_recovery filter c.last_model != loaded; chat_sse saves st.set_last_model(&cid, &model) from models.current()",
+   "file": "backend/src/api.rs",
+   "lines": "2481-2494, 3453-3463, 4141-4150, 8743-8781"
+  },
+  {
+   "title": "A reply in progress lives only in the API server's memory until it ends",
+   "why_it_matters": "The streamed text is kept in memory and saved only on completion or Stop. A server crash or a rolling deploy loses the whole partial reply, and a client that reconnects to another server cannot pick the stream up. The stateless-server design needs periodic checkpoints and a shared stream (Redis when 2+ servers), plus a rule for who finishes a reply when its server dies.",
+   "evidence": "let partial = Arc::new(Mutex::new(String::new())); ... st.add_message(... content: stored ...) only after the loop; Sse::new(UnboundedReceiverStream::new(rx))",
+   "file": "backend/src/api.rs",
+   "lines": "3536-3540, 4118-4185, 4248"
+  },
+  {
+   "title": "Same-name attachments overwrite each other on disk",
+   "why_it_matters": "Attachment bytes are stored under conversation folder + file name, so uploading 'notes.txt' twice keeps two records but one file. Moving to file storage should key by attachment id; existing data needs care during import.",
+   "evidence": "let dir = s.attachments_dir.join(&id); std::fs::write(dir.join(&safe), &bytes); attachment_file reads attachments_dir.join(&id).join(&att.filename)",
+   "file": "backend/src/api.rs",
+   "lines": "5081-5085, 5125-5129, 5162-5166, 5226"
+  },
+  {
+   "title": "Settings read on request paths outside this job's files",
+   "why_it_matters": "Other jobs must also switch these reads to 'this user's effective settings' or 'this pool's settings': prepare_fits (api.rs 1673), start_sidecar (1869), execute_tool (5417), run_agent (5859), runtime_policy (8870), calibrate_model (9814), and agent_runner.rs 2832, 3859 and 4838 (compaction policy and settings clones inside the agent loop, which will run on the worker).",
+   "evidence": "Grep settings.read(): api.rs 1673, 1869, 5417, 5859, 8870, 9814; agent_runner.rs 2832, 3859, 4838",
+   "file": "backend/src/api.rs",
+   "lines": "1673, 1869, 5417, 5859, 8870, 9814"
+  },
+  {
+   "title": "The default thread count is measured on whichever machine creates the settings",
+   "why_it_matters": "AppSettings::default detects the processor of the machine running the backend. In the target, that is the API server, not the machine running the model copies, so default tuning would be wrong. Hardware defaults belong to the pool manager on each node.",
+   "evidence": "cpu_threads: crate::cpu_topology::detect().map(|topology| topology.physical_count() as u32)",
+   "file": "backend/src/settings.rs",
+   "lines": "419-429"
+  }
+ ]
+}

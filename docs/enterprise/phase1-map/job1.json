@@ -1,0 +1,1579 @@
+{
+ "summary": "Scope: the coding agent loop and its tools (job 1 of 3). Central answer: the registry has 21 tools. 16 of them touch the user's project or PC and move to the desktop app's local tool runner: list_directory, read_file, write_file, append_file, edit_file, replace_lines, outline, search_text, delete_file, execute_command (including background commands), project_check, git_commit, open_path, system_info and list_processes, plus the page-loading half of preview_page. The other 5 stay on the worker: web_search, create_document, remember, changes (it needs one batched file read from the PC) and present_plan. A chat-only tool, manage_context, also stays server-side.\n\nThe desktop side is mostly reuse. Tauri's native layer is Rust, so tools.rs, workspace.rs, terminal.rs, file_read.rs, outline.rs, project_check.rs, preview.rs, cdp.rs, repo_index::build and search::html_to_text can be compiled into the desktop app almost unchanged. The device channel can carry the existing ToolRequest and ToolResult shapes.\n\nThe loop side is the hard part. run_loop (agent_runner.rs 2579-4119) is one ~1,540-line function, and all run state lives in its local variables. It reads the single loaded model directly, uses the global permission object, and reaches the PC both through tools and through about 14 places where the host (not the model) reads the project:\n- project-root detection\n- AGENTS.md / CLAUDE.md\n- HANDOFF.md / MEMORY.md\n- before/after diffs on every edit\n- the completion checks on disk\n- the changes report\n- the screenshot file\n- the repo index\n- git status and diff\n- folder-path checks when a run starts\nAll of these need device-channel requests, and the run-start and completion-check ones must be batched.\n\nApprovals, Stop and the event stream are in-memory today: a one-shot channel, an on/off flag plus task abort, and a broadcast channel replayed from a Vec, in a 20-entry registry. They must become database rows plus notifications so that any API server can serve the screen while a worker owns the run.\n\nSeveral security gaps must not be carried over:\n- the agent calls the tool runner with approved=true unconditionally\n- POST /api/tools/execute runs any tool in any folder path it is sent\n- the plugin run endpoint skips the permission check entirely\n- Stop cannot kill a command that is already running\n- background commands are owned by a folder path rather than by a run\n\nThe chat path also runs PC tools, outside the agent loop. The decided design does not cover that yet.",
+ "items": [
+  {
+   "name": "tools::registry, risk_of, runs_in_the_agent, required_args, chat_safe, is_file_edit, touches_git_internals",
+   "file": "backend/src/tools.rs",
+   "lines": "78-303",
+   "what_it_does": "The fixed catalogue of the 21 actions a model may ask for. For each one it records a risk level (safe, moderate or dangerous) and the arguments it needs. It also says which actions plain chat may run without asking, which count as file edits, and flags edits inside a project's hidden git folder, where git keeps commands it will run.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Keep it as the one shared catalogue used by the worker, the API server and the desktop app. Add to each entry where it runs (on the user's PC or on the server) and what it needs from the model, so the same record can feed the plugin description files and the model-ability filter. Plugin (MCP) tools will have to be merged into this list at run time; today it is hard-coded.",
+   "size": "M",
+   "evidence": "pub fn registry() -> Vec<ToolDescriptor> (78-207); risk_of (209-217); runs_in_the_agent matches \"web_search\" | \"remember\" | \"changes\" | \"preview_page\" (222-224); chat_safe lists list_directory, read_file, search_text, outline, system_info, list_processes, create_document (292-303); touches_git_internals (257-263)",
+   "confidence": "high"
+  },
+  {
+   "name": "tools::execute (dispatcher) and require_approved",
+   "file": "backend/src/tools.rs",
+   "lines": "305-319, 375-380, 824-928",
+   "what_it_does": "The single place that runs a tool. It takes a tool name, its arguments and the project folder, keeps every path inside that folder, refuses moderate or dangerous actions unless an 'approved' flag is set, and carries out the action on this machine.",
+   "assumes": [
+    "pc_files",
+    "pc_processes"
+   ],
+   "destination": "desktop_app",
+   "change": "Make this the core of the desktop app's local tool runner; the Rust code can be compiled into the Tauri app. The desktop decides 'approved' itself, from the user's permission mode and its own approval prompt, and never from a flag the server sends. The names that only the run can serve (web_search, remember, changes, present_plan) are already refused here and stay on the worker.",
+   "size": "M",
+   "evidence": "pub fn execute(req, ws, approved) (375); require_approved: if approved || req.approved {return Ok(())} (311-319); the agent always passes true: tools::execute(&blocking_req, &blocking_ws, true) (agent_runner.rs 4790)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool list_directory",
+   "file": "backend/src/tools.rs",
+   "lines": "381-408",
+   "what_it_does": "Lists the files and folders inside one folder of the project; folder names end in '/'.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Runs in the desktop tool runner unchanged, after the desktop's own folder check.",
+   "size": "S",
+   "evidence": "\"list_directory\" => ws.resolve(rel) then std::fs::read_dir(&dir) (381-389)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool read_file + file_read::read",
+   "file": "backend/src/tools.rs; backend/src/file_read.rs",
+   "lines": "tools.rs 409-426; file_read.rs 7-87",
+   "what_it_does": "Reads part of a text file with line numbers: 200 lines by default, at most 500 lines or 12,000 characters per call. It tells the model where to continue and refuses binary files.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Moves to the desktop unchanged. The existing per-call size limits also limit how much a misbehaving server can pull out in one request.",
+   "size": "S",
+   "evidence": "crate::file_read::read(&p, &req.args) (419); DEFAULT_LINES 200, MAX_LINES 500, CHUNK_CHARS 12_000 (file_read.rs 7-9)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool write_file",
+   "file": "backend/src/tools.rs",
+   "lines": "427-469",
+   "what_it_does": "Creates or overwrites a file, creating any missing folders. It then reads the file back to prove the bytes on disk match what was sent, and marks the result '(verified on disk)'. Files are limited to 5 MB.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Runs on the desktop, read-back included, so the 'verified' marker stays truthful. The 5 MB limit becomes the admin's file-size limit, sent with every request and enforced by the desktop.",
+   "size": "S",
+   "evidence": "std::fs::create_dir_all(parent); std::fs::write(&p, content); let on_disk = std::fs::read(&p) (448-463); MAX_FILE_BYTES 5_000_000 (305); WRITE_VERIFIED (308)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool append_file",
+   "file": "backend/src/tools.rs",
+   "lines": "474-529",
+   "what_it_does": "Adds text to the end of a file, creating it if needed, then checks the new size on disk. Small models write long files this way, in parts.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Runs on the desktop unchanged.",
+   "size": "S",
+   "evidence": "OpenOptions::new().create(true).append(true).open(&p); metadata(&p).len() read-back (507-523)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool edit_file",
+   "file": "backend/src/tools.rs",
+   "lines": "530-588",
+   "what_it_does": "Replaces exact existing text (or applies a diff) in a file. It recognises an edit that was already made, writes the result and reads it back.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Runs on the desktop as one action: read, change, write and read back in a single round trip. The text-matching helpers come from the shared library.",
+   "size": "S",
+   "evidence": "read_to_string(&p) (540); apply_replacement / apply_unified_patch (569-571); std::fs::write + std::fs::read read-back (575-581)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool replace_lines",
+   "file": "backend/src/tools.rs",
+   "lines": "593-673",
+   "what_it_does": "Replaces a range of lines by number. It can check the expected text first, keeps the file's own line endings, and reads the result back.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Runs on the desktop unchanged.",
+   "size": "S",
+   "evidence": "read_to_string (608); crlf handling (609, 654); write + read-back (662-666)",
+   "confidence": "high"
+  },
+  {
+   "name": "Patch and text-replacement helpers",
+   "file": "backend/src/tools.rs",
+   "lines": "934-1350",
+   "what_it_does": "Pure text routines. They apply a diff, find a block of lines while tolerating small differences, detect an edit that was already made, summarise the changed lines, and explain where the closest match is when the model's text is not found.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "No behaviour change. They are compiled into the desktop app (where the edits happen) and kept available to the worker.",
+   "size": "S",
+   "evidence": "apply_unified_patch (934), locate_lines (1026), edit_already_made (1081), closest_region (1190), apply_replacement (1238)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool outline + outline.rs",
+   "file": "backend/src/tools.rs; backend/src/outline.rs",
+   "lines": "tools.rs 674-685; outline.rs 20-188",
+   "what_it_does": "Shows what a file defines (functions, classes, headings) with their line numbers. For a folder, it lists the files with their sizes and line counts; to do that it opens every file in the folder.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Runs on the desktop. A folder outline reads every file in the folder, so it must stay a single desktop-side action and never become one request per file.",
+   "size": "S",
+   "evidence": "crate::outline::outline(&p, rel) (682); folder_outline reads each file to count lines: std::fs::read_to_string(entry.path()) (outline.rs 137-139)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool project_check + project_check.rs",
+   "file": "backend/src/tools.rs; backend/src/project_check.rs",
+   "lines": "tools.rs 688-702; project_check.rs 37-272",
+   "what_it_does": "Works out what kind of project it is (npm, cargo, go or python) from its files. It checks the needed program is installed on this PC, runs the project's own build and tests (by default allowing up to 600 seconds), and reduces the output to a short list of problems.",
+   "assumes": [
+    "pc_files",
+    "pc_processes"
+   ],
+   "destination": "desktop_app",
+   "change": "Runs on the desktop: it uses the PC's installed programs and its search path. The timeout cap comes from the admin's command-timeout setting and is enforced by the desktop. The output-shrinking part, problems(), is pure and can be shared.",
+   "size": "S",
+   "evidence": "on_path reads PATH (37-47); plan() reads package.json, Cargo.toml (63-115); run() calls crate::terminal::run (209); default_timeout 600 s (270-272); cfg!(windows) in python_tests (136)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool delete_file",
+   "file": "backend/src/tools.rs",
+   "lines": "703-717",
+   "what_it_does": "Deletes one file inside the project.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Runs on the desktop. It is dangerous, so the desktop asks every time unless the user's mode is Auto.",
+   "size": "S",
+   "evidence": "std::fs::remove_file(&p) (715)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool search_text + search_dir/search_file",
+   "file": "backend/src/tools.rs",
+   "lines": "718-739, 1351-1449",
+   "what_it_does": "Searches every text file under a folder for a pattern, skipping hidden, dependency and build folders. It returns up to 50 'file:line: text' matches.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Runs on the desktop as one action. The walk opens thousands of files, which is impossible over the network one file at a time.",
+   "size": "S",
+   "evidence": "search_dir walks std::fs::read_dir recursively (1354-1409); MAX_SEARCH_MATCHES 50 (309)",
+   "confidence": "high"
+  },
+  {
+   "name": "missing_path (did-you-mean helper)",
+   "file": "backend/src/tools.rs",
+   "lines": "321-371",
+   "what_it_does": "When a path does not exist, it searches the project, looking at up to 20,000 entries, for files of the same name and suggests them.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Stays inside the desktop tool runner, as part of the failing tool's single round trip.",
+   "size": "S",
+   "evidence": "walk with seen > 20_000 cap (337-360)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool execute_command (foreground and background)",
+   "file": "backend/src/tools.rs",
+   "lines": "740-823",
+   "what_it_does": "Runs a shell command in the project folder. It refuses to run a dev server in the foreground. In the background it starts the command and reports its first output; given a background id it reads that command's later output, or stops it. Each background command is labelled with the folder path as its owner.",
+   "assumes": [
+    "pc_processes",
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Runs on the desktop. Label each background command with the run that started it, not the folder path, and refuse status or stop requests for another run's command. The admin's command-timeout cap travels with each request and is enforced by the desktop.",
+   "size": "M",
+   "evidence": "owner = ws.root().to_string_lossy() (793); start_background(cmd, &cwd, &owner, settle) (794); background_status(id) / stop_background(id) with no owner check (747-751); keeps_running refusal (780-787); timeout_secs from model args (770)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool system_info",
+   "file": "backend/src/tools.rs",
+   "lines": "827-831",
+   "what_it_does": "Reports the operating system and processor type of the machine the backend runs on.",
+   "assumes": [
+    "pc_processes"
+   ],
+   "destination": "desktop_app",
+   "change": "Must describe the user's PC, where commands actually run. Answer it on the desktop, or from facts the desktop reports when it connects. On a worker it would describe the server.",
+   "size": "S",
+   "evidence": "format!(\"os={} arch={}\", std::env::consts::OS, std::env::consts::ARCH) (827-831)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool git_commit",
+   "file": "backend/src/tools.rs",
+   "lines": "836-858",
+   "what_it_does": "Runs git commit in the project folder with a single-line message, after rejecting messages containing shell characters.",
+   "assumes": [
+    "pc_processes",
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Runs on the desktop unchanged; it needs approval unless the user's mode allows it.",
+   "size": "S",
+   "evidence": "std::process::Command::new(\"git\").args([\"-C\", root, \"commit\", \"-m\", msg]) (848-851)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool list_processes",
+   "file": "backend/src/tools.rs",
+   "lines": "861-870",
+   "what_it_does": "Lists up to 300 running programs (name and process id) on the machine the backend runs on. Chat may run it without asking.",
+   "assumes": [
+    "pc_processes"
+   ],
+   "destination": "desktop_app",
+   "change": "Run it on the desktop, or drop it. On a shared server it would show the server's processes to any user. Take it off the no-approval chat list, or keep it there only for the user's own PC.",
+   "size": "S",
+   "evidence": "sysinfo::System::new_all(); sys.processes() (862-869); chat_safe includes \"list_processes\" (300)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool open_path",
+   "file": "backend/src/tools.rs",
+   "lines": "876-913",
+   "what_it_does": "Opens a project file or folder in the operating system's default app (Explorer, open or xdg-open). It is offered only when the user asked for something to be opened.",
+   "assumes": [
+    "pc_windows",
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Runs on the desktop only; it opens a window on the user's screen.",
+   "size": "S",
+   "evidence": "Command::new(\"explorer\") / \"open\" / \"xdg-open\" .spawn() (892-910)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool preview_page: page loading (preview.rs)",
+   "file": "backend/src/preview.rs",
+   "lines": "53-639",
+   "what_it_does": "Opens a page that a dev server on this machine is serving, and only on a loopback address. It waits for the server to answer, starts an installed Chrome, Edge or Brave with no window, measures the layout and collects console errors. It can save a screenshot to the temporary folder, then turns all of this into a text report.",
+   "assumes": [
+    "loopback_only",
+    "pc_processes",
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Must run on the user's PC, where the dev server and the browser are. Return the report text plus the screenshot bytes, not a file path. Keep the loopback-only rule on the desktop so the server cannot use the PC to reach other addresses. It needs search::html_to_text from the shared library.",
+   "size": "M",
+   "evidence": "parse_local_url allows only localhost|127.0.0.1|0.0.0.0|[::1] (81-85); find_browser searches PATH / PROGRAMFILES (145-197); look() saves to std::env::temp_dir() screenshot (519-526); uses crate::search::html_to_text (550)",
+   "confidence": "high"
+  },
+  {
+   "name": "cdp::Browser and cdp::Session",
+   "file": "backend/src/cdp.rs",
+   "lines": "22-319",
+   "what_it_does": "Starts a windowless browser with a debugging port and a throwaway profile folder, talks to it through a small built-in WebSocket client, and kills the browser and its child processes when finished.",
+   "assumes": [
+    "pc_processes",
+    "pc_files",
+    "loopback_only"
+   ],
+   "destination": "desktop_app",
+   "change": "Moves to the desktop with preview; no change.",
+   "size": "S",
+   "evidence": "Command::new(exe).arg(\"--remote-debugging-port=0\") (60-75); Drop runs taskkill /T /F (29-48); http_get to 127.0.0.1 (129)",
+   "confidence": "high"
+  },
+  {
+   "name": "preview_for_run (preview_page as run by the agent)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "1497-1551",
+   "what_it_does": "Calls the page preview, reads the screenshot file from the temporary folder, saves it as a picture in the conversation's Artifacts panel (server file storage plus a database row), deletes the temporary file, and adds a note to the report.",
+   "assumes": [
+    "pc_files",
+    "single_db_file"
+   ],
+   "destination": "worker",
+   "change": "The worker sends a preview request to the desktop and gets back the report plus the screenshot bytes. It stores the picture in S3/MinIO and the artifact row in PostgreSQL. It no longer reads a local file.",
+   "size": "M",
+   "evidence": "crate::preview::look(url, wait, keep_picture) (1518); std::fs::read(picture) (1521); crate::documents::store(&state.artifacts_dir, ...) (1524); state.storage.lock().await.record_artifact (1535); std::fs::remove_file(picture) (1536)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool web_search: execute_web_search + search::run_search",
+   "file": "backend/src/agent_runner.rs; backend/src/search.rs",
+   "lines": "agent_runner.rs 3853-3883, 4827-4888; search.rs 11-214",
+   "what_it_does": "Searches the web through DuckDuckGo (no key) or Brave (with the API key from settings) and formats the results. It records the search and the tool use in the database. It needs the request's Search switch, and asks for approval unless the mode is Auto.",
+   "assumes": [
+    "global_settings",
+    "single_db_file"
+   ],
+   "destination": "worker",
+   "change": "Stays on the worker (it reaches the internet, not the PC). The provider and key come from admin settings. The records go to PostgreSQL and the audit log. The approval request goes through the same durable approval record as everything else, but is answered on the user's screen, not by the desktop runner.",
+   "size": "S",
+   "evidence": "settings.search.provider / brave_key (4838-4845); crate::search::run_search (4846); record_search_run + record_tool_execution (4853-4880); settings.search.autonomous \"deny\" and global_auto check (3859-3864)",
+   "confidence": "high"
+  },
+  {
+   "name": "search::extract_page and html_to_text",
+   "file": "backend/src/search.rs",
+   "lines": "216-255",
+   "what_it_does": "Downloads any http(s) page and strips it to plain text (at most 8,000 characters). html_to_text is also used by the page preview.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "worker",
+   "change": "Page fetching stays on the worker but must obey the admin's network policy. Today it would fetch internal or cloud addresses. html_to_text moves to the shared library because the desktop preview needs it.",
+   "size": "S",
+   "evidence": "extract_page accepts any url starting http:// or https:// (219-221); pub(crate) fn html_to_text (236); used by preview.rs 550",
+   "confidence": "high"
+  },
+  {
+   "name": "tool create_document",
+   "file": "backend/src/agent_runner.rs; backend/src/api.rs",
+   "lines": "agent_runner.rs 3833-3852; api.rs 3082-3091",
+   "what_it_does": "Builds a document (xlsx, docx, pdf, pptx, csv and others) from a description the model writes, and saves it to the conversation's Artifacts panel. It never writes into the project.",
+   "assumes": [
+    "single_db_file"
+   ],
+   "destination": "worker",
+   "change": "Stays on the server side: the file goes to S3/MinIO and the record to PostgreSQL, with the owner set. It needs no device channel.",
+   "size": "S",
+   "evidence": "crate::documents::execute_create_document(&state.storage, &state.artifacts_dir, &conv, &call.args) (3839-3845)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool remember: keep_note / with_kept_notes",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "1581-1640, 3824-3829",
+   "what_it_does": "Keeps up to 12 short facts the model asks to remember, pinned at the end of the task message so they survive summarising.",
+   "assumes": [
+    "in_memory_state"
+   ],
+   "destination": "worker",
+   "change": "Stays on the worker. The notes must be saved with the run's checkpoint so a paused or moved run keeps them.",
+   "size": "S",
+   "evidence": "MAX_KEPT_NOTES 12 (1590); kept_notes: Vec<String> local to run_loop (2846)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool changes: changes_report",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "1553-1579",
+   "what_it_does": "Lists every file this run created, changed or deleted. To give each file's current line count and size, it re-reads every one of those files from disk.",
+   "assumes": [
+    "pc_files",
+    "in_memory_state"
+   ],
+   "destination": "worker",
+   "change": "The list of changed paths stays on the worker. The current sizes come from one batched 'stat these files' request to the desktop, not one read per file.",
+   "size": "S",
+   "evidence": "ws.resolve(path) ... std::fs::read_to_string(&full) for each changed path (1566-1570)",
+   "confidence": "high"
+  },
+  {
+   "name": "tool present_plan (plan runs)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "3642-3667",
+   "what_it_does": "Ends a read-only plan run by presenting the finished plan for the user to approve. If the tool argument is short, it uses the plan the model wrote as prose instead.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "worker",
+   "change": "Stays on the worker; approving the plan is an ordinary record and event.",
+   "size": "S",
+   "evidence": "if call.name == \"present_plan\" && spec.mode == AgentMode::Plan (3647); persist_final + tool_activity(\"final\") (3664-3665)",
+   "confidence": "high"
+  },
+  {
+   "name": "terminal::run with spawn / collect / kill_tree",
+   "file": "backend/src/terminal.rs",
+   "lines": "16-245",
+   "what_it_does": "Runs a command through cmd.exe or sh in a folder with no input. It collects the output as it arrives and kills the whole process tree on timeout (default 120 s, maximum 1,800 s). Output is kept to 50,000 characters, from the start and the end.",
+   "assumes": [
+    "pc_processes"
+   ],
+   "destination": "desktop_app",
+   "change": "Runs on the desktop. Add 'cancel this request' handling that kills the process tree at once; today a Stop cannot reach a running command. The admin's timeout cap is enforced on the desktop.",
+   "size": "M",
+   "evidence": "DEFAULT_TIMEOUT_SECS 120, MAX_TIMEOUT_SECS 1800 (23-24); kill_tree: taskkill /T /F /PID or kill -KILL -pgid (185-206); poll loop until deadline (224-236)",
+   "confidence": "high"
+  },
+  {
+   "name": "Background command registry (start_background, background_status, stop_background, stop_background_for, background_commands)",
+   "file": "backend/src/terminal.rs",
+   "lines": "247-406",
+   "what_it_does": "A program-wide list of commands left running, such as dev servers. It hands out numbered ids, keeps their recent output, returns the existing one if the same command is started again in the same folder, and stops all commands labelled with a folder when a run ends.",
+   "assumes": [
+    "in_memory_state",
+    "pc_processes"
+   ],
+   "destination": "desktop_app",
+   "change": "Lives in the desktop app; the processes are on the PC and survive a lost server connection. Label commands with the run id. The desktop stops them when the run ends, is stopped, or the app exits, and keeps them running while a disconnected run is paused, so the worker can re-attach by id. Refuse status or stop requests for other runs' ids.",
+   "size": "M",
+   "evidence": "static RUNNING: OnceLock<Mutex<HashMap<u32, Background>>> (269-272); static NEXT: AtomicU32 (275); stop_background_for(owner) filters by owner string (377-392); same-command reuse by command && owner (312-329)",
+   "confidence": "high"
+  },
+  {
+   "name": "terminal::denied and keeps_running",
+   "file": "backend/src/terminal.rs",
+   "lines": "38-104",
+   "what_it_does": "denied() refuses a few catastrophic command strings, for example formatting the drive or a forced git push. keeps_running() recognises dev servers and file watchers that never exit on their own.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "desktop_app",
+   "change": "Both checks run on the desktop as its own last line of defence; the worker can also use them to give early feedback. The deny list is matched on substrings and is easy to get around: it is a backstop, not a sandbox.",
+   "size": "S",
+   "evidence": "denied(): \"rm -rf /\", \"format c:\", \"git push --force\" ... lower.contains(pat) (40-63); keeps_running SERVERS list (70-104)",
+   "confidence": "high"
+  },
+  {
+   "name": "head_tail, format_result, format_background, shell_hint",
+   "file": "backend/src/terminal.rs",
+   "lines": "408-538",
+   "what_it_does": "Turns command results into text for the model, keeping the start and end of long output. On Windows it adds a hint when a Unix command such as ls or grep is missing.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Shared code. shell_hint must decide by the user's PC operating system, not the machine the code runs on.",
+   "size": "S",
+   "evidence": "shell_hint: if !cfg!(windows) { return None; } (431-433)",
+   "confidence": "high"
+  },
+  {
+   "name": "WorkspaceManager (resolve, without_own_name, sanitize_filename)",
+   "file": "backend/src/workspace.rs",
+   "lines": "8-201",
+   "what_it_does": "The project-folder boundary. It joins a requested path to the project root and rejects '..' escapes, absolute paths outside the root, and links or junctions that lead out. It checks the real disk to do this. It also drops a repeated folder name at the start of a path.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "The authoritative check moves to the desktop, which resolves every path against a folder from its own allowed-folders list, not against a root the server names. The worker keeps a text-only version for labels and keys only; today, on a machine without the folder, resolve quietly falls back to joining text. This is the starting point for desktop-side security.",
+   "size": "M",
+   "evidence": "resolve: lexical containment (80-96), canonicalize root (98-112), symlink_metadata/canonicalize ancestor walk (118-157); without_own_name checks self.root.join(first).exists() (63)",
+   "confidence": "high"
+  },
+  {
+   "name": "PermissionManager (decide, decide_call, decide_in, grant_session, describe)",
+   "file": "backend/src/permissions.rs",
+   "lines": "52-210",
+   "what_it_does": "Decides whether an action runs, needs the user's approval, or is refused, based on the current permission mode (ask, accept edits, plan or auto) and the action's risk. It also remembers 'allow for this session' grants per tool and folder. One copy is shared by the whole program.",
+   "assumes": [
+    "global_settings",
+    "in_memory_state",
+    "one_user"
+   ],
+   "destination": "shared_library",
+   "change": "Keep the decision rules as shared code used by both the worker (second line) and the desktop (first line, which asks the user). The mode becomes a per-user setting capped by the admin's maximum. Session grants become per user, device, folder and run, and are kept on the desktop. The unused trusted_dirs field could hold the desktop's allowed folders.",
+   "size": "M",
+   "evidence": "pub struct PermissionManager { autonomy, allow_network, trusted_dirs, grants: HashSet<(String,String)> } (59-65); AppState.permissions: Arc<RwLock<PermissionManager>> (api.rs 89); grants keyed (tool, workspace path) (108-116); trusted_dirs/allow_network never read elsewhere",
+   "confidence": "high"
+  },
+  {
+   "name": "AutonomyLevel, PERMISSION_MODES, autonomy_for_mode, RiskLevel",
+   "file": "backend/src/permissions.rs",
+   "lines": "10-50",
+   "what_it_does": "Names the four permission modes and the risk levels, and maps each mode to how much may run without asking.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "No change. The admin's 'maximum permission mode' setting is expressed in these names.",
+   "size": "S",
+   "evidence": "PERMISSION_MODES [\"ask\",\"accept_edits\",\"plan\",\"auto\"] (41); autonomy_for_mode (44-50)",
+   "confidence": "high"
+  },
+  {
+   "name": "repo_index::build and tree_text",
+   "file": "backend/src/repo_index.rs",
+   "lines": "119-186, 269-299",
+   "what_it_does": "Walks the project (up to 5,000 files) and reads each one up to 1 MB to collect function and class names, building a file and symbol map. tree_text turns it into a short folder tree.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Build it on the desktop and send the finished map; reading 5,000 files over the network is not workable. The server may cache the map per device, folder and version.",
+   "size": "S",
+   "evidence": "MAX_FILES 5000, MAX_FILE_BYTES 1_000_000 (10-11); std::fs::read_dir + read_to_string per file (127-169)",
+   "confidence": "high"
+  },
+  {
+   "name": "repo_index::search",
+   "file": "backend/src/repo_index.rs",
+   "lines": "188-267",
+   "what_it_does": "Ranks the files in an index against the words of a question, using path and symbol matches.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "No change; pure code over the index the desktop sends.",
+   "size": "S",
+   "evidence": "pub fn search(idx, query, limit) (189)",
+   "confidence": "high"
+  },
+  {
+   "name": "InspectionContext (manage_context chat tool)",
+   "file": "backend/src/inspection_context.rs",
+   "lines": "8-177",
+   "what_it_does": "Within one chat reply, labels each tool result as 'evidence', scores it against the user's words, and drops low-value results when the context is full. The model can keep or release items with the manage_context tool.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "No change; it lives only for the length of one reply.",
+   "size": "S",
+   "evidence": "pub struct InspectionContext (18); record/manage/compact (70-176); tool == \"manage_context\" (71)",
+   "confidence": "high"
+  },
+  {
+   "name": "StreamSplitter",
+   "file": "backend/src/stream_split.rs",
+   "lines": "1-557",
+   "what_it_does": "While a model reply streams in, it separates the text the user should see from the tool-call blocks the host will run, so the two never disagree.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "No change. The worker uses it for runs and the API server for chat. It depends on the agent_runner parsing helpers, which therefore also go to the shared library.",
+   "size": "S",
+   "evidence": "use crate::agent_runner::{fence_opener, known_tool, parse_action_with_raw} (25); pub struct StreamSplitter (60)",
+   "confidence": "high"
+  },
+  {
+   "name": "Slash command catalogue (commands::registry, find, parse, complete, help_text)",
+   "file": "backend/src/commands.rs",
+   "lines": "9-259",
+   "what_it_does": "The list of '/' shortcuts (/model, /search, /diff, /plan, /build, /stop and others), and the code that reads and auto-completes them.",
+   "assumes": [
+    "one_loaded_model"
+   ],
+   "destination": "shared_library",
+   "change": "Keep it. Reword /model to 'choose a model from your allowed list' instead of 'switch the active model', and make /stop stop this user's own reply or run. Hide PC-only commands such as /search, /find, /diff, /build and /run in the browser, where there is no desktop app.",
+   "size": "S",
+   "evidence": "\"model\" ... \"Show or switch the active model\" (53-59); \"stop\" ... \"Stop the active generation/agent\" (173-180)",
+   "confidence": "medium"
+  },
+  {
+   "name": "commands::find_files (/find)",
+   "file": "backend/src/commands.rs",
+   "lines": "261-316",
+   "what_it_does": "Walks the project folder for files whose names match a pattern such as '*.cpp', returning up to 50.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Runs on the desktop as one request. Its caller, the /find handler in api.rs (not in this job's scope), must send the request over the device channel.",
+   "size": "S",
+   "evidence": "std::fs::read_dir walk (273-316); called from api.rs 6409",
+   "confidence": "high"
+  },
+  {
+   "name": "Run event and state types (AgentState, AgentMode, AgentEvent, PendingTool, AgentContextUsage)",
+   "file": "backend/src/agent.rs",
+   "lines": "9-288",
+   "what_it_does": "Describes a run's stages (planning, running a tool, waiting for permission, compacting, finished), its mode, each activity event shown to the user, an action waiting for approval, and how full the model's context is.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Keep them as the shared event format. Add a run id, an increasing sequence number (so a screen reconnecting to any API server can resume where it left off), the owner, and the model or copy that served the step.",
+   "size": "M",
+   "evidence": "pub struct AgentEvent {state, message, iteration, kind, tool, args, output, diff, pending_tool, context_usage} (62-86); PendingTool (227-236)",
+   "confidence": "high"
+  },
+  {
+   "name": "Characters-per-token ratio (CHARS_PER_TOKEN_X100, chars_per_token, observe_prompt, reset_chars_per_token)",
+   "file": "backend/src/agent.rs",
+   "lines": "112-159",
+   "what_it_does": "One program-wide number, learned from the model server's reports, that estimates how many characters make one token for 'the loaded model'. It is reset when a model is loaded and used to size every prompt.",
+   "assumes": [
+    "one_loaded_model",
+    "in_memory_state"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Make it a per-model value. Several models will be served at once and every worker needs the same figure, so store it in the model's profile, which the pool manager or gateway updates, and do not keep it as one global number.",
+   "size": "S",
+   "evidence": "static CHARS_PER_TOKEN_X100: AtomicU32 (117); reset on model load (api.rs 2059); observe_prompt from llamaserver.rs 795",
+   "confidence": "high"
+  },
+  {
+   "name": "CancelToken and AgentLimits",
+   "file": "backend/src/agent.rs",
+   "lines": "290-318",
+   "what_it_does": "An in-memory on/off flag that the Stop button sets and the loop checks; plus a constant retry limit.",
+   "assumes": [
+    "in_memory_state"
+   ],
+   "destination": "worker",
+   "change": "Keep the flag inside the worker, but have it set by a listener for a durable 'stop requested' mark on the run row, which any API server can write, plus a notification.",
+   "size": "S",
+   "evidence": "pub struct CancelToken { flag: Arc<AtomicBool> } (303-318)",
+   "confidence": "high"
+  },
+  {
+   "name": "run_stub_plan",
+   "file": "backend/src/agent.rs",
+   "lines": "320-362",
+   "what_it_does": "An early placeholder loop that emits five fixed steps. Only tests use it.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "remove",
+   "change": "Delete it, together with its tests.",
+   "size": "S",
+   "evidence": "only referenced in agent.rs tests (424, 435)",
+   "confidence": "high"
+  },
+  {
+   "name": "ProgressGuard and LoopWatch",
+   "file": "backend/src/agent_progress.rs",
+   "lines": "11-310",
+   "what_it_does": "Per-run counters that stop a run going nowhere: steps in a row with nothing achieved, the same action repeated with the same result, long stretches of reading without changing anything, and one file rewritten over and over.",
+   "assumes": [
+    "in_memory_state"
+   ],
+   "destination": "worker",
+   "change": "Stays on the worker. Make these counters saveable with the run's checkpoint so a run that pauses (disconnect) or moves to another worker keeps them.",
+   "size": "S",
+   "evidence": "pub struct ProgressGuard {...} (19-24); pub struct LoopWatch { seen: HashSet<u64>, ... } (138-148); created in run_loop (2841, 2844)",
+   "confidence": "high"
+  },
+  {
+   "name": "Action parsing and transcript shaping helpers",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "18-1485 (except 1260-1350 noted), 4652-4939",
+   "what_it_does": "Pure text routines. They read a tool call out of a model reply in its various formats (fenced JSON, tagged, Gemma style, constrained JSON), rescue a malformed but complete call, and stitch a cut-off reply to its continuation. They also shorten large file text that has been written and verified, classify results as failed or successful, and label actions for the activity view.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "No behaviour change. Chat (API server) and runs (worker) both use them. The fixed hints that mention the 'workspace root' remain valid because paths stay relative to the project folder on the PC.",
+   "size": "S",
+   "evidence": "parse_tool_block (1158), salvage_action (630), locate_action (1132), condensed_reply (1277), release_call_text (1309), tool_output_failed (4716), command_exit_code (4704), tool_action_label (4903), CD_DOES_NOT_PERSIST (352)",
+   "confidence": "high"
+  },
+  {
+   "name": "Context compaction and pruning (CompactionPolicy, compact_run_transcript, complete_note, release_tool_results, repair_tool_pairs, prune_transcript)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "1409-1481, 1811-2083",
+   "what_it_does": "Keeps a run inside the model's context window. Between steps it asks the model for a progress note and replaces older turns with that note plus the host's record of actions. It drops the text of old tool results first and whole turns last, and never splits a tool call from its result. The trigger threshold comes from the single settings object.",
+   "assumes": [
+    "global_settings"
+   ],
+   "destination": "worker",
+   "change": "Stays on the worker. The threshold and on/off switch become admin defaults (with a possible user choice, if allowed). The note request must go to the same model copy as the run's steps so its cache is reused.",
+   "size": "M",
+   "evidence": "CompactionPolicy::from_settings(&state.settings.read().await.memory) (2832); client.chat_turns_on_run_prompt(&request, ...) rides the cached transcript (1860-1865)",
+   "confidence": "high"
+  },
+  {
+   "name": "Run system prompt (system_prompt, system_prompt_for, native_system_prompt, command_shell, long_form, SPECIALIST_TOOLS, checking_rules)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "2085-2313",
+   "what_it_does": "Writes the run's instructions: the operating system and command shell, the project root path, whether the folder is one project or holds several, the tool list with argument examples, and the working rules. Smaller context windows get fewer tools.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "worker",
+   "change": "Stays on the worker, but the operating system, shell and 'one project or several' answer must come from the desktop: today they describe the machine the backend runs on, which would be a Linux worker. The tool list should be filtered by the model's ability profile and the user's plugins.",
+   "size": "M",
+   "evidence": "command_shell matches std::env::consts::OS (2133-2138); os = std::env::consts::OS (2280, 2308); placement_rule calls looks_like_project_root(Path::new(workspace)) (2158-2164)",
+   "confidence": "high"
+  },
+  {
+   "name": "launches_window and opening_requested",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "2104-2127",
+   "what_it_does": "Recognises commands that would open a window on the user's desktop (start, explorer, open and similar), and whether the user's task actually asked for something to be opened.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "The worker uses it to refuse early; the desktop applies the same check itself before running a command.",
+   "size": "S",
+   "evidence": "launches_window first word matches start|explorer|xdg-open|open|start-process... (2107-2119); used at 3695-3699",
+   "confidence": "high"
+  },
+  {
+   "name": "looks_like_project_root and focused_workspace_root",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "2315-2403",
+   "what_it_does": "Decides whether the chosen folder is itself a project (it has .git, package.json, Cargo.toml or similar). If not, it picks the sub-project named most recently in the conversation and narrows the run to it. This takes dozens of file checks on disk.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "The desktop answers a single 'project roots in this folder' request: the list of child project folders, plus whether the root is a project. The worker does the matching against the conversation. Chat uses the same function (api.rs 2541).",
+   "size": "S",
+   "evidence": "path.join(marker).exists() for 10 markers, read_dir for *.sln (2328-2345); read_dir(&canonical_root) + canonicalize each child (2363-2385)",
+   "confidence": "high"
+  },
+  {
+   "name": "project_instructions (AGENTS.md / CLAUDE.md discovery)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "1642-1668, 2729",
+   "what_it_does": "Reads the first of AGENTS.md, CLAUDE.md, MUSE.md or PROJECT.md in the project and adds it, shortened, to the run's instructions, stating that it cannot change the rules or approvals.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "worker",
+   "change": "Its file reads become part of one batched 'run start' request to the desktop (along with project roots and notes). The worker keeps the wording and the length budget.",
+   "size": "S",
+   "evidence": "PROJECT_INSTRUCTION_FILES (1649); std::fs::read_to_string(root.join(name)) (1653); prompt.push_str(&project_instructions(&focused_root, ...)) (2729)",
+   "confidence": "high"
+  },
+  {
+   "name": "project_notes and earlier_work_block (HANDOFF.md / MEMORY.md, earlier-work record)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "1670-1809, 2803-2830",
+   "what_it_does": "For a follow-up in the same session, it reads the project's own HANDOFF.md and MEMORY.md and lists what earlier runs actually did (from the database's record of tool uses), so the new run does not start from nothing.",
+   "assumes": [
+    "pc_files",
+    "single_db_file"
+   ],
+   "destination": "worker",
+   "change": "The two note files come in the batched 'run start' request to the desktop. The earlier-work list is read from PostgreSQL, scoped to this conversation and owner. If the audit log becomes a separate append-only store, read the earlier-work list from per-run records instead.",
+   "size": "S",
+   "evidence": "std::fs::read_to_string(root.join(name)) for HANDOFF.md, MEMORY.md (1675-1676); storage.tool_executions_for(&spec.conversation_id, 150) (2809)",
+   "confidence": "high"
+  },
+  {
+   "name": "AgentSpec",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "2405-2416",
+   "what_it_does": "What a run was asked to do: the project folder path, the task, the mode, the conversation, whether web search is allowed, and whether the model may think out loud.",
+   "assumes": [
+    "pc_files",
+    "one_user"
+   ],
+   "destination": "worker",
+   "change": "Becomes the job record queued in PostgreSQL. Add the user, the device the run's PC actions go to, the allowed-folder id on that device (instead of a raw path), and the model chosen from the user's allowed list.",
+   "size": "S",
+   "evidence": "pub struct AgentSpec { workspace: PathBuf, task, mode, conversation_id, search_enabled, reasoning } (2406-2416)",
+   "confidence": "high"
+  },
+  {
+   "name": "LiveRun",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "2418-2496",
+   "what_it_does": "The live run object kept in memory. It holds the Stop flag, every event so far, a broadcast channel for watching screens, a channel to the database journal writer, the action waiting for approval, a one-shot channel that delivers the approval answer, and the task handle.",
+   "assumes": [
+    "in_memory_state"
+   ],
+   "destination": "worker",
+   "change": "Split it. Durable parts (state, events, pending approval, stop request) become PostgreSQL rows with notifications, published through Redis when there are two or more API servers. Only the task handle, the Stop flag and the model connection stay in the worker's memory.",
+   "size": "L",
+   "evidence": "events: Mutex<Vec<AgentEvent>>, broadcaster: broadcast::Sender, pending_tx: Mutex<Option<oneshot::Sender<ApprovalDecision>>>, handle: Mutex<Option<JoinHandle>> (2424-2437); emit() sends to journal, Vec and broadcast (2475-2479)",
+   "confidence": "high"
+  },
+  {
+   "name": "AgentRegistry and RunSummary",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "2498-2570",
+   "what_it_does": "The in-memory list of runs that the stop, approve, status and event endpoints look up. It keeps only the latest 20 and lists everyone's runs to anyone.",
+   "assumes": [
+    "in_memory_state",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Replace it with a runs table in PostgreSQL (owner, state, worker, device, timestamps) queried by API servers, scoped to the caller or their team. Remove the 20-run cap, which today can drop a run that is still working.",
+   "size": "M",
+   "evidence": "runs: HashMap<String, Arc<LiveRun>>, order: VecDeque (2513-2516); if self.order.len() > 20 { remove oldest } (2523-2531); summaries() returns all (2551-2569)",
+   "confidence": "high"
+  },
+  {
+   "name": "run_loop (the agent loop)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "2578-4119",
+   "what_it_does": "The whole coding agent in one ~1,540-line function. It loads the conversation, memory and attachments from the database, focuses on the right project folder, writes the instructions, and then repeats: summarise if needed, ask the single loaded model for the next step, read the action, check the mode and the permission, wait for approval, run the tool, record the result, and decide whether to stop. Before finishing it runs the completion check. All run state is kept in local variables.",
+   "assumes": [
+    "one_loaded_model",
+    "pc_files",
+    "in_memory_state",
+    "single_db_file",
+    "global_settings",
+    "one_user"
+   ],
+   "destination": "worker",
+   "change": "Runs on a worker as a queued job. Model calls go through the model gateway with routing pinned to the run's model copy. PC tools and host-side PC reads go through the device-channel client. The permission check uses the user's mode capped by the admin maximum. The database becomes PostgreSQL. Save a checkpoint (transcript plus counters) after each step so a disconnect can pause the run and it can resume, even on another worker. Stop the run (or pause it) if the device is not connected when it starts.",
+   "size": "L",
+   "evidence": "state.llama.write().await ... llama.running (2619-2637, 3020-3029, 3126, 3202-3205); state.storage.lock().await (2585-2590, 2739-2762, 2806-2814); state.permissions.read().await.decide_call(..., Some(&ws_key)) (3751-3756); locals transcript/work_log/inspected/kept_notes/changed_files/verification (2733-2885)",
+   "confidence": "high"
+  },
+  {
+   "name": "review_completion, parse_completion_review, tool_list_tokens",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "4121-4218",
+   "what_it_does": "When the model says it is finished, asks the same model (on the same transcript, to reuse its cache) to act as a strict checker: is everything requested done and verified? It reads the answer as COMPLETE or CONTINUE with a reason.",
+   "assumes": [
+    "one_loaded_model"
+   ],
+   "destination": "worker",
+   "change": "Stays on the worker. The request must go to the same model copy as the run's steps (pinned routing by run), or every check re-reads the whole transcript.",
+   "size": "S",
+   "evidence": "comment: 'A separate prompt would evict the transcript from the single slot' (4127-4132); client.chat_turns_on_run_prompt(&turns, 220, cfg, tools) (4185)",
+   "confidence": "high"
+  },
+  {
+   "name": "VerificationState and its disk checks (created_folders, page_reference_problems, listing_target, git_overview_command, verification_command, read_only_command)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "4220-4650",
+   "what_it_does": "Tracks what the run changed but has not yet looked at. Before accepting 'done', it checks on disk that new folders are not empty, that every local file a written web page links to exists next to the page, and that deleted files are gone. It also recognises test, build and read-only commands from their text.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "worker",
+   "change": "The bookkeeping stays on the worker using text-only paths. The disk checks become one batched 'completion check' request to the desktop. It is sent once per completion claim: today the scan is repeated each time needs_evidence() is called.",
+   "size": "M",
+   "evidence": "empty_created_dirs: std::fs::read_dir(path) (4346); broken_page_references: std::fs::read_to_string(page) (4360) + folder.join(target).exists() (4603, 4608); delete: path.exists() (4510); ws.resolve in observe/created_folders/listing_target (4439, 4479, 4554, 4639); needs_evidence() called at 2936, 3497, 3509",
+   "confidence": "high"
+  },
+  {
+   "name": "await_approval",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "4727-4770",
+   "what_it_does": "Pauses the run until the user clicks Allow or Deny. It stores the waiting action, emits a 'needs approval' event, and re-checks whether a mode change to Auto should approve it at once (taking the global settings lock). It then waits on an in-memory one-shot channel.",
+   "assumes": [
+    "in_memory_state",
+    "global_settings",
+    "one_user"
+   ],
+   "destination": "worker",
+   "change": "For PC actions, the decided design has the desktop app ask the user. The worker sends the action with the mode decision, and the desktop's prompt answer comes back with the result and is audited. For server actions (web search), store a pending-approval row. Any API server writes the answer, and the worker is woken by a notification. The 'switch to Auto releases waiting actions' rule must cover only this user's runs.",
+   "size": "L",
+   "evidence": "oneshot::channel() (4735); *run.pending_tx.lock() = Some(tx) (4746); state.settings_update.lock().await; crate::api::resume_auto_approved_runs(state) (4764-4765); rx.await (4767)",
+   "confidence": "high"
+  },
+  {
+   "name": "execute_local_tool",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "4772-4825",
+   "what_it_does": "Runs a project tool on this machine in a background thread, marking it approved whatever the gate said. It turns errors into model-readable messages and records the action in the database.",
+   "assumes": [
+    "pc_files",
+    "pc_processes",
+    "single_db_file"
+   ],
+   "destination": "worker",
+   "change": "Becomes the worker's device-channel client. It sends {run, request id, tool, arguments, mode decision, limits} to the user's desktop: through the API server holding that desktop's WebSocket, via Redis when there are two or more API servers. It waits with a timeout longer than the command timeout and can send a cancel for the request. It pauses the run if the device disconnects. One round trip per tool is fine: model steps take seconds.",
+   "size": "L",
+   "evidence": "tokio::task::spawn_blocking(move || crate::tools::execute(&blocking_req, &blocking_ws, true)) (4789-4791); audit_tool(state, run, call, &output) (4823)",
+   "confidence": "high"
+  },
+  {
+   "name": "mutation_snapshot, mutation_diff, unified_hunks",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "4941-5085, 3805, 4027",
+   "what_it_does": "Before each file change it reads the file (up to 64 KB); afterwards it reads it again and builds a diff for the activity view.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "Done separately, these would be two extra network round trips per edit. Have the desktop take the before and after copies inside the same tool request and return the diff with the result. unified_hunks is pure and goes to the shared library.",
+   "size": "S",
+   "evidence": "let before = mutation_snapshot(&ws, &call) (3805); mutation_diff(&ws, &call, before) (4027); std::fs::metadata / read_to_string (4949-4955)",
+   "confidence": "high"
+  },
+  {
+   "name": "audit_tool",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "5087-5103",
+   "what_it_does": "Saves each tool use (conversation, tool, arguments and result, each cut to 4,000 characters) to the database, always marked 'approved' whether the user approved it or the mode allowed it.",
+   "assumes": [
+    "single_db_file",
+    "one_user"
+   ],
+   "destination": "worker",
+   "change": "Write to the tamper-evident audit log with the user, device, run, how it was allowed (mode, session grant or explicit approval, and by whom), and the guard decisions. Keep a separate per-run action record for the 'earlier work' briefing.",
+   "size": "M",
+   "evidence": "record_tool_execution(... approved: true ...) (5094-5102)",
+   "confidence": "high"
+  },
+  {
+   "name": "persist_final, cancelled_message, model_server_stopped_message",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "5105-5133",
+   "what_it_does": "Writes the run's last message into the conversation. It explains a stop (by the user, or because Companion closed), or says the model server stopped, pointing to its log file and telling the user to load the model again.",
+   "assumes": [
+    "single_db_file",
+    "one_loaded_model"
+   ],
+   "destination": "worker",
+   "change": "Write to PostgreSQL. Reword the model-server message: users cannot load models or read server log files, so say the model copy failed and that the run can be resumed. Admins see the details in the pool manager.",
+   "size": "S",
+   "evidence": "crate::logfile::model_server() path (5116-5118); 'load the model again' (5120); st.update_message_content (5132)",
+   "confidence": "high"
+  },
+  {
+   "name": "cached_repo_index and AppState.repo_index",
+   "file": "backend/src/api.rs",
+   "lines": "2897-2925, 103-106",
+   "what_it_does": "Builds the project's file and symbol map and caches it in memory per project. The cache is refreshed only when the top folder's modified time changes.",
+   "assumes": [
+    "pc_files",
+    "in_memory_state"
+   ],
+   "destination": "desktop_app",
+   "change": "Build the map on the desktop and let the desktop decide when it is stale, since it can watch the folder. The server may cache the result per device, folder and version in PostgreSQL or Redis, not in one server's memory.",
+   "size": "M",
+   "evidence": "std::fs::metadata(path).modified() (2903-2908); s.repo_index.read().await.get(ws_id) (2909); spawn_blocking(repo_index::build) (2917)",
+   "confidence": "high"
+  },
+  {
+   "name": "retrieve_knowledge",
+   "file": "backend/src/api.rs",
+   "lines": "2927-2966",
+   "what_it_does": "Scores every saved text chunk of a project by how often the question's words appear in it and returns the top few, to add to a chat prompt. All of the project's chunks are loaded into memory first.",
+   "assumes": [
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Replace with a pgvector (plus keyword) search in PostgreSQL, scoped to what the user may see.",
+   "size": "M",
+   "evidence": "term overlap scoring over chunks (2933-2965); chunks = st.knowledge_for(ws_id) (api.rs 3768)",
+   "confidence": "high"
+  },
+  {
+   "name": "run_chat_tool_round",
+   "file": "backend/src/api.rs",
+   "lines": "2968-3180",
+   "what_it_does": "In a chat reply (not an agent run), runs one read-only tool the model asked for (list, read, search, outline, system info, process list), or creates a document. It records the use in the database and feeds the result back to the model. Writes and commands are refused in chat.",
+   "assumes": [
+    "pc_files",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Chat replies stream from API servers, so read-only project tools here also need the device channel, or code-mode chat must be run on a worker. The decided design covers only the agent. Without a desktop (browser use), project tools are not offered.",
+   "size": "L",
+   "evidence": "WorkspaceManager::new(ws_path) + spawn_blocking(crate::tools::execute(&req, &ws, false)) (3093-3108); record_tool_execution(tool: format!(\"chat:{}\")) (3153-3162)",
+   "confidence": "high"
+  },
+  {
+   "name": "chat_artifact_count",
+   "file": "backend/src/api.rs",
+   "lines": "3182-3195",
+   "what_it_does": "Counts a conversation's saved artifacts, to tell whether a chat reply produced the document the user asked for.",
+   "assumes": [
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Query PostgreSQL, scoped to the owner.",
+   "size": "S",
+   "evidence": "state.storage.lock().await.artifacts_for(conv_id) (3188-3194)",
+   "confidence": "high"
+  },
+  {
+   "name": "emit_chat_activity",
+   "file": "backend/src/api.rs",
+   "lines": "3197-3214",
+   "what_it_does": "Saves a chat's activity event in the database and sends it to the open reply stream.",
+   "assumes": [
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Save it to PostgreSQL; the stream is the reply's own SSE connection, so no other change.",
+   "size": "S",
+   "evidence": "record_message_activity(message_id, &event) (3203-3207); tx.send(Event::default().event(\"activity\")) (3211-3213)",
+   "confidence": "high"
+  },
+  {
+   "name": "list_tools (GET /api/tools)",
+   "file": "backend/src/api.rs",
+   "lines": "5276-5278",
+   "what_it_does": "Returns the full tool catalogue.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "api_server",
+   "change": "Return only the tools and plugins this user may use with the chosen model, marking which need the desktop app.",
+   "size": "S",
+   "evidence": "Json(tools::registry()) (5277); route /api/tools (487)",
+   "confidence": "high"
+  },
+  {
+   "name": "execute_tool (POST /api/tools/execute) and ExecuteToolReq",
+   "file": "backend/src/api.rs",
+   "lines": "5280-5489",
+   "what_it_does": "Runs any tool directly in any folder path given in the request, after the global permission check, with approval taken from the request itself. Commands, writes and deletes all run here, on the server's own request thread.",
+   "assumes": [
+    "pc_files",
+    "pc_processes",
+    "global_settings",
+    "loopback_only"
+   ],
+   "destination": "remove",
+   "change": "Remove it from the server. It is remote code execution on whatever machine runs the API. If manual tool use from the UI is still wanted, it becomes a local call inside the desktop app against its allowed folders, audited through the server.",
+   "size": "M",
+   "evidence": "let ws_root = PathBuf::from(&req.workspace) (5312) with no check that it is a registered project; RequireApproval if req.approved_once => 'once' (5337); tools::execute(&tool_req, &ws, true) (5469); safe today only because main.rs binds loopback ('the API has no auth', main.rs 140-142)",
+   "confidence": "high"
+  },
+  {
+   "name": "audit (helper for execute_tool)",
+   "file": "backend/src/api.rs",
+   "lines": "5491-5507",
+   "what_it_does": "Saves a tool attempt, its result and whether it was allowed.",
+   "assumes": [
+    "single_db_file",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Folded into the shared audit-log writer (user, device, decision, approver, tamper-evident chain).",
+   "size": "S",
+   "evidence": "record_tool_execution(... approved: ok ...) (5498-5506)",
+   "confidence": "high"
+  },
+  {
+   "name": "list_tool_executions (GET /api/tools/executions)",
+   "file": "backend/src/api.rs",
+   "lines": "5509-5529",
+   "what_it_does": "Returns the recorded tool uses of any conversation by its id, with no check of who is asking.",
+   "assumes": [
+    "single_db_file",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Read from PostgreSQL, allowed only for the conversation's owner (and auditors or admins through the admin API).",
+   "size": "S",
+   "evidence": "st.tool_executions_for(&q.conversation_id, q.limit.clamp(1,200)) (5526)",
+   "confidence": "high"
+  },
+  {
+   "name": "message_intent, answering_intent, latest_reply_asks_in, latest_reply_asks",
+   "file": "backend/src/api.rs",
+   "lines": "5549-5653",
+   "what_it_does": "Recognises 'thanks', 'hi' and 'go ahead' style messages, and whether the last reply asked the user a question, so a short 'yes' is treated as a request rather than an acknowledgement.",
+   "assumes": [
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Read history from PostgreSQL; otherwise unchanged.",
+   "size": "S",
+   "evidence": "messages_for(conversation_id) (5638); whole-message match table (5567-5618)",
+   "confidence": "high"
+  },
+  {
+   "name": "conversational_reply",
+   "file": "backend/src/api.rs",
+   "lines": "5655-5685",
+   "what_it_does": "Saves a canned user and assistant exchange (for example 'Got it') without starting a run.",
+   "assumes": [
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Write to PostgreSQL with owner checks.",
+   "size": "S",
+   "evidence": "st.add_message for user and assistant (5670-5682)",
+   "confidence": "high"
+  },
+  {
+   "name": "resolve_continuation",
+   "file": "backend/src/api.rs",
+   "lines": "5687-5726",
+   "what_it_does": "For 'continue', finds the session's last unfinished task or proposed plan. It checks on disk that the project folder is the same one, and looks in the in-memory run list for whether that run is still going or waiting for approval.",
+   "assumes": [
+    "pc_files",
+    "in_memory_state",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Read the task and the run state from PostgreSQL. Compare folders by the device's allowed-folder id instead of resolving paths on disk.",
+   "size": "S",
+   "evidence": "std::fs::canonicalize(workspace) vs context.workspace (5708-5710); s.agents.read().await.get(&context.run_id) (5713)",
+   "confidence": "high"
+  },
+  {
+   "name": "run_agent (POST /api/agent/run)",
+   "file": "backend/src/api.rs",
+   "lines": "5735-5873",
+   "what_it_does": "Starts an agent run. It answers greetings and thanks directly, checks the folder exists on this machine and matches the session's linked project, saves the user's message, records which model was used, and launches the run.",
+   "assumes": [
+    "pc_files",
+    "one_loaded_model",
+    "single_db_file",
+    "global_settings",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Authenticate the user and check permissions. Check the session's project is an allowed folder on the user's connected device (the desktop confirms it), not with is_dir on the server. Resolve settings (company, then group, then user) for reasoning and mode. Take the model from the user's choice within the allowed list. Queue the job in PostgreSQL. Without a connected desktop, refuse (or offer server-only tools).",
+   "size": "M",
+   "evidence": "ws_root.is_dir() (5774); std::fs::canonicalize(&linked.path) vs &ws_root (5822-5836); s.models.read().await.current() (5815); s.settings.read().await.reasoning.default_on (5859)",
+   "confidence": "high"
+  },
+  {
+   "name": "spawn_agent_run",
+   "file": "backend/src/api.rs",
+   "lines": "5875-5996",
+   "what_it_does": "Creates the live run. It saves a 'Work is starting' message and the task context, starts a background writer that copies each event into the database and marks the task finished, starts the loop as a task in this process, counts active runs, and registers the run in memory. It refuses while the model is being swapped.",
+   "assumes": [
+    "in_memory_state",
+    "single_db_file",
+    "one_loaded_model",
+    "pc_files"
+   ],
+   "destination": "api_server",
+   "change": "The API server only inserts the run row, the job and the starting message. A worker claims the job (row locking in PostgreSQL), runs run_loop, writes events with sequence numbers, publishes them live, and updates the task context. Model-swap locking is replaced by the gateway. The active-run counter becomes a query or a metric.",
+   "size": "L",
+   "evidence": "s.runtime_update.try_lock() (5886); tokio::spawn journal writer record_message_activity (5942-5965); bg_counter.fetch_add (5969); tokio::spawn(run_loop) (5977-5991); s.agents.write().await.insert (5993); canonicalize(&run.spec.workspace) (5929)",
+   "confidence": "high"
+  },
+  {
+   "name": "agent_resume (POST /api/agent/runs/:id/resume)",
+   "file": "backend/src/api.rs",
+   "lines": "5998-6038",
+   "what_it_does": "Delivers Allow or Deny (and 'for the session') to a run waiting for approval, through its in-memory one-shot channel. Anyone can answer any run.",
+   "assumes": [
+    "in_memory_state",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Check that the caller owns the run. Write the decision to the pending-approval row and notify the worker that owns the run. For PC actions the decision is normally made in the desktop app; the endpoint then serves server-side approvals and the browser-only case.",
+   "size": "M",
+   "evidence": "s.agents.read().await.get(&id); run.pending_tx.lock().take(); tx.send(decision) (6011-6028)",
+   "confidence": "high"
+  },
+  {
+   "name": "agent_stop (POST /api/agent/runs/:id/stop)",
+   "file": "backend/src/api.rs",
+   "lines": "6040-6080",
+   "what_it_does": "Sets the run's stop flag, aborts its task, wakes it if it is waiting for approval, and emits 'Stopped by you'. Aborting does not end a command that is already running.",
+   "assumes": [
+    "in_memory_state",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Check the owner, set 'stop requested' on the run row, and notify the owning worker. The worker cancels its model request and sends 'cancel request and stop this run's background commands' to the desktop, which kills the process trees. If the worker is gone, the desktop must still stop when told by the API server it is connected to.",
+   "size": "M",
+   "evidence": "run.cancel.cancel(); h.abort() (6057-6060); pending_tx Denied (6062-6064); the running command is in spawn_blocking (agent_runner.rs 4789), which abort cannot stop",
+   "confidence": "high"
+  },
+  {
+   "name": "agent_status (GET /api/agent/runs/:id)",
+   "file": "backend/src/api.rs",
+   "lines": "6082-6100",
+   "what_it_does": "Returns a run's state, step count, waiting action and number of events, from memory.",
+   "assumes": [
+    "in_memory_state",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Read from the runs table, owner-scoped.",
+   "size": "S",
+   "evidence": "s.agents.read().await.get(&id); r.events.lock() (6086-6096)",
+   "confidence": "high"
+  },
+  {
+   "name": "agent_runs (GET /api/agent/runs)",
+   "file": "backend/src/api.rs",
+   "lines": "6102-6104",
+   "what_it_does": "Lists the last 20 runs of everyone.",
+   "assumes": [
+    "in_memory_state",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Query the runs table for the caller's runs; team or platform admins and auditors get a separate admin view.",
+   "size": "S",
+   "evidence": "Json(s.agents.read().await.summaries()) (6103)",
+   "confidence": "high"
+  },
+  {
+   "name": "agent_events + async_stream_like (GET /api/agent/runs/:id/events, SSE)",
+   "file": "backend/src/api.rs",
+   "lines": "6106-6178",
+   "what_it_does": "Streams a run's events to the screen: it replays everything kept in memory, then follows the live broadcast until the run ends. Streamed partial text is dropped if the screen is slow.",
+   "assumes": [
+    "in_memory_state",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Any API server can serve it. Replay from the PostgreSQL event table after the client's last sequence number (Last-Event-ID), then follow live events from Redis, or in-process with a single server. Partial text is live-only. Check the owner.",
+   "size": "M",
+   "evidence": "r.events.lock().clone(), r.broadcaster.subscribe() (6113-6120); RecvError::Lagged => continue (6172)",
+   "confidence": "high"
+  },
+  {
+   "name": "pick_folder (OS folder chooser)",
+   "file": "backend/src/api.rs",
+   "lines": "7197-7210",
+   "what_it_does": "Opens the operating system's folder picker window on the machine the backend runs on and returns the chosen path.",
+   "assumes": [
+    "pc_windows"
+   ],
+   "destination": "desktop_app",
+   "change": "Becomes a Tauri dialog in the desktop app. The chosen folder goes into the desktop's own allowed-folders list, and the server receives only a folder id and display name.",
+   "size": "S",
+   "evidence": "rfd::FileDialog::new().pick_folder() (7200-7204)",
+   "confidence": "high"
+  },
+  {
+   "name": "list_workspaces (GET /api/workspaces)",
+   "file": "backend/src/api.rs",
+   "lines": "7212-7221",
+   "what_it_does": "Lists every saved project.",
+   "assumes": [
+    "single_db_file",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "List only the caller's projects (each tied to a user and device), from PostgreSQL.",
+   "size": "S",
+   "evidence": "storage.list_workspaces() (7218)",
+   "confidence": "high"
+  },
+  {
+   "name": "create_workspace + walk_count",
+   "file": "backend/src/api.rs",
+   "lines": "7223-7308",
+   "what_it_does": "Registers a project folder. It optionally creates it on disk, detects its build system, and counts up to 2,000 files before saving the record.",
+   "assumes": [
+    "pc_files",
+    "single_db_file",
+    "one_user"
+   ],
+   "destination": "desktop_app",
+   "change": "The desktop creates the folder, detects the build system and counts files, and adds the folder to its allowed list. The API server stores only the project record (owner, device, folder id, name, summary).",
+   "size": "M",
+   "evidence": "std::fs::create_dir_all(&pb) (7246); detect_build_system(&pb); walk_count(&pb, 2000) (7256-7257); create_workspace(&w) (7272)",
+   "confidence": "high"
+  },
+  {
+   "name": "get_workspace (GET /api/workspaces/:id)",
+   "file": "backend/src/api.rs",
+   "lines": "7310-7319",
+   "what_it_does": "Returns one project record.",
+   "assumes": [
+    "single_db_file",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Owner check; PostgreSQL.",
+   "size": "S",
+   "evidence": "storage.get_workspace(&id) (7314)",
+   "confidence": "high"
+  },
+  {
+   "name": "delete_workspace (DELETE /api/workspaces/:id)",
+   "file": "backend/src/api.rs",
+   "lines": "7321-7380",
+   "what_it_does": "Removes a project record (never the folder) and optionally its chats. It is refused while a run is working in it, which it checks against the in-memory run list.",
+   "assumes": [
+    "in_memory_state",
+    "single_db_file",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Check active runs in the runs table, check the owner, and tell the desktop to drop the folder from its allowed list if the user wishes.",
+   "size": "S",
+   "evidence": "s.agents.read().await.summaries() filtered by run.state.is_active() (7347-7355)",
+   "confidence": "high"
+  },
+  {
+   "name": "workspace_instructions (GET /api/workspaces/:id/instructions)",
+   "file": "backend/src/api.rs",
+   "lines": "7382-7416",
+   "what_it_does": "Reads AGENTS.md, CLAUDE.md, MUSE.md, PROJECT.md and README.md from the project folder for display.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "One 'read these files' device request: from the desktop app's own screen, or relayed by the API server. Unavailable in the browser without a desktop.",
+   "size": "S",
+   "evidence": "std::fs::read_to_string(root.join(name)) for 5 candidates (7401-7412)",
+   "confidence": "high"
+  },
+  {
+   "name": "workspace_diff (GET /api/workspaces/:id/diff) and SAFE_GIT_* commands",
+   "file": "backend/src/api.rs",
+   "lines": "7418-7448, 5728-5733",
+   "what_it_does": "Runs git diff (summary and full, capped at 100,000 characters) in the project folder, with git's external-command hooks switched off.",
+   "assumes": [
+    "pc_processes",
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "A single device request on the desktop that runs both git commands. Keep the safe flags.",
+   "size": "S",
+   "evidence": "crate::terminal::run(SAFE_GIT_DIFF_STAT, &root, 30); run(SAFE_GIT_DIFF_FULL, ...) (7435-7440); SAFE_GIT_* with core.fsmonitor=false, --no-ext-diff (5731-5733)",
+   "confidence": "high"
+  },
+  {
+   "name": "load_workspace and resolve_workspace_root",
+   "file": "backend/src/api.rs",
+   "lines": "7450-7473",
+   "what_it_does": "Loads a project record and checks its folder exists on this machine.",
+   "assumes": [
+    "pc_files",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Load the record from PostgreSQL with an owner check. The 'folder exists' check becomes a device request, or is left to the desktop when it acts.",
+   "size": "S",
+   "evidence": "PathBuf::from(&ws.path).is_dir() (7457-7463)",
+   "confidence": "high"
+  },
+  {
+   "name": "workspace_index (GET /api/workspaces/:id/index)",
+   "file": "backend/src/api.rs",
+   "lines": "7475-7514",
+   "what_it_does": "Returns the project's file and symbol map, or the files best matching a query, rebuilding it on request.",
+   "assumes": [
+    "pc_files",
+    "in_memory_state"
+   ],
+   "destination": "desktop_app",
+   "change": "The desktop builds the map; the server or the desktop answers searches on it.",
+   "size": "S",
+   "evidence": "cached_repo_index(&s, &id, &root) (7487); repo_index::search (7490)",
+   "confidence": "high"
+  },
+  {
+   "name": "ingest_knowledge + chunk_text (POST /api/workspaces/:id/knowledge)",
+   "file": "backend/src/api.rs",
+   "lines": "7516-7651",
+   "what_it_does": "Reads up to 50 text files from the project (2 MB each at most), cuts them into overlapping 800-character pieces and saves them for keyword lookup.",
+   "assumes": [
+    "pc_files",
+    "single_db_file"
+   ],
+   "destination": "worker",
+   "change": "The desktop reads the chosen files and uploads them in one batch to object storage. A worker job chunks them, makes embeddings and stores them in pgvector, owned by the user and project. The file limits come from admin settings.",
+   "size": "M",
+   "evidence": "WorkspaceManager::resolve (7562); std::fs::read_dir walk, files.len() >= 50 (7570-7602); std::fs::read_to_string(f) (7621); add_knowledge_chunk (7636)",
+   "confidence": "high"
+  },
+  {
+   "name": "list_knowledge (GET /api/workspaces/:id/knowledge)",
+   "file": "backend/src/api.rs",
+   "lines": "7653-7667",
+   "what_it_does": "Lists the indexed files of a project and how many pieces each has.",
+   "assumes": [
+    "single_db_file",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "PostgreSQL query with an owner check.",
+   "size": "S",
+   "evidence": "st.knowledge_paths(&id) (7660)",
+   "confidence": "high"
+  },
+  {
+   "name": "clear_knowledge (POST /api/workspaces/:id/knowledge/clear)",
+   "file": "backend/src/api.rs",
+   "lines": "7669-7690",
+   "what_it_does": "Deletes the indexed pieces of one file, or of the whole project.",
+   "assumes": [
+    "single_db_file",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "PostgreSQL delete with an owner check, and an audit record.",
+   "size": "S",
+   "evidence": "st.clear_knowledge_path(&id, ...) (7682, 7686)",
+   "confidence": "high"
+  },
+  {
+   "name": "workspace_git (GET /api/workspaces/:id/git)",
+   "file": "backend/src/api.rs",
+   "lines": "7730-7762",
+   "what_it_does": "Runs git branch, git status and git log in the project folder for the Git panel.",
+   "assumes": [
+    "pc_processes",
+    "pc_files"
+   ],
+   "destination": "desktop_app",
+   "change": "A single device request on the desktop that runs the three git commands.",
+   "size": "S",
+   "evidence": "root.join(\".git\").exists() (7739); crate::terminal::run(cmd, &root, 15) x3 (7745-7760)",
+   "confidence": "high"
+  },
+  {
+   "name": "list_plugins + plugins_dir (GET /api/plugins)",
+   "file": "backend/src/api.rs",
+   "lines": "7764-7818",
+   "what_it_does": "Reads plugin.json files from a plugins folder next to the install (or the current folder) and lists them. A 'plugin' here only re-lists built-in tool names.",
+   "assumes": [
+    "pc_files",
+    "global_settings"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Replace with the new plugin system: MCP servers plus description files, managed by admins, with per-group access and per-user switches stored in PostgreSQL. The user-facing list is filtered by access and by the model's ability profile.",
+   "size": "M",
+   "evidence": "s.install_root.join(\"plugins\") then \"../plugins\" then \"plugins\" (7766-7778); cross-check declared tools against tools::registry() (7797-7805)",
+   "confidence": "high"
+  },
+  {
+   "name": "run_plugin_command (POST /api/plugins/:id/run)",
+   "file": "backend/src/api.rs",
+   "lines": "7820-7898",
+   "what_it_does": "Runs a built-in tool named in a plugin's manifest, in a saved project or else the system temporary folder. Approval is whatever the request says; the permission system is never consulted.",
+   "assumes": [
+    "pc_files",
+    "pc_processes",
+    "single_db_file"
+   ],
+   "destination": "remove",
+   "change": "Remove it. Plugin (MCP) tools run on the worker through the agent loop's normal permission and audit path.",
+   "size": "S",
+   "evidence": "ws_root = std::env::temp_dir() when no workspace_id (7860-7861); tools::execute(&tool_req, &ws, req.approved) with no PermissionManager call (7872)",
+   "confidence": "high"
+  }
+ ],
+ "surprises": [
+  {
+   "title": "The agent loop runs every tool with approval forced on",
+   "why_it_matters": "The tool code's own 'needs approval' check is a dead letter in agent runs. The only real gate is the loop's permission decision. If the desktop runner copies this pattern, a buggy or compromised server could run any write or command just by sending it. The desktop must make and enforce its own decision.",
+   "evidence": "execute_local_tool: tools::execute(&blocking_req, &blocking_ws, true) even though `approved` is a parameter; require_approved returns Ok if approved || req.approved (tools.rs 311-319)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "4772-4791"
+  },
+  {
+   "title": "POST /api/tools/execute runs any tool in any folder path it is sent",
+   "why_it_matters": "The folder comes straight from the request body and is not checked against the saved projects. In Auto mode nothing asks first. It is safe today only because the API binds to loopback with no sign-in; on a server it is remote code execution. It must be deleted before any network deployment.",
+   "evidence": "let ws_root = PathBuf::from(&req.workspace) (5312); tools::execute(&tool_req, &ws, true) (5469); main.rs warns 'the API has no auth' (main.rs 140-142)",
+   "file": "backend/src/api.rs",
+   "lines": "5300-5489"
+  },
+  {
+   "title": "Plugin run endpoint skips the permission system entirely, and today's 'plugins' are not MCP",
+   "why_it_matters": "The caller sets 'approved' itself, so commands and deletes run with no check, defaulting to the system temp folder. Today's plugin is just a manifest listing built-in tools; the target plugin system (MCP servers, per-group access) is new work with nothing to migrate.",
+   "evidence": "tools::execute(&tool_req, &ws, req.approved) with no PermissionManager call (7872); ws_root = std::env::temp_dir() (7860-7861); list_plugins only cross-checks names against tools::registry() (7797-7805)",
+   "file": "backend/src/api.rs",
+   "lines": "7820-7898"
+  },
+  {
+   "title": "Stop does not stop a command that is already running",
+   "why_it_matters": "Stop aborts the run's async task, but the command runs in a blocking thread that cannot be aborted. It keeps going until its own timeout, which can be up to 30 minutes. The device protocol needs an explicit 'cancel request X' message that kills the process tree on the PC, and the desktop must also obey a stop when the worker is gone.",
+   "evidence": "agent_stop: run.cancel.cancel(); h.abort() (api.rs 6057-6060); command runs in tokio::task::spawn_blocking (agent_runner.rs 4789); MAX_TIMEOUT_SECS 1800 (terminal.rs 24)",
+   "file": "backend/src/api.rs",
+   "lines": "6040-6080"
+  },
+  {
+   "title": "Background commands belong to a folder path, not a run, and any id can be read or stopped",
+   "why_it_matters": "Two runs (or two users' runs on a shared machine) in the same folder stop each other's dev servers when either ends. Any run can read or stop any background id. On the desktop, label each command with its run id and refuse other runs' ids. Decide what survives a disconnect: keep the processes while the run is paused, and stop them when the run ends or the app quits.",
+   "evidence": "owner = ws.root().to_string_lossy() (tools.rs 793); StopBackground(ws_key) stops all for that path when the run ends (agent_runner.rs 2598-2610); background_status/stop_background take only an id (terminal.rs 360-373)",
+   "file": "backend/src/terminal.rs",
+   "lines": "247-406"
+  },
+  {
+   "title": "The model is told about the server's operating system and shell, not the PC's",
+   "why_it_matters": "On a Linux worker driving a Windows PC, the prompt would say 'sh', give Unix hints, and report the wrong OS from system_info. Commands would then fail on cmd.exe. The device-channel handshake must report the PC's OS, shell and installed tools, and the prompt must use them.",
+   "evidence": "command_shell matches std::env::consts::OS (2133-2138); prompt 'Operating system: {os}' with os = std::env::consts::OS (2253, 2280, 2308); shell_hint uses cfg!(windows) (terminal.rs 431); system_info (tools.rs 827-831)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "2129-2313"
+  },
+  {
+   "title": "Chat (not only the agent) reads the user's project and runs tools there",
+   "why_it_matters": "The decided design sends only agent tools over the device channel. Code-mode chat, whose replies are meant to stream from API servers, also needs PC access: focusing on the right sub-project, the project listing and AGENTS.md in its prompt, the repo-index hints, and the read-only tools. The slash commands /search, /find and /diff do the same. Either API servers get device-channel access too, or code-mode chat runs as a worker job.",
+   "evidence": "focused_workspace_root in chat (api.rs 2541); workspace snapshot reads AGENTS.md (api.rs 2855-2863); cached_repo_index in chat (3756); run_chat_tool_round runs tools::execute (3093-3108); /search, /find, /diff run tools::execute, find_files and terminal::run directly (6385-6428)",
+   "file": "backend/src/api.rs",
+   "lines": "2534-2557, 3750-3808, 2980-3180, 6385-6428"
+  },
+  {
+   "title": "Permission mode and 'allow for session' grants are one global object",
+   "why_it_matters": "Switching one user's mode to Auto would release the waiting actions of every run on the server. Session grants are keyed only by tool and folder-path text, so two users with the same path string (for example C:\\Users\\dev\\app on different PCs) share a grant. In the design, the mode becomes per user (capped by the admin) and grants become per user, device and run, held by the desktop.",
+   "evidence": "AppState.permissions: Arc<RwLock<PermissionManager>> (api.rs 89); put_permission_mode sets s.permissions.write().autonomy then resume_auto_approved_runs over all runs (api.rs 8960-8984, 8993-9044); grants: HashSet<(String,String)> (permissions.rs 64)",
+   "file": "backend/src/permissions.rs",
+   "lines": "59-116"
+  },
+  {
+   "title": "The run registry forgets the oldest run after 20, even if it is still working",
+   "why_it_matters": "An evicted run keeps working, but Stop, approval and its event stream return 'unknown run'; an evicted run waiting for approval waits forever. This is another reason runs must become database rows, not an in-memory list.",
+   "evidence": "if self.order.len() > 20 { if let Some(old) = self.order.pop_front() { self.runs.remove(&old); } } (2523-2531)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "2512-2549"
+  },
+  {
+   "title": "All run state lives in one function's local variables",
+   "why_it_matters": "A worker restart, crash or redeploy loses the run, and it cannot move to another worker. 'If the app disconnects the run pauses' works only by holding a worker slot (and a model cache) for as long as the user is away. Long pauses and rolling deploys need a checkpoint (transcript, notes, counters, changed files) saved after each step, and a resume path.",
+   "evidence": "transcript, work_log, inspected, kept_notes, changed_files, verification, progress_guard, loop_watch, failed_calls declared as locals (2733-2885)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "2579-2886"
+  },
+  {
+   "title": "Routing must be pinned per run, not only per conversation",
+   "why_it_matters": "The loop deliberately sends the compaction note and the completion check on the run's own transcript so the model copy's cache can be reused ('the single slot'). With model pools, every request of a run must go to the same copy. A chat in the same conversation competing for that copy's slot would evict the run's cache.",
+   "evidence": "review_completion comment: 'A separate prompt would evict the transcript from the single slot and force a full re-prefill' (4127-4132); compaction uses chat_turns_on_run_prompt on the run transcript (1860-1865)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "4127-4189, 1818-1938"
+  },
+  {
+   "title": "The loop talks to the single loaded model directly and tells users to reload it",
+   "why_it_matters": "run_loop takes its model address and settings from the one llama-server the process manages, checks between steps whether that server is still up, and on failure tells the user to 'load the model again' and points at the server's local log file. All of this must go through the model gateway, and the messages must suit users who cannot manage models.",
+   "evidence": "state.llama.write().await ... running.base_url, cfg (2619-2629); llama.is_running()/stop_report() (3020-3029, 3202-3205); model_server_stopped_message uses crate::logfile::model_server() (5114-5121)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "2618-2653, 3020-3029, 5112-5122"
+  },
+  {
+   "title": "Worker-side code would quietly resolve PC paths against the worker's own disk",
+   "why_it_matters": "The completion checks, diff snapshots, changes report and command classification call the folder-boundary resolver, which looks at the real disk. On a worker the folder does not exist, so the resolver silently falls back to plain text joining, and its 'drop the repeated folder name' rule checks a path that is not there. Path keys then differ from what the desktop resolves. The worker needs a text-only resolver; the authoritative one runs on the desktop.",
+   "evidence": "resolve: root NotFound => Ok(normalized) (workspace.rs 98-110); without_own_name uses self.root.join(first).exists() (workspace.rs 63); ws.resolve used in VerificationState::observe (4439, 4479), changes_report (1567), mutation_snapshot (4948)",
+   "file": "backend/src/workspace.rs",
+   "lines": "53-158"
+  },
+  {
+   "title": "Several host-side scans would become dozens of network round trips",
+   "why_it_matters": "Batching is needed in exactly these places; elsewhere one round trip per model step is fine because a step takes seconds. Run start reads project roots (about 10 checks per sub-folder), AGENTS.md and the like, and HANDOFF.md / MEMORY.md: make that one request. Each edit takes before and after snapshots: return the diff with the tool result. A completion claim reads every written page and checks every link, repeated on each needs_evidence() call: one request per claim. The changes report reads each changed file: one request. The repo index, search, folder outline, the did-you-mean walk and project_check must each run wholly on the desktop.",
+   "evidence": "focused_workspace_root (2359-2403); project_instructions/project_notes (1651-1690); mutation_snapshot before/after (3805, 4027); broken_page_references/empty_created_dirs (4342-4365) called via needs_evidence at 2936, 3497, 3509; changes_report (1558-1579); repo_index::build up to 5000 files (repo_index.rs 119-186)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "1558-1690, 2359-2403, 4334-4365, 4941-4985"
+  },
+  {
+   "title": "What the desktop must check on its own side",
+   "why_it_matters": "A compromised server can only be contained by the desktop. Starting points that exist: the folder-boundary resolver (workspace.rs), the permission rules (permissions.rs), the git-folder edit check, the window-launch check, the catastrophic-command list, loopback-only preview, file-size and read-chunk limits, and git commit message rules. What is missing:\n- the desktop's own list of allowed folders, chosen in its own dialog\n- requests accepted only for runs the user started from this device that are not stopped\n- its own approval prompt (never a server-sent 'approved')\n- the user's mode capped locally\n- per-run labels on background commands\n- a local log of actions\n- optionally, a rule protecting secret files such as .env and keys\nShell commands are not confined to the folder (the code says so), so in Auto a compromised server can run anything the user can. The admin's maximum mode, and a desktop-side opt-in for Auto, are the real limits.",
+   "evidence": "PermissionDecision text: 'Shell commands are not sandboxed by the project folder' (permissions.rs 187); denied() substring list (terminal.rs 40-63); parse_local_url loopback only (preview.rs 81-85); touches_git_internals (tools.rs 257-263); launches_window (agent_runner.rs 2107-2119)",
+   "file": "backend/src/permissions.rs",
+   "lines": "118-210"
+  },
+  {
+   "title": "The audit trail claims approvals that never happened, and is not an audit log",
+   "why_it_matters": "Every agent tool use is saved as approved=true, whether the mode allowed it or the user clicked Allow. Approvals, denials, guard decisions and who decided are not recorded. Arguments and results are cut to 4,000 characters, and the rows can be edited. The same table also feeds the 'earlier work' briefing for the next run. The tamper-evident audit design needs new records, and the briefing should read per-run action records.",
+   "evidence": "audit_tool: approved: true (agent_runner.rs 5094-5102); chat records approved: false (api.rs 3160); earlier_work_block reads tool_executions_for (agent_runner.rs 2809)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "5087-5103"
+  },
+  {
+   "title": "Web page fetching on the worker can reach internal addresses",
+   "why_it_matters": "extract_page fetches any http(s) address and the search provider address comes from settings. On a server or Kubernetes, that can reach cloud metadata and internal services. The admin's network policy must be enforced on the worker for server-side web tools; preview stays loopback-only on the PC.",
+   "evidence": "if !(url.starts_with(\"https://\") || url.starts_with(\"http://\")) only check (218-221)",
+   "file": "backend/src/search.rs",
+   "lines": "216-234"
+  },
+  {
+   "title": "Most of the PC-side code can be reused as-is in Tauri",
+   "why_it_matters": "This makes the plan smaller. Tauri's native side is Rust, so the tool runner, the folder boundary, command running with process-tree kill, file reading, outline, project_check, preview and its browser driver, the repo-index builder and html_to_text can be built into the desktop app with little change. The device channel can carry the existing ToolRequest {name, args} and ToolResult {ok, output, exit_code} shapes, plus a diff and a screenshot.",
+   "evidence": "tools::ToolRequest / ToolResult (tools.rs 18-50); tools::execute (375); preview::look (preview.rs 496); cdp::Browser (cdp.rs 23)",
+   "file": "backend/src/tools.rs",
+   "lines": "18-50, 375-928"
+  },
+  {
+   "title": "Process list and system info run without approval in chat",
+   "why_it_matters": "These two tools are on the 'chat may run without asking' list and report on the machine the backend runs on. On a shared server any user could list the server's processes. They must run on the user's PC or be dropped from chat.",
+   "evidence": "chat_safe includes \"system_info\" | \"list_processes\" (292-302); list_processes uses sysinfo::System::new_all() (862-869)",
+   "file": "backend/src/tools.rs",
+   "lines": "286-303, 859-870"
+  }
+ ]
+}

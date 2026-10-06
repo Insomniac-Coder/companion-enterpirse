@@ -11,8 +11,11 @@ fork to drop the model weights (Git LFS); commit ids differ from the Companion's
   the user's PC through the desktop app; hosting is undecided (own servers or AWS), so the design targets
   Kubernetes plus a one-machine version that must also run on a Windows laptop; Outlook first, then Gmail;
   Jira Cloud; "local" means the server installed on the laptop (no separate offline mode in the app).
-- **State:** Phase 0 (fork) done; the Phase 1 code map runs next (read-only agents, at most 2 at a time;
-  results in `docs/enterprise/phase1-map/`).
+- **State (2026-10-06):** Phase 0 done: the copy builds and passes its checks (backend 521 passed, 7 skipped;
+  frontend 114 passed; frontend build). The Phase 1 code map is done: `docs/enterprise/phase1-map/README.md`
+  (summary, design additions, gaps not to carry over) with the raw entries beside it. Next: turn the map into
+  the Phase 1 task list and estimate, after the owner's review. The owner's disk is short on space: build
+  with `CARGO_INCREMENTAL=0` and `CARGO_PROFILE_DEV_DEBUG=0` (about 1 GB instead of 14).
 - Everything below this section is the Companion's own handoff, kept as it was at the fork.
 
 # Handoff — start here

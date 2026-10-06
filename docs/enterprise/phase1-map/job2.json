@@ -1,0 +1,1432 @@
+{
+ "summary": "I mapped how models are run today and found one model server on one machine. LlamaServerManager holds at most one process and ModelManager has one current_id. start_sidecar always stops the previous model before it starts the next. guard_agent_running refuses a switch while any chat or agent run is active anywhere. Chat, agent, compaction and benchmark requests carry no model id: they take the base_url and settings of whatever model is running (api.rs:3452, agent_runner.rs:2619).\n\nAnswers to the six questions:\n\n(1) Places that assume one loaded model: LlamaServerManager, ModelManager (current, switch_to, unload_all), the stub mirror engine in AppState.inference, the single global LoadProgress, FitPreparation (which runs only when nothing is loaded), and the fixed port 3888. Also these handlers: load_model, load_model_by_id, prepare_conversation, inference_start, inference_stop, unload_models, recheck_model_tooling, benchmark, runtime_policy, system_overview, cancel_load and calibrate_model. Finally, the process-wide chars-per-token estimate is reset on every load. All of this is replaced by three things:\n- a model registry and a table of model copies in PostgreSQL, owned by the model pool manager;\n- a gateway call made with a model id and a conversation id;\n- draining one copy at a time instead of the global \"no runs anywhere\" guard.\n\n(2) Tool-ability check: tooling.rs measures one loaded llama.cpp model with 2 to 4 probe requests. It writes tooling.json beside the weights, keyed by the runtime build (BUILD_INFO.json) and a fingerprint of the chat template. To become an ability profile it needs:\n- storage in a database table instead of the models folder, keyed by model id plus model file hash, plus runtime build or provider and model version, plus template fingerprint;\n- context size, vision support and the template's capabilities in the same record;\n- runs as a queued worker job through the gateway, so vLLM and outside providers can be checked too;\n- tool definitions taken from tool and plugin description files instead of the hard-coded table in tooling::parameters.\n\n(3) Sidecar HTTP client. These parts are already a generic OpenAI-format client: the messages and tool-call format, streaming (SSE) parsing including streamed tool-call fragments, error status mapping, the reasoning_content field, usage counts, the retry-once-on-connect logic and the request recorder. These parts are llama.cpp-specific:\n- request fields cache_prompt, top_k, repeat_penalty, timings_per_token, chat_template_kwargs, and the response_format of type json_object with a schema;\n- the /props template capabilities, /tokenize, the timings object and the exceed_context_size_error type;\n- the --parallel 1 single slot and the template-refusal retry.\n\n(4) Memory fit, calibration, hardware profiling and downloads. The runtime fit (llama-fit-params), the policy, drafting and memory-mapping choices, CPU fallback, cpu_topology and the speed rule all still apply on a GPU server, inside the pool manager's process for each node. But they need a GPU index for each copy, VRAM already reserved by other copies, and multiplication by slots. Only the battery-or-mains check and the \"close other GPU-heavy applications\" notes are laptop-only. Calibration, model import/scan, downloads, delete, tool re-check and benchmark become admin dashboard actions, run by a worker or the pool manager. The daio and recommend heuristics, auto_configure, describe_model and cache_budget are superseded by the runtime fit and can be removed.\n\n(5) Resource meters and system endpoints. Each process keeps an in-memory one-hour sample buffer and runs nvidia-smi (busiest card only). With many servers, each GPU node reports per-GPU readings to a central store, and the admin dashboard reads them. Users keep only the meters for their own request: context, tokens per second and cache hits.\n\n(6) Routing the same conversation to the same model copy:\n- each copy has one slot, so any other conversation evicts the cache;\n- llama.cpp picks a slot by prompt similarity and the client never sends id_slot;\n- adding slots divides the context window, and the fit does not account for that;\n- the RAM prompt cache belongs to each copy;\n- the run's side requests (completion check, compaction) also need the same copy;\n- an agent run captures one copy's address at start and fails instead of moving if that copy dies;\n- the token-estimate ratio is process-global.\n\nThe affinity map (conversation or run to copy) must live in a shared store, with a fallback that re-reads the prompt.",
+ "items": [
+  {
+   "name": "SidecarBinary::detect, runtime_dir, search_path",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "132-193",
+   "what_it_does": "Finds the llama.cpp server program on this computer: first an environment variable, then the project's runtime folder, then the system PATH. If none is found, it tells the user to run a build script.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "model_pool_manager",
+   "change": "The pool manager finds the runtime on each GPU machine it controls (one machine) or uses it from the container image (Kubernetes). The runtime version is something the admin chooses, and the error message should speak to the admin, not to an end user.",
+   "size": "S",
+   "evidence": "COMPANION_LLAMA_SERVER_BIN env override; runtime_dir(install_root) = install_root/runtime/bin; search_path over PATH; message 'Run scripts\\\\build-runtime.ps1 from the project folder'",
+   "confidence": "high"
+  },
+  {
+   "name": "SidecarBinary::devices, supports_argument, builtin_chat_templates, help_text, listed_builtin_chat_templates",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "36-131, 195-210",
+   "what_it_does": "Runs the model server program briefly to ask which GPUs it can use and which options and built-in chat formats it knows. It remembers the help text in memory for each program file.",
+   "assumes": [
+    "pc_processes",
+    "in_memory_state"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Each GPU machine runs this once and reports the result to the pool manager's registry: which devices it has, the runtime build, and which options and chat formats it supports. The in-memory cache is fine to keep as a local speed-up on each machine.",
+   "size": "S",
+   "evidence": "Command::new(&self.0).arg(\"--list-devices\"); static SEEN: OnceLock<Mutex<HashMap<Key, Arc<String>>>>; parse_devices(..)",
+   "confidence": "high"
+  },
+  {
+   "name": "server_args",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "212-337",
+   "what_it_does": "Builds the start-up options for the model server. It always listens on the machine's own loopback address only and serves one conversation at a time. It also sets context size, GPU layers, cache precision, batch sizes, drafting, threads, the RAM prompt cache and the vision add-on file.",
+   "assumes": [
+    "loopback_only",
+    "one_loaded_model"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Changes needed:\n- The listen address becomes configurable: all addresses inside a Kubernetes pod, loopback on one machine.\n- The number of parallel conversation slots for each copy becomes an admin setting, and the context per slot is accounted for.\n- Each copy can be pinned to a GPU (a device option or CUDA_VISIBLE_DEVICES).\n- The builder must be able to produce a vLLM equivalent.\nThe option-building logic itself stays.",
+   "size": "M",
+   "evidence": "\"--host\".into(), \"127.0.0.1\".into(), ... \"--parallel\".into(), \"1\".into(); only device option emitted is [\"--device\",\"none\"] for CPU",
+   "confidence": "high"
+  },
+  {
+   "name": "Load-failure explanations: RUNTIME_DIAGNOSTIC_MARKER, without_runtime_diagnostic, last_runtime_error, explain_load_failure, describe_exit",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "339-381, 568-615",
+   "what_it_does": "Turns the model server's log and exit code into a plain sentence explaining why a model would not start or why it stopped.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Keep as is. The pool manager stores the sentence on the copy's record so the admin dashboard can show it. Users only see that the model is unavailable.",
+   "size": "S",
+   "evidence": "explain_load_failure matches 'wrong number of tensors', 'key not found in model', 'unknown model architecture'; describe_exit names Windows codes like 0xC0000005",
+   "confidence": "high"
+  },
+  {
+   "name": "RunningSidecar::spawn, stop, is_alive, stop_report",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "383-566",
+   "what_it_does": "Starts one model server as a child process on a fixed local port and waits up to 5 minutes for it to report healthy. It keeps the last 8 KB of its output and the process handle in memory, and can stop it or report how it ended.",
+   "assumes": [
+    "pc_processes",
+    "loopback_only",
+    "in_memory_state"
+   ],
+   "destination": "model_pool_manager",
+   "change": "This becomes the 'local processes' backend of the pool manager:\n- each copy gets its own free port, its own log file and a registry row (node, address, state, started time, last error);\n- the process handle stays on the machine that owns it;\n- a Kubernetes backend does the same through a Deployment and a readiness check on /health.\nThe API servers and workers never hold process handles.",
+   "size": "L",
+   "evidence": "TcpListener::bind((\"127.0.0.1\", port)); base_url = format!(\"http://127.0.0.1:{port}\"); child: Child stored in struct; crate::logfile::model_server() single model-server log",
+   "confidence": "high"
+  },
+  {
+   "name": "reap_orphaned_sidecars, normalized_executable_path",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "617-650",
+   "what_it_does": "Before starting a model, it kills every model-server process on the machine that runs the same program file and whose parent process no longer exists.",
+   "assumes": [
+    "pc_processes",
+    "one_loaded_model"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Only reclaim processes the pool manager itself recorded (by process id or a marker file per copy). Otherwise, when several copies run on one machine and the manager restarts (on Windows), starting one copy kills all the others.",
+   "size": "S",
+   "evidence": "process.exe() == target && process.parent().map_or(true, |parent| system.process(parent).is_none()) => process.kill(); called from spawn at line 413",
+   "confidence": "high"
+  },
+  {
+   "name": "drain_worker_log, wait_for_health",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "652-734",
+   "what_it_does": "Reads the model server's output into a short in-memory tail and the model-server log on disk. It checks /health every half second until the server is ready or has exited.",
+   "assumes": [
+    "pc_processes",
+    "loopback_only"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Keep for the local-process backend, with one log per copy. In Kubernetes, the readiness check and pod logs replace both.",
+   "size": "S",
+   "evidence": "bytes.drain(..excess) keeps 8192 bytes; client.get(format!(\"{base_url}/health\")) loop with child.try_wait()",
+   "confidence": "high"
+  },
+  {
+   "name": "shared_client",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "736-753",
+   "what_it_does": "Keeps one shared pool of HTTP connections for every model request. It waits 5 seconds to connect and 20 minutes between received bytes.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Keep it in the gateway client used by API servers and workers. Allow more idle connections per host, because many copies and providers will be called. Outside providers need their own timeouts and their own key header.",
+   "size": "S",
+   "evidence": "connect_timeout(5s), read_timeout(1200s), pool_max_idle_per_host(4)",
+   "confidence": "high"
+  },
+  {
+   "name": "SidecarClient generic OpenAI-format core: ChatTurn, turn_json, native_calls_in, StreamedToolCalls, SseFrames, post_chat, send_with_retry, complete_detailed_body, stream/stream_body, classify_failure/classify_status/transport_failure, StreamHandlers, StreamOutcome, AgentCompletion, NativeToolCall",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "757-770, 873-960, 1069-1128, 1163-1279, 1394-1511, 1513-1520, 1778-1940, 1995-2223",
+   "what_it_does": "Talks to the model in the standard OpenAI chat format. It sends messages and tool definitions, reads either a whole reply or a streamed one (text, hidden reasoning and tool calls), stops early when a complete action has arrived, and sorts failures into kinds the caller can recover from.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Changes needed:\n- Make this the OpenAI-format adapter of the model gateway: a base address and API key for each provider, plus a list of which extra fields that provider accepts.\n- Add an Anthropic adapter beside it with the same request and response shapes.\n- Keep the early-stop and cancel behaviour.\n- The OpenAI-compatible endpoint for other company software can reuse the parsing code.",
+   "size": "M",
+   "evidence": "post to format!(\"{}/v1/chat/completions\", self.base_url); delta parsing of /delta/content, /delta/reasoning_content, /delta/tool_calls; [DONE] handling",
+   "confidence": "high"
+  },
+  {
+   "name": "llama.cpp-specific client parts: sampling_body, apply_options, structured json_object schema, timings_per_token, template_caps, visible_token_count, tokenize",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "1297-1335, 1522-1537, 2006-2013, 2225-2267",
+   "what_it_does": "Adds request fields only llama.cpp understands:\n- a flag that keeps the prompt cached;\n- two extra sampling knobs;\n- timing data on every streamed piece;\n- a switch for the chat template's thinking mode;\n- a JSON-schema format in llama.cpp's own shape.\nIt also asks the server what the chat template supports (/props) and counts tokens with /tokenize.",
+   "assumes": [
+    "one_loaded_model"
+   ],
+   "destination": "shared_library",
+   "change": "Put these behind the llama.cpp adapter, switched on only when a copy runs llama.cpp. A vLLM adapter maps them to vLLM's names (prefix caching is automatic there, sampling names differ, it has its own tokenizer endpoint). Outside providers get only standard fields, and their structured output uses the json_schema format. Token counting falls back to the provider's usage numbers.",
+   "size": "M",
+   "evidence": "\"cache_prompt\": true, \"top_k\", \"repeat_penalty\"; body[\"timings_per_token\"]=true; body[\"chat_template_kwargs\"]={\"enable_thinking\":..}; {\"type\": \"json_object\", \"schema\": {...}}; GET {base}/props; POST {base}/tokenize",
+   "confidence": "high"
+  },
+  {
+   "name": "template_safe_turns, flattened_tool_turn, is_template_refusal, strictly_shaped_body",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "962-1067, 1130-1161",
+   "what_it_does": "Reshapes the message list for models whose chat template refuses a system message or requires strict user/assistant alternation. If the server refuses the list, it retries once with the strictest shape.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Keep it for self-hosted models (llama.cpp and vLLM both render the model's own template). Read the template's limits from the model's ability profile, not from the current load settings. Outside providers skip it.",
+   "size": "S",
+   "evidence": "template_safe_turns(turns, cfg.chat_template); retry when code == BAD_REQUEST && is_template_refusal(&text)",
+   "confidence": "high"
+  },
+  {
+   "name": "observe_prompt_size, prompt_chars, call_chars (with agent::CHARS_PER_TOKEN_X100)",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "790-856",
+   "what_it_does": "After each request, learns how many characters make one token for 'the' model and stores the ratio in one number for the whole program. Every new model load resets it.",
+   "assumes": [
+    "in_memory_state",
+    "one_loaded_model"
+   ],
+   "destination": "shared_library",
+   "change": "Keep the ratio for each model id. An in-memory cache per process is acceptable because it is only an estimate, but it should be seeded from a stored value so a fresh worker does not start at the default.",
+   "size": "S",
+   "evidence": "crate::agent::observe_prompt(chars, prompt_tokens); agent.rs:117 static CHARS_PER_TOKEN_X100: AtomicU32; api.rs:2059 crate::agent::reset_chars_per_token()",
+   "confidence": "high"
+  },
+  {
+   "name": "RecordedRequest, RequestRecorder, without_image_data, record_request, recorded_output",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "772-788, 858-871, 1452-1462, 1539-1576",
+   "what_it_does": "Hands a copy of every model request and its reply, with image data removed, to a recorder the caller provides, which saves it.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Keep it. The recorder becomes the audit and request-log sink, carrying the user, the model id, the copy or provider, and the retention rules.",
+   "size": "S",
+   "evidence": "pub type RequestRecorder = Arc<dyn Fn(RecordedRequest) + Send + Sync>",
+   "confidence": "high"
+  },
+  {
+   "name": "structured_action_schema",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "1599-1650",
+   "what_it_does": "For models that cannot call tools natively, builds a strict answer format listing each built-in tool and its required inputs, so the model can only produce a valid action.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Build the list from the tools this user and model are actually offered, including plugin and MCP tools from their description files. Emit the format each adapter accepts: llama.cpp's shape or the standard json_schema.",
+   "size": "M",
+   "evidence": "for tool in crate::tools::registry() { let required = crate::tools::required_args(tool.name); ...}; serde_json::json!({\"type\": \"json_object\", \"schema\": {\"anyOf\": alternatives}})",
+   "confidence": "high"
+  },
+  {
+   "name": "Request entry points: chat, chat_turns, agent_chat_turns, probe_turns, agent_chat_turns_stream, chat_turns_without_reasoning, chat_turns_on_run_prompt, chat_stream, chat_turns_stream(_observed)",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "1578-1776, 1942-1993",
+   "what_it_does": "Ready-made request types: a plain chat, an agent step, a short tool-check probe, a check that turns thinking off, and a check that reuses the agent run's own prompt so the cache still matches. Each one takes all its sampling values from the load settings of the running model.",
+   "assumes": [
+    "one_loaded_model"
+   ],
+   "destination": "shared_library",
+   "change": "Take sampling values for each request (resolved from the company, group and user settings) instead of from the load settings. Address requests by model id and conversation id through the gateway, not by a base address.",
+   "size": "S",
+   "evidence": "sampling_body(turns, max_tokens, cfg, ..) reads cfg.temperature/top_p/top_k/repeat_penalty; SidecarClient::new(base_url)",
+   "confidence": "high"
+  },
+  {
+   "name": "LlamaServerManager",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "2270-2312",
+   "what_it_does": "Holds the single running model server, if any, and the last load error, for the whole application.",
+   "assumes": [
+    "one_loaded_model",
+    "in_memory_state"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Replace it with the pool manager's registry of copies, stored in PostgreSQL: model id, node, address, state (starting, ready, draining, stopped, failed), slots, runtime build, last error. API servers and workers read this registry or ask the gateway. Only the pool manager holds process handles.",
+   "size": "L",
+   "evidence": "/// Manager held in AppState: at most one running sidecar (§15 single model). pub running: Option<RunningSidecar>",
+   "confidence": "high"
+  },
+  {
+   "name": "InferenceStatus",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "2314-2327",
+   "what_it_does": "Status report naming one engine, one model, one address and one context size.",
+   "assumes": [
+    "one_loaded_model"
+   ],
+   "destination": "api_server",
+   "change": "Users get an availability list for each model they may use (ready, waking up, unavailable). The admin dashboard gets the status of each copy.",
+   "size": "S",
+   "evidence": "pub model: Option<String>, pub base_url: Option<String>, pub context_size: u32",
+   "confidence": "high"
+  },
+  {
+   "name": "InferenceError, SidecarFailure",
+   "file": "backend/src/inference.rs",
+   "lines": "12-127",
+   "what_it_does": "Error types for model requests, with plain messages. Some messages tell the user to press Load or change Settings.",
+   "assumes": [
+    "one_loaded_model"
+   ],
+   "destination": "shared_library",
+   "change": "Keep the kinds of failure. Reword the user messages: users can no longer load models or change load settings. Add kinds for 'model has no ready copy', 'provider refused' and 'not allowed'.",
+   "size": "S",
+   "evidence": "ModelNotLoaded => \"No model is loaded. Select a model and press Load first.\"",
+   "confidence": "high"
+  },
+  {
+   "name": "Support, TemplateCaps, ChatTemplateShape",
+   "file": "backend/src/inference.rs",
+   "lines": "129-203",
+   "what_it_does": "Records what a model's chat template can do: tools, system message, alternation. It is read from llama.cpp's /props at load.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Make these fields part of the stored ability profile for each model. vLLM and outside providers fill them from their own metadata or from probe results.",
+   "size": "S",
+   "evidence": "TemplateCaps::from_props reads props[\"chat_template_caps\"]",
+   "confidence": "high"
+  },
+  {
+   "name": "InferenceConfig",
+   "file": "backend/src/inference.rs",
+   "lines": "205-344",
+   "what_it_does": "One settings bundle that mixes four things: how to start the model (file path, context, GPU layers, threads, cache), how to sample each reply (temperature and similar), what the model can do (template shape and tool-check result), and its default file 'models/model.gguf'.",
+   "assumes": [
+    "pc_files",
+    "one_loaded_model",
+    "global_settings"
+   ],
+   "destination": "shared_library",
+   "change": "Split into three:\n- a launch specification owned by the pool manager and set by the admin for each deployment;\n- sampling options resolved for each user and request;\n- the ability profile for each model, read from the database.\nRemove the default local file path.",
+   "size": "M",
+   "evidence": "pub model_path: PathBuf ... pub tooling: Option<ToolingProfile> ... pub temperature: f32; model_path: PathBuf::from(\"models/model.gguf\")",
+   "confidence": "high"
+  },
+  {
+   "name": "speculative_for, DRAFT_HEAD_* constants, default_* helpers",
+   "file": "backend/src/inference.rs",
+   "lines": "346-385",
+   "what_it_does": "Decides how the model server should guess ahead to speed up replies (draft head or n-gram), from the model file's facts and an on/off setting.",
+   "assumes": [
+    "global_settings"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Keep it. The on/off switch becomes an admin performance setting for each deployment.",
+   "size": "S",
+   "evidence": "speculative_for(model, tuning.speculative == \"off\")",
+   "confidence": "high"
+  },
+  {
+   "name": "EngineTimings",
+   "file": "backend/src/inference.rs",
+   "lines": "387-432",
+   "what_it_does": "Reads llama.cpp's own speed numbers for one reply: prompt speed, generation speed, prompt tokens reused from cache, drafted tokens.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Keep it inside the llama.cpp adapter. The vLLM and provider adapters leave it empty or fill it from usage data. Cache hits per copy feed the routing-affinity metrics.",
+   "size": "S",
+   "evidence": "cached_tokens: count(\"cache_n\")",
+   "confidence": "high"
+  },
+  {
+   "name": "ResolvedRuntimePolicy, resolve_runtime_policy*, VramState, fit_to_memory, cpu_context_cap, prompt_cache_ram_mib, apply_to",
+   "file": "backend/src/inference.rs",
+   "lines": "434-950",
+   "what_it_does": "Plans how one model will fit this machine. It uses the GPU memory free now (counting everything else as used) and the free RAM to choose context size, cache precision and GPU/hybrid/CPU placement. It also sizes the RAM prompt cache and writes explanatory notes. The tuning comes from the single settings object.",
+   "assumes": [
+    "one_loaded_model",
+    "global_settings"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Keep the method. The budget becomes the free memory of the GPU this copy is assigned to, minus memory reserved for copies that are starting. Tuning comes from the admin's settings for the deployment. When a copy has several slots, the context is multiplied by the slot count. Notes go to the admin, not the user.",
+   "size": "M",
+   "evidence": "let free = vram.total_bytes.saturating_sub(vram.used_bytes); note text 'Closing other GPU-heavy applications before loading allows a larger context'; tuning: &crate::settings::RuntimeSettings",
+   "confidence": "high"
+  },
+  {
+   "name": "Metrics, OutputTiming",
+   "file": "backend/src/inference.rs",
+   "lines": "952-1139",
+   "what_it_does": "Speed and token counts for one reply or one agent turn, kept separate from the reply text.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Keep. Add the model id and the copy or provider so usage can be shown per user and per model.",
+   "size": "S",
+   "evidence": "pub struct Metrics { tokens_per_sec, prompt_tokens, kv_cache_limit, timing, engine, finish_reason }",
+   "confidence": "high"
+  },
+  {
+   "name": "IInferenceEngine, StubEngine, LlamaCppEngine",
+   "file": "backend/src/inference.rs",
+   "lines": "1141-1335",
+   "what_it_does": "An engine interface that the real code path does not use. A fake 'stub' engine is kept loaded only as a mirror for the status screens, and a placeholder llama.cpp engine always fails.",
+   "assumes": [
+    "one_loaded_model",
+    "in_memory_state"
+   ],
+   "destination": "remove",
+   "change": "Remove all three. The model gateway built from the client code is the real abstraction. Status comes from the pool registry.",
+   "size": "S",
+   "evidence": "api.rs:80 pub inference: Arc<RwLock<StubEngine>>; api.rs:2079 'Mirror loaded state into the registry + stub engine for UI consistency'; LlamaCppEngine only referenced in tests",
+   "confidence": "high"
+  },
+  {
+   "name": "ModelMetadata, ModelCapabilities, validate, gguf_path, deletion_path, safe_gguf_filename",
+   "file": "backend/src/models.rs",
+   "lines": "9-180",
+   "what_it_does": "Describes one model (name, architecture, size, context, vision, tool support, memory figures) and where its file is in the local models folder. It includes a 'loaded' flag and checks that file names and ids are safe.",
+   "assumes": [
+    "pc_files",
+    "one_loaded_model"
+   ],
+   "destination": "shared_library",
+   "change": "Make it the registry record in PostgreSQL. The location becomes an object-store key or shared-volume path plus a content hash. Remove the 'loaded' flag, because state belongs to each copy. Keep the safety checks for admin imports.",
+   "size": "M",
+   "evidence": "pub dir: PathBuf; pub fn gguf_path(&self) -> PathBuf { self.dir.join(..unwrap_or(\"model.gguf\")) }; #[serde(default = \"default_loaded\")] pub loaded: bool",
+   "confidence": "high"
+  },
+  {
+   "name": "auto_configure, AutoConfig",
+   "file": "backend/src/models.rs",
+   "lines": "182-226",
+   "what_it_does": "Rough guess of GPU share and context from file size, using a fixed 0.5 MB per token.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "remove",
+   "change": "Remove it. The runtime's own memory fit replaces it, and model_detail is its only user.",
+   "size": "S",
+   "evidence": "let kv_gb = (requested_ctx as f64) * 0.000_5; only caller api.rs:2272",
+   "confidence": "high"
+  },
+  {
+   "name": "ModelManager (register, list, get, current, switch_to, unload_all, reconcile, remove)",
+   "file": "backend/src/models.rs",
+   "lines": "228-341",
+   "what_it_does": "An in-memory list of known models with one 'current' model. Switching marks the old one unloaded and the new one loaded.",
+   "assumes": [
+    "one_loaded_model",
+    "in_memory_state"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Changes needed:\n- The model registry moves to PostgreSQL; the admin adds, imports and removes models there.\n- API servers read the models each user is allowed (by group).\n- 'Current model' and 'switch_to' go away; each request names its model id, and the pool manager tracks copies.",
+   "size": "M",
+   "evidence": "/// Single-loaded-model manager (§15). current_id: Option<String>; switch_to unloads previous",
+   "confidence": "high"
+  },
+  {
+   "name": "GGUF reading and folder scan: gguf_header (with static cache), parse_gguf_header, template_hints, template_shape, template_handles_tools, load_issues, builtin_chat_format, fallback_chat_format, projector_in, model_set_bytes, complete_model_file, gguf_files, inferred_metadata, scan_models_dir, checked_header",
+   "file": "backend/src/models.rs",
+   "lines": "343-1264",
+   "what_it_does": "Reads only the header of each model file in the local models folder: architecture, context, chat template, memory figures, packaging problems. It also infers names and quantization from file names, finds a vision add-on file next to the weights, and caches headers in memory.",
+   "assumes": [
+    "pc_files",
+    "in_memory_state"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Run the header reading once, when the admin imports a model, as a job on a machine that can read the model store. Store the results in the registry. Keep header parsing as a shared library.\n\nThe table from architecture to chat format names model families, not models; it is acceptable, but should be treated as data.",
+   "size": "M",
+   "evidence": "std::fs::read_dir(dir) in scan_models_dir; static CACHE: OnceLock<Mutex<HeaderCache>>; builtin_chat_format matches \"gemma\" | \"gemma2\" ...",
+   "confidence": "high"
+  },
+  {
+   "name": "Runtime fit logic (pure): Fit, largest_full_gpu_context, FIT_COMBINATIONS, fastest_combination, free_expert_blocks, default_micro_batch, calibrated_micro_batch_fits, load_without_mmap, weights_in_ram_bytes, micro_batch_args, probe_args, parse_fit_output, fitted_gpu_layers, tensor_overrides, spread, fit_combinations, FitDecision, fit_reuse",
+   "file": "backend/src/runtime_fit.rs",
+   "lines": "1-394, 430-620",
+   "what_it_does": "Pure decision rules. Finds the largest context that keeps every layer on the GPU, picks the fastest cache and margin, picks the batch size by the owner's speed rule, and decides whether to load weights into RAM and whether a remembered decision can be reused.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Keep as the pool manager's llama.cpp tuning library. Two additions: multiply the context by the number of slots for each copy, and include GPU memory already reserved for other copies on the same GPU.",
+   "size": "S",
+   "evidence": "pub async fn largest_full_gpu_context<F, Fut>(..probe_batch); pub fn fit_reuse(remembered, free_vram_mib, preferred)",
+   "confidence": "high"
+  },
+  {
+   "name": "probe, probe_in_order, FIT_PROBE_CONCURRENCY",
+   "file": "backend/src/runtime_fit.rs",
+   "lines": "395-428, 490-545",
+   "what_it_does": "Runs llama.cpp's fit tool as a child process, up to 4 at once, to ask how many layers of a model fit in GPU memory at a given context.",
+   "assumes": [
+    "pc_processes",
+    "pc_files"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Run it on the machine and GPU that will host the copy (in Kubernetes, as a start-up step of the copy's pod, or as a job pinned to that node). Never run it on an API server.",
+   "size": "M",
+   "evidence": "tokio::process::Command::new(fit_tool).args(probe_args(..)); stream::iter(probes).buffered(concurrency)",
+   "confidence": "high"
+  },
+  {
+   "name": "fit_memory_key",
+   "file": "backend/src/runtime_fit.rs",
+   "lines": "622-658",
+   "what_it_does": "Builds the key for a remembered fit from the model file's name, size and date, the fit tool's full path and date, the request, and total GPU memory.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Key it by model content hash, runtime build, GPU type and memory, and request, without local paths. Store it in PostgreSQL so every machine with the same GPU type reuses it.",
+   "size": "S",
+   "evidence": "format!(\"v{FIT_MEMORY_VERSION}|{name}|{}|{}|{}|{}|ctx..\", model_set_bytes(model), modified(model), fit_tool.display(), ..)",
+   "confidence": "high"
+  },
+  {
+   "name": "parse_devices, gpu_startup_failure",
+   "file": "backend/src/runtime_selection.rs",
+   "lines": "6-40, 128-189",
+   "what_it_does": "Reads the runtime's device list, and recognises GPU start-up failures in its log (CUDA, Vulkan, HIP, SYCL errors) as opposed to bad files or port clashes.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Keep it unchanged in the pool manager.",
+   "size": "S",
+   "evidence": "line.split_once(':') device id check; [\"cuda error\", \"vk_error\", \"hiperror\", ...]",
+   "confidence": "high"
+  },
+  {
+   "name": "cpu_configuration, without_load_tuning",
+   "file": "backend/src/runtime_selection.rs",
+   "lines": "42-126",
+   "what_it_does": "Rewrites a load for CPU-only use: no GPU, f16 cache, context cap, and a RAM prompt cache sized from this machine's free RAM and the model file size. It adds a note advising smaller models.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Keep it for the CPU-only one-machine case. The free RAM must be that of the host running the copy, minus other copies. The advice note goes to the admin.",
+   "size": "S",
+   "evidence": "std::fs::metadata(&cfg.model_path); crate::hardware::detect().ram.available_gb",
+   "confidence": "high"
+  },
+  {
+   "name": "load_with_fallback",
+   "file": "backend/src/runtime_selection.rs",
+   "lines": "191-241",
+   "what_it_does": "Tries to start the model on the GPU. If that fails, it tries the GPU again without the extra tuning, then silently falls back to CPU, and reports what happened.",
+   "assumes": [
+    "pc_processes"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Keep the retry steps. Whether a pool copy may fall back to CPU becomes an admin setting for each deployment; on a GPU server it is usually better to fail and alert. The result is recorded on the copy.",
+   "size": "S",
+   "evidence": "launch(cpu_configuration(cfg, \"GPU initialization or allocation failed\"))",
+   "confidence": "medium"
+  },
+  {
+   "name": "Calibration planning and choice (pure): Placement, Plan, thread_candidates, plan, micro_batch_candidates, micro_batch_plan, micro_batch_run_order, MicroBatchMeasurement, choose_micro_batch, measured_extra_blocks, Rate, Measurement, Profile, choose_profiles, Regression, regression, Environment, Calibration, model_key, parse_bench_json, bench_args, FittedPlacement, read_fitted_placement",
+   "file": "backend/src/calibration.rs",
+   "lines": "25-588, 633-680",
+   "what_it_does": "Plans a speed benchmark of one model on one machine (thread counts, batch sizes). It turns the results into Fastest, Balanced and Light profiles, picks a batch size by the owner's speed rule, and flags slow-downs against an earlier comparable run.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Keep as the library for the admin's calibration action.\n- Results are stored for each GPU-machine type, not each laptop.\n- 'Light' (leave cores free for other apps) matters only on a shared one-machine install.\n- model_key (file name and size) becomes a content hash.",
+   "size": "S",
+   "evidence": "pub fn model_key(path) -> format!(\"{name}:{size}\"); profiles \"fastest\" | \"balanced\" | \"light\"",
+   "confidence": "high"
+  },
+  {
+   "name": "runtime_tool, run_tool, fitted_placement, run_benchmark, runtime_build",
+   "file": "backend/src/calibration.rs",
+   "lines": "590-735",
+   "what_it_does": "Runs the runtime's fit, benchmark and version tools as hidden child processes (with up to 30 minutes for a benchmark) and reads their output.",
+   "assumes": [
+    "pc_processes",
+    "pc_files"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Run these on the GPU machine being calibrated, which has been taken out of service first. In Kubernetes this is a one-off job on that node type.",
+   "size": "M",
+   "evidence": "tokio::process::Command::new(tool) ... Duration::from_secs(1800)",
+   "confidence": "high"
+  },
+  {
+   "name": "power_source, platform_power, gpu_driver",
+   "file": "backend/src/calibration.rs",
+   "lines": "737-817",
+   "what_it_does": "Reads whether a laptop is on battery or mains, and the NVIDIA driver version, so calibrations are only compared under the same conditions.",
+   "assumes": [
+    "pc_processes"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Keep as facts each machine reports. Battery-or-mains only matters for laptop installs. The driver version should cover non-NVIDIA backends too.",
+   "size": "S",
+   "evidence": "GetSystemPowerStatus; /sys/class/power_supply; Command::new(\"nvidia-smi\") --query-gpu=driver_version",
+   "confidence": "high"
+  },
+  {
+   "name": "DownloadManager (new, list, get, validate_request, start, pause, cancel, resume, refresh, mark_failed)",
+   "file": "backend/src/downloads.rs",
+   "lines": "16-285",
+   "what_it_does": "Downloads a model file from any web address the caller gives into models/<id>/model.gguf on this machine. Download jobs are kept in memory, and progress is read from the size of the partial file.",
+   "assumes": [
+    "in_memory_state",
+    "pc_files"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Changes needed:\n- Downloads become an admin action queued as a worker job in PostgreSQL, with progress stored there.\n- Files are written to the model store (S3, MinIO or a folder).\n- The address is checked against the network policy (allowed hosts).\n- Split (multi-part) models are supported.",
+   "size": "L",
+   "evidence": "jobs: HashMap<String, DownloadJob>; let dest = dir.join(\"model.gguf\"); validate_request only checks http(s) prefix",
+   "confidence": "high"
+  },
+  {
+   "name": "download_task, part_len, FailedMarker, verify_sha256, hex_encode",
+   "file": "backend/src/downloads.rs",
+   "lines": "287-451",
+   "what_it_does": "Streams the download with resume support, optionally checks its SHA-256, renames the partial file when done, and writes a '.failed' marker file beside it on error.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "worker",
+   "change": "Keep the resume and checksum logic in the worker job. Write in parts to the object store. Record failures and progress in the job's database row instead of marker files.",
+   "size": "M",
+   "evidence": "dest.with_extension(\"gguf.part\"); FailedMarker::write(&dest, ..); tokio::fs::rename(&part, &dest)",
+   "confidence": "high"
+  },
+  {
+   "name": "describe_model, ModelEstimates",
+   "file": "backend/src/downloads.rs",
+   "lines": "453-514",
+   "what_it_does": "Rough size and fit estimate for one model (fixed 0.5 MB per context token) plus missing-file warnings.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "remove",
+   "change": "Replace it with the stored fit decision for each GPU type, shown on the admin model page. Keep only the missing-file and missing-vision-file checks as part of import validation.",
+   "size": "S",
+   "evidence": "let kv_cache_gb = (meta.context_length as f64) * 0.000_5",
+   "confidence": "medium"
+  },
+  {
+   "name": "ToolMethod, FileText, CheckOutcome, ToolingProfile, summary, ProfileState, profile_state",
+   "file": "backend/src/tooling.rs",
+   "lines": "30-117",
+   "what_it_does": "Records how a model calls tools (natively, through the app's text format, or not at all) and whether file text arrives intact. It also tracks whether that result is still current for this runtime build and chat template.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Make it the core of the model's ability profile, adding context size, vision, whether reasoning is supported, provider, and the date checked. The 'current' test compares provider and model version for outside models.",
+   "size": "S",
+   "evidence": "pub struct ToolingProfile { method, can_write, file_text, runtime, template, checks, .. }",
+   "confidence": "high"
+  },
+  {
+   "name": "profile_dir, read_profile, write_profile",
+   "file": "backend/src/tooling.rs",
+   "lines": "119-136",
+   "what_it_does": "Saves and reads the tool-check result as tooling.json in the same folder as the model file.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "shared_library",
+   "change": "Store it in a PostgreSQL table keyed by model id, model content hash or provider model version, runtime build and template fingerprint. The model store may be read-only, and many machines share it.",
+   "size": "S",
+   "evidence": "pub const PROFILE_FILE: &str = \"tooling.json\"; std::fs::write(&temporary, ..); std::fs::rename(.., dir.join(PROFILE_FILE))",
+   "confidence": "high"
+  },
+  {
+   "name": "runtime_identity, template_fingerprint",
+   "file": "backend/src/tooling.rs",
+   "lines": "138-176",
+   "what_it_does": "Identifies the runtime build from a BUILD_INFO.json file next to the server program, or from the file's size and date, and makes a short fingerprint of the chat template text.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Each copy reports its runtime build to the registry; the fingerprint function moves to the shared library. Outside providers use provider name plus model version.",
+   "size": "S",
+   "evidence": "server_binary.parent().map(|dir| dir.join(\"BUILD_INFO.json\"))",
+   "confidence": "high"
+  },
+  {
+   "name": "parameters, tool_definitions, descriptors",
+   "file": "backend/src/tooling.rs",
+   "lines": "178-306",
+   "what_it_does": "A hand-written table of input formats for every built-in tool (read_file, execute_command, preview_page and so on). Any other tool name gets an empty format.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "shared_library",
+   "change": "Take tool input formats from each tool's description: built-in tools from the shared tool registry, plugin and MCP tools from their description files. The model gateway can then offer any allowed tool natively.",
+   "size": "M",
+   "evidence": "match tool { \"list_directory\" => .., \"execute_command\" => .., _ => (serde_json::json!({}), &[]) }",
+   "confidence": "high"
+  },
+  {
+   "name": "check and probe helpers (PROBE_FILE_TEXT, probe_write_task, leaked_call_text, same_text, native_call_outcome, file_outcome, text_call_outcome)",
+   "file": "backend/src/tooling.rs",
+   "lines": "308-541",
+   "what_it_does": "Sends 2 to 4 short test requests to the loaded model: one asking it to list files, one asking it to write a tricky file exactly. If the model's native tool calling fails, it repeats both in the app's text format, then decides the tool method and whether the model may write files.",
+   "assumes": [
+    "one_loaded_model"
+   ],
+   "destination": "worker",
+   "change": "Run it as a queued job through the model gateway, so it works for llama.cpp, vLLM and outside providers. Trigger it on the first ready copy of a new model, runtime or template, or by the admin. For outside providers, show the cost and require admin approval. It depends on the agent's prompt builder and parser, which must be in the shared library.",
+   "size": "M",
+   "evidence": "pub async fn check(client: &SidecarClient, cfg, runtime, template, caps); crate::agent_runner::system_prompt_for(..); crate::agent_runner::parse_tool_block(..)",
+   "confidence": "high"
+  },
+  {
+   "name": "hardware: CpuInfo, RamInfo, GpuInfo, HardwareReport, static_info, available_ram_gb, detect",
+   "file": "backend/src/hardware.rs",
+   "lines": "12-117",
+   "what_it_does": "Reads this machine's CPU, core counts, RAM and operating system. The GPU list is a placeholder that always says 'not enumerated'.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Each GPU machine reports these facts to the registry, with a real list of GPUs (index, vendor, memory) so copies can be placed on specific GPUs. API servers do not need it.",
+   "size": "S",
+   "evidence": "gpus: vec![GpuInfo { vendor: \"unknown\", model: \"not enumerated (runtime device list decides placement)\", vram_gb: 0.0, .. }]",
+   "confidence": "high"
+  },
+  {
+   "name": "snapshot, ResourceSnapshot",
+   "file": "backend/src/hardware.rs",
+   "lines": "43-54, 119-141",
+   "what_it_does": "Combines this machine's CPU, RAM and GPU readings with the context size and speed of 'the' running model into one meter reading.",
+   "assumes": [
+    "one_loaded_model"
+   ],
+   "destination": "api_server",
+   "change": "Split it. The meters for a user's own request (context used, tokens per second) come from that request's metrics. Machine readings go to the admin dashboard for each machine and GPU.",
+   "size": "S",
+   "evidence": "snapshot(latest, context_used, context_limit, tps) called with inf.context_size(), inf.metrics().tokens_per_sec of StubEngine",
+   "confidence": "high"
+  },
+  {
+   "name": "daio: DeviceProfile, fingerprint_parts, normalize_token, detect_simd",
+   "file": "backend/src/daio.rs",
+   "lines": "15-95",
+   "what_it_does": "Builds a non-identifying fingerprint of this machine (CPU family, cores, GPU, memory, OS, backend) and lists CPU instruction sets.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Keep the fingerprint as the 'machine type' key that calibrations and fit decisions are stored under.",
+   "size": "S",
+   "evidence": "fingerprint_parts() used by api.rs:9718 calibration_environment",
+   "confidence": "high"
+  },
+  {
+   "name": "daio: seed_capabilities, ModelProfile, kv_per_token_mb, WorkloadClass, Placement, optimize",
+   "file": "backend/src/daio.rs",
+   "lines": "97-325",
+   "what_it_does": "An advisory rule-of-thumb placement recommender (GPU, hybrid or CPU, context size) built from parameter-count guesses.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "remove",
+   "change": "Remove it. The runtime's measured fit and calibration replaced it, and it is only shown on an advisory endpoint.",
+   "size": "S",
+   "evidence": "kv_per_token_mb(params_b) = 1.0 * (params_b / 8.0).sqrt(); rationale 'Advisory f16 KV estimate, not measured allocation'",
+   "confidence": "medium"
+  },
+  {
+   "name": "cpu_topology: LogicalCpu, CpuTopology, detect, platform modules",
+   "file": "backend/src/cpu_topology.rs",
+   "lines": "1-274",
+   "what_it_does": "Reads from the operating system which logical processors share a core and which cores are the fast ones on hybrid CPUs.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Keep it on each GPU machine. Inside a Kubernetes container it must respect the CPU limit given to the copy, not the whole host.",
+   "size": "S",
+   "evidence": "GetSystemCpuSetInformation (Windows); /sys parsing (Linux)",
+   "confidence": "medium"
+  },
+  {
+   "name": "recommend: Workload, RecProfile, bytes_per_param, parse_params_b, shape, kv_per_token, recommend",
+   "file": "backend/src/recommend.rs",
+   "lines": "1-275",
+   "what_it_does": "Rule-of-thumb context recommendation from parameter count and quantization guesses, shared across active sessions.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "remove",
+   "change": "Remove it. The runtime fit is the authority. Its one useful idea, capacity shared by concurrent sessions, belongs in the pool manager's choice of slots for each copy.",
+   "size": "S",
+   "evidence": "shape(params_b) heuristic; 'Advisory estimate, not measured allocation'",
+   "confidence": "medium"
+  },
+  {
+   "name": "speed_rule::balanced_choice",
+   "file": "backend/src/speed_rule.rs",
+   "lines": "1-88",
+   "what_it_does": "The owner's rule for picking between speed options: give up at most 5% of generation speed, and only for at least 5 times as much gain in prompt-reading speed.",
+   "assumes": [
+    "none"
+   ],
+   "destination": "model_pool_manager",
+   "change": "No change. It stays the tuning rule for llama.cpp copies.",
+   "size": "S",
+   "evidence": "MAX_GENERATION_LOSS = 0.05; MIN_GAIN_PER_LOSS = 5.0",
+   "confidence": "high"
+  },
+  {
+   "name": "read_nvidia_smi, parse_smi_line, vram_info, GpuReading",
+   "file": "backend/src/metrics.rs",
+   "lines": "30-94",
+   "what_it_does": "Runs nvidia-smi to read GPU use, memory, temperature and power, and keeps only the busiest card.",
+   "assumes": [
+    "pc_processes"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Each GPU machine reads every GPU separately (by index), for all vendors where possible, and reports to the central metrics store. Memory budgeting for each copy uses the assigned GPU's reading.",
+   "size": "M",
+   "evidence": "text.lines().filter_map(parse_smi_line).max_by(util_pct) // Multi-GPU: report the busiest card",
+   "confidence": "high"
+  },
+  {
+   "name": "MetricsLog, SharedLog, sample_once, collect_sample, sampler, Sample",
+   "file": "backend/src/metrics.rs",
+   "lines": "13-29, 96-234",
+   "what_it_does": "A background task in this program samples the whole machine's CPU, RAM and GPU every 2 seconds into a one-hour in-memory history. It also counts active sessions.",
+   "assumes": [
+    "in_memory_state"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Each GPU machine pushes samples, tagged with machine and GPU, to a central store (a PostgreSQL time table or Prometheus). The admin dashboard reads from there. The 'active sessions' count comes from the copies' slot use, not from one process.",
+   "size": "M",
+   "evidence": "pub const CAPACITY: usize = 1800; // 1 hour at 2 s; samples: VecDeque<Sample>",
+   "confidence": "high"
+  },
+  {
+   "name": "alerts_for, Alert",
+   "file": "backend/src/metrics.rs",
+   "lines": "236-275",
+   "what_it_does": "Warns about high GPU memory or RAM use and suggests reducing context, reducing GPU layers or stopping inference.",
+   "assumes": [
+    "one_loaded_model"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Alerts are raised for each machine and GPU on the admin dashboard, with suggestions aimed at admins (scale out, fewer copies on this GPU).",
+   "size": "S",
+   "evidence": "suggestions: [\"Reduce context size\", \"Reduce GPU layers\", \"Stop idle inference (`Stop` in System)\"]",
+   "confidence": "high"
+  },
+  {
+   "name": "AppState fields models, inference, llama, downloads, load_progress, fit_preparation",
+   "file": "backend/src/api.rs",
+   "lines": "78-108",
+   "what_it_does": "In-memory shared state of the single program: model list with current model, stub engine, the one model server, download jobs, one load-progress record, and background fit-search flags.",
+   "assumes": [
+    "in_memory_state",
+    "one_loaded_model"
+   ],
+   "destination": "remove",
+   "change": "Remove these from the API server state.\n- The registry, copies, downloads and progress move to PostgreSQL, owned by the pool manager and admin jobs.\n- API servers keep only a gateway client and a short-lived read cache of the registry.",
+   "size": "L",
+   "evidence": "pub llama: Arc<RwLock<LlamaServerManager>>; pub inference: Arc<RwLock<StubEngine>>; pub load_progress: Arc<RwLock<LoadProgress>>; pub fit_preparation: Arc<FitPreparation>",
+   "confidence": "high"
+  },
+  {
+   "name": "list_models (GET /api/models, /api/v1/models)",
+   "file": "backend/src/api.rs",
+   "lines": "674-720",
+   "what_it_does": "On every call it rescans the local models folder, updates the list, starts a background fit for new files, reads each model's tooling.json, and adds tool support from the SQLite record.",
+   "assumes": [
+    "pc_files",
+    "single_db_file",
+    "one_user",
+    "in_memory_state"
+   ],
+   "destination": "api_server",
+   "change": "Return the models this user's groups allow. For each, include its ability profile and availability (ready copies, can wake up) from the database. Folder scanning becomes the admin import action, and the list call never touches disk.",
+   "size": "M",
+   "evidence": "crate::models::scan_models_dir(&s.models_dir) on every call; crate::tooling::read_profile(..); st.template_caps_for(&key)",
+   "confidence": "high"
+  },
+  {
+   "name": "load_model (POST /api/models/load)",
+   "file": "backend/src/api.rs",
+   "lines": "722-775",
+   "what_it_does": "Lets the user switch the one running model. It refuses if any chat or agent run is active, and reports progress in the single progress record.",
+   "assumes": [
+    "one_loaded_model",
+    "one_user",
+    "in_memory_state"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Users no longer load models: choosing a model on a conversation is enough, and the gateway routes by model id. The admin gets 'deploy / set copies / scale' actions on the pool manager instead.",
+   "size": "M",
+   "evidence": "guard_agent_running(&s, force.force); load_model_by_id(&s, req.id.trim())",
+   "confidence": "high"
+  },
+  {
+   "name": "unload_models (POST /api/models/unload)",
+   "file": "backend/src/api.rs",
+   "lines": "777-786",
+   "what_it_does": "Stops the running model if no run is active, then restarts the background fit search.",
+   "assumes": [
+    "one_loaded_model",
+    "in_memory_state"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Becomes the admin's 'scale model to zero' or 'stop copy' action. The pool manager drains that copy (no new requests, finish current ones) before stopping it.",
+   "size": "S",
+   "evidence": "s.models.write().await.unload_all(); s.llama.write().await.stop().await",
+   "confidence": "high"
+  },
+  {
+   "name": "inference_status (GET /api/inference/status)",
+   "file": "backend/src/api.rs",
+   "lines": "788-827",
+   "what_it_does": "Reports whether the one model server is running, its address, model, context, last error, and a CPU-mode notice.",
+   "assumes": [
+    "one_loaded_model",
+    "in_memory_state"
+   ],
+   "destination": "api_server",
+   "change": "Users get each allowed model's availability. The status of each copy, including its address, last error and CPU fallback, is admin-only.",
+   "size": "S",
+   "evidence": "let m = s.models.read().await.current(); base_url = llama.base_url()",
+   "confidence": "high"
+  },
+  {
+   "name": "inference_start (POST /api/inference/start)",
+   "file": "backend/src/api.rs",
+   "lines": "829-920",
+   "what_it_does": "Starts the model server for a model id, or for any file path and port the caller sends, falling back to the current model.",
+   "assumes": [
+    "one_loaded_model",
+    "pc_files",
+    "pc_processes",
+    "loopback_only"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin-only 'start copy of registered model'. Remove the free file path and port from the request; ports are allocated by the pool manager. Audit every call.",
+   "size": "M",
+   "evidence": "InferenceStartReq { model_path: Option<String>, port: Option<u16>, .. }; (None, PathBuf::from(p)); req.port.unwrap_or(DEFAULT_SIDECAR_PORT)",
+   "confidence": "high"
+  },
+  {
+   "name": "tooling_for_load, tooling_identity",
+   "file": "backend/src/api.rs",
+   "lines": "922-976",
+   "what_it_does": "During a model load, uses the saved tool-check result or runs the check now (a few seconds), and tells the person loading what was found.",
+   "assumes": [
+    "one_loaded_model",
+    "pc_files"
+   ],
+   "destination": "model_pool_manager",
+   "change": "When a copy becomes ready and its model/runtime/template has no current profile, the pool manager queues a tool-check job. The load is never blocked, and the check runs once per model, not per copy. The notice goes to the admin.",
+   "size": "S",
+   "evidence": "set_progress(.., \"checking_tools\", ..); run_tool_check(s, model, base_url, cfg, runtime, template)",
+   "confidence": "high"
+  },
+  {
+   "name": "run_tool_check",
+   "file": "backend/src/api.rs",
+   "lines": "978-998",
+   "what_it_does": "Runs the tool check against a running model's address and saves the result beside the model file.",
+   "assumes": [
+    "pc_files"
+   ],
+   "destination": "worker",
+   "change": "Worker job that calls the gateway with a model id (any copy, or the provider) and writes the ability profile to the database.",
+   "size": "S",
+   "evidence": "crate::tooling::write_profile(&dir, &profile)",
+   "confidence": "high"
+  },
+  {
+   "name": "recheck_model_tooling (POST /api/models/:id/tooling/check)",
+   "file": "backend/src/api.rs",
+   "lines": "1000-1039",
+   "what_it_does": "Re-runs the tool check, but only if the requested model is the one loaded. It updates the running model's settings in memory.",
+   "assumes": [
+    "one_loaded_model",
+    "in_memory_state"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin action that queues a check for any model id (self-hosted or provider). Gateways pick up the new profile from the database.",
+   "size": "S",
+   "evidence": "running.filter(|_| loaded.as_deref() == Some(id.as_str())); running.cfg.tooling = Some(profile.clone())",
+   "confidence": "high"
+  },
+  {
+   "name": "guard_agent_running",
+   "file": "backend/src/api.rs",
+   "lines": "1047-1080",
+   "what_it_does": "Blocks any model change while any chat reply or agent run is active anywhere in the program.",
+   "assumes": [
+    "one_user",
+    "one_loaded_model",
+    "in_memory_state"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Replace it with per-copy draining. Taking a copy out of service stops new requests going to it and waits for its in-flight requests (and moves or pauses agent runs pinned to it). Other users and models are unaffected. Active runs are tracked in the database, not in one process.",
+   "size": "M",
+   "evidence": "s.generations.read().await.is_active() ... s.agents.read().await.summaries().filter(is_active) => 409",
+   "confidence": "high"
+  },
+  {
+   "name": "fit_context_with_runtime, FitPurpose, batched_fit_holds, search_fit (and apply_fit_decision)",
+   "file": "backend/src/api.rs",
+   "lines": "1082-1561",
+   "what_it_does": "Asks llama.cpp's fit tool which context, cache and batch size keep the whole model on the GPU, checks that probes run together agree with probes run alone, and remembers the decision in the SQLite file.",
+   "assumes": [
+    "pc_processes",
+    "pc_files",
+    "single_db_file"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Move it to the pool manager's start-copy path on the target machine. Store decisions in PostgreSQL keyed by GPU type. Count memory reserved by sibling copies, and only one copy starts on a GPU at a time, so two starts cannot both claim the same free memory.",
+   "size": "M",
+   "evidence": "s.storage.lock().await.fit_decision_for(&key); probe(&fit_tool, gguf, ..); FIT_PROBE_CONCURRENCY",
+   "confidence": "high"
+  },
+  {
+   "name": "FitPreparation, spawn_fit_preparation, prepare_fits, prepare_fit",
+   "file": "backend/src/api.rs",
+   "lines": "1609-1751",
+   "what_it_does": "A background job in this program that works out each model's fit ahead of its first load, but only while no model is running. It is cancelled the moment a load starts.",
+   "assumes": [
+    "in_memory_state",
+    "one_loaded_model",
+    "global_settings"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Run it per machine and GPU when a GPU is idle, or as the admin's 'prepare deployment' action, using the deployment's admin settings. If several models are always running it may never find an idle GPU, so the fit is mainly done at copy start.",
+   "size": "M",
+   "evidence": "if .. || s.llama.write().await.is_running() { return; }; models.sort_by_key(|model| model.id != settings.general.default_model)",
+   "confidence": "high"
+  },
+  {
+   "name": "start_sidecar",
+   "file": "backend/src/api.rs",
+   "lines": "1845-2121",
+   "what_it_does": "The whole model-load pipeline:\n- stops the previous model and marks everything unloaded;\n- measures GPU memory and RAM;\n- applies the user's settings, the calibration profile and the runtime fit, then chooses memory-mapping and the prompt-cache size;\n- starts the server with GPU-then-CPU fallback;\n- reads the template's capabilities, runs the tool check, and publishes the model as current.",
+   "assumes": [
+    "one_loaded_model",
+    "pc_processes",
+    "pc_files",
+    "global_settings",
+    "in_memory_state",
+    "loopback_only",
+    "single_db_file"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Becomes 'start one copy of model X on GPU G'. It never stops other copies. Settings come from the admin's deployment config. The result is a registry row, and the tool check is queued separately. Sampling settings are removed from the load (they become per request).",
+   "size": "L",
+   "evidence": "s.llama.write().await.stop().await; s.models.write().await.unload_all(); base_inference_config(&settings, ..); s.llama.write().await.running = Some(sidecar); s.models.write().await.switch_to(id)",
+   "confidence": "high"
+  },
+  {
+   "name": "inference_stop (POST /api/inference/stop)",
+   "file": "backend/src/api.rs",
+   "lines": "2123-2133",
+   "what_it_does": "Stops the running model when no run is active, and restarts the background fit search.",
+   "assumes": [
+    "one_loaded_model",
+    "in_memory_state"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin 'stop copy or deployment' action with draining and an audit record.",
+   "size": "S",
+   "evidence": "guard_agent_running(&s, false); s.llama.write().await.stop().await",
+   "confidence": "high"
+  },
+  {
+   "name": "scan_models (POST /api/models/scan)",
+   "file": "backend/src/api.rs",
+   "lines": "2135-2147",
+   "what_it_does": "Rescans the local models folder and updates the in-memory list.",
+   "assumes": [
+    "pc_files",
+    "in_memory_state"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin 'import models from store' action that runs a header-reading job and writes registry rows.",
+   "size": "S",
+   "evidence": "crate::models::scan_models_dir(&dir); s.models.write().await.reconcile(found)",
+   "confidence": "high"
+  },
+  {
+   "name": "model_recommend (GET /api/models/:id/recommend)",
+   "file": "backend/src/api.rs",
+   "lines": "2181-2246",
+   "what_it_does": "Rule-of-thumb context recommendation using this machine's memory and the number of active agent runs.",
+   "assumes": [
+    "pc_files",
+    "in_memory_state"
+   ],
+   "destination": "remove",
+   "change": "Remove it. Fit decisions per GPU type, on the admin model page, replace it.",
+   "size": "S",
+   "evidence": "crate::recommend::recommend(&RecInputs { vram_gb: vram, ram_gb: hw.ram.total_gb, other_sessions: others, .. })",
+   "confidence": "medium"
+  },
+  {
+   "name": "model_detail (GET /api/models/:id)",
+   "file": "backend/src/api.rs",
+   "lines": "2248-2279",
+   "what_it_does": "Shows a model's facts plus rough size and fit estimates, worked out from this machine and the user's context setting.",
+   "assumes": [
+    "pc_files",
+    "global_settings"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "The admin view shows registry facts, fit decisions and calibrations per GPU type, and the copies. Users get a short model card: name, ability profile, context.",
+   "size": "S",
+   "evidence": "describe_model(&effective_meta, vram, hw.ram.total_gb); s.settings.read().await.inference.context_size",
+   "confidence": "high"
+  },
+  {
+   "name": "delete_model (DELETE /api/models/:id)",
+   "file": "backend/src/api.rs",
+   "lines": "2281-2328",
+   "what_it_does": "Permanently deletes a model's weights file from this disk, stopping the model first if it is the one loaded. It does not check for running work.",
+   "assumes": [
+    "pc_files",
+    "one_loaded_model"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin-only, with an audit record. Drain and stop all copies of the model, remove its registry entry and permissions, then delete it from the model store.",
+   "size": "M",
+   "evidence": "if is_current { s.llama.write().await.stop().await; .. } std::fs::remove_file(&weights)",
+   "confidence": "high"
+  },
+  {
+   "name": "Download handlers: list_downloads, start_download, get_download, pause_download, resume_download, cancel_download",
+   "file": "backend/src/api.rs",
+   "lines": "2330-2398",
+   "what_it_does": "Exposes the download manager: start a download from any address, list, get, pause, resume or cancel.",
+   "assumes": [
+    "in_memory_state",
+    "pc_files"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin-only endpoints over download jobs queued in PostgreSQL, checked against the network policy, writing to the model store.",
+   "size": "M",
+   "evidence": "dm.start(req.id, req.url, req.sha256, http)",
+   "confidence": "high"
+  },
+  {
+   "name": "load_model_by_id",
+   "file": "backend/src/api.rs",
+   "lines": "6654-6689",
+   "what_it_does": "Loads a registered model on the fixed port 3888, replacing whatever was running. It is used by the load button and the /model chat command.",
+   "assumes": [
+    "one_loaded_model",
+    "loopback_only"
+   ],
+   "destination": "remove",
+   "change": "Remove it. The /model command and the selector set the conversation's model id, and the gateway routes by it.",
+   "size": "S",
+   "evidence": "start_sidecar(s, Some(model.id.clone()), model.gguf_path(), DEFAULT_SIDECAR_PORT, ..); caller api.rs:6326",
+   "confidence": "high"
+  },
+  {
+   "name": "prepare_conversation (POST /api/conversations/:id/prepare)",
+   "file": "backend/src/api.rs",
+   "lines": "6912-7089",
+   "what_it_does": "Before continuing a saved conversation, it loads that conversation's model, replacing the running one. It then checks the model did not change in the meantime and records it as the conversation's last model.",
+   "assumes": [
+    "one_loaded_model",
+    "in_memory_state",
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Becomes 'warm up': check the user may use the model, ask the pool manager to make sure a copy is ready (waking from zero copies if needed), and choose or record the copy for this conversation (the affinity entry). It never stops anything.",
+   "size": "M",
+   "evidence": "if !already { start_sidecar(&bg, Some(target.clone()), gguf.clone(), DEFAULT_SIDECAR_PORT, ..) }; same_existing_model_path(&running.cfg.model_path, &gguf)",
+   "confidence": "high"
+  },
+  {
+   "name": "conversation_compatibility (GET compatibility for a pending switch)",
+   "file": "backend/src/api.rs",
+   "lines": "7091-7151",
+   "what_it_does": "Warns whether a target model can handle the conversation's images and earlier tool calls, using the model's vision and tool-calling flags.",
+   "assumes": [
+    "single_db_file"
+   ],
+   "destination": "api_server",
+   "change": "Read the ability profile (vision, tool method, can write files, context) from the database. Also check that the user is allowed the model, and note when an outside provider would receive the conversation (data policy).",
+   "size": "S",
+   "evidence": "if image_attachments > 0 && !target.vision; if has_tool_turns && !target.tool_calling",
+   "confidence": "high"
+  },
+  {
+   "name": "benchmark (POST /api/system/benchmark)",
+   "file": "backend/src/api.rs",
+   "lines": "8117-8178",
+   "what_it_does": "Runs one timed reply on the current model and reports speeds and cache hits.",
+   "assumes": [
+    "one_loaded_model",
+    "in_memory_state"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin action that benchmarks a chosen model id (or a specific copy) through the gateway.",
+   "size": "S",
+   "evidence": "let mut llama = s.llama.write().await; .. s.models.read().await.current()",
+   "confidence": "high"
+  },
+  {
+   "name": "runtime_policy (GET /api/runtime/policy)",
+   "file": "backend/src/api.rs",
+   "lines": "8861-8948",
+   "what_it_does": "Shows the active model's launch plan and a preview of the next load's plan, built from the single settings object, the current or default model, and the latest GPU sample.",
+   "assumes": [
+    "one_loaded_model",
+    "global_settings",
+    "in_memory_state"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin view of each deployment's launch plan for each GPU type, plus the active plan of each copy.",
+   "size": "S",
+   "evidence": "registry.current().cloned().or_else(|| registry.get(&settings.general.default_model)); n_ctx: settings.inference.context_size",
+   "confidence": "high"
+  },
+  {
+   "name": "system_info (GET /api/system, /api/v1/system)",
+   "file": "backend/src/api.rs",
+   "lines": "9171-9182",
+   "what_it_does": "Returns this machine's hardware and a meter snapshot that includes the stub engine's context size.",
+   "assumes": [
+    "one_loaded_model",
+    "in_memory_state"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin view of each machine. The desktop app can show local PC facts itself if ever needed.",
+   "size": "S",
+   "evidence": "hardware::snapshot(latest.as_ref(), 0, inf.context_size(), inf.metrics().tokens_per_sec)",
+   "confidence": "high"
+  },
+  {
+   "name": "system_metrics (GET /api/system/metrics, /api/v1/system/metrics)",
+   "file": "backend/src/api.rs",
+   "lines": "9184-9207",
+   "what_it_does": "Returns this process's in-memory history of machine readings and alerts.",
+   "assumes": [
+    "in_memory_state"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Reads the central metrics store, filtered by machine and GPU.",
+   "size": "M",
+   "evidence": "let log = s.metrics.lock(); log.window(secs)",
+   "confidence": "high"
+  },
+  {
+   "name": "system_overview (GET /api/system/overview, /api/v1/system/overview)",
+   "file": "backend/src/api.rs",
+   "lines": "9209-9295",
+   "what_it_does": "One screen with this machine, the current model, its file size, and the 20 most recent conversations of the whole database, with machine load attributed to the active one.",
+   "assumes": [
+    "one_user",
+    "one_loaded_model",
+    "in_memory_state",
+    "single_db_file"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin overview of models, copies, machines and load. Drop the conversation list: it is not scoped to any owner and would show every user's titles.",
+   "size": "M",
+   "evidence": "st.list_conversations() .. take(20); s.models.read().await.current()",
+   "confidence": "high"
+  },
+  {
+   "name": "set_progress, load_progress (GET /api/models/load/progress), cancel_load (POST /api/models/load/cancel), LoadProgress",
+   "file": "backend/src/api.rs",
+   "lines": "111-120, 9299-9322",
+   "what_it_does": "One shared record of the current model load's stage. Cancelling sets a flag and immediately stops the running model server, without checking for active work.",
+   "assumes": [
+    "in_memory_state",
+    "one_loaded_model"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Each copy has a stage stored on its registry row (starting, fitting, checking tools, ready, failed). Admins can cancel a starting copy without touching running ones, and users only see 'waking up'.",
+   "size": "S",
+   "evidence": "pub load_progress: Arc<RwLock<LoadProgress>>; cancel_load: s.llama.write().await.stop().await (no guard_agent_running)",
+   "confidence": "high"
+  },
+  {
+   "name": "cache_budget (GET /api/system/cache)",
+   "file": "backend/src/api.rs",
+   "lines": "9652-9673",
+   "what_it_does": "Returns mostly fixed text about cache budgets, plus the sampler's sample count and the stub engine's context.",
+   "assumes": [
+    "in_memory_state",
+    "single_db_file"
+   ],
+   "destination": "remove",
+   "change": "Remove it. Prompt-cache hit rates for each copy belong in admin metrics.",
+   "size": "S",
+   "evidence": "\"budgets\": {\"ram\": null, \"vram\": null}; \"history\": {\"storage\": \"local SQLite\"}",
+   "confidence": "high"
+  },
+  {
+   "name": "current_device_profile, calibration_environment, latest_calibration, apply_calibrated_profile, calibrated_micro_batch_of",
+   "file": "backend/src/api.rs",
+   "lines": "1601-1607, 9675-9726, 10014-10086",
+   "what_it_does": "Builds this machine's fingerprint. It reads the runtime version, power source, driver and CPU layout, looks up the model's latest calibration in SQLite, and applies the chosen profile (threads, waiting, priority) to a load.",
+   "assumes": [
+    "pc_processes",
+    "single_db_file",
+    "global_settings"
+   ],
+   "destination": "model_pool_manager",
+   "change": "Run on each GPU machine at copy start. Calibrations are stored in PostgreSQL by machine type. The profile choice is an admin setting for each deployment.",
+   "size": "S",
+   "evidence": "\"nvidia GPU (via nvidia-smi)\" / \"cuda\" guessed from vram_info; calibrations_for(&model.id, &key); settings.runtime.profile_name()",
+   "confidence": "high"
+  },
+  {
+   "name": "model_calibration (GET /api/models/:id/calibration)",
+   "file": "backend/src/api.rs",
+   "lines": "9728-9763",
+   "what_it_does": "Shows a model's latest calibration and whether it still matches this machine.",
+   "assumes": [
+    "single_db_file",
+    "pc_processes"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin view of calibrations for each model and machine type.",
+   "size": "S",
+   "evidence": "calibration_environment(&s, &binary.0).await runs llama-server --version",
+   "confidence": "high"
+  },
+  {
+   "name": "calibrate_model (POST /api/models/:id/calibrate)",
+   "file": "backend/src/api.rs",
+   "lines": "9765-10012",
+   "what_it_does": "Stops the running model, then runs the fit and benchmark tools for several minutes (including a 2-minute cooling pause) and saves the result.",
+   "assumes": [
+    "one_loaded_model",
+    "pc_processes",
+    "single_db_file",
+    "in_memory_state"
+   ],
+   "destination": "admin_dashboard_api",
+   "change": "Admin action. The pool manager drains one machine or GPU of each type, runs the calibration there as a job, stores the results, and returns the machine to service. It must not stop copies other users are relying on without draining.",
+   "size": "M",
+   "evidence": "stage(\"unloading\", \"Unloading the current model so only one model is in memory.\"); bg.llama.write().await.stop().await",
+   "confidence": "high"
+  },
+  {
+   "name": "device_profile, capability_db, model_optimize, calibrate (GET /api/system/device, /api/system/capabilities, /api/models/:id/optimize, POST /api/system/calibrate)",
+   "file": "backend/src/api.rs",
+   "lines": "10088-10192",
+   "what_it_does": "Advisory endpoints: this machine's fingerprint, a list of CPU and GPU features, a rule-of-thumb placement, and a placeholder 'calibrate' that only echoes the device.",
+   "assumes": [
+    "in_memory_state"
+   ],
+   "destination": "remove",
+   "change": "Remove model_optimize, capability_db and the placeholder calibrate. The device fingerprint is shown per machine in the admin dashboard.",
+   "size": "S",
+   "evidence": "\"profile_status\": \"baseline-uncalibrated\"; crate::daio::optimize(&device, &model, workload, active, policy)",
+   "confidence": "medium"
+  }
+ ],
+ "surprises": [
+  {
+   "title": "Chat and agent requests never name a model: they use whatever is running",
+   "why_it_matters": "A gateway with several models needs a model id on every request. Today a conversation's model_id is not used to answer it. The reply comes from the loaded model, and the conversation's 'last model' is overwritten with that model afterwards. A recovery screen exists only for this mismatch. Routing must resolve conversation model, then user's allowed list, then a copy, for chat, agent steps, compaction and summaries alike.",
+   "evidence": "api.rs:3452-3463 sidecar = llama.running (base_url, cfg); agent_runner.rs:2619-2637 same snapshot; api.rs:4141-4149 set_last_model(cid, current()); api.rs:8767 stale filter c.last_model != loaded; api.rs:6840-6856 compaction uses the running sidecar",
+   "file": "backend/src/api.rs",
+   "lines": "3452-3463, 4141-4149, 6840-6856, 8765-8776"
+  },
+  {
+   "title": "Each copy serves one conversation at a time; more slots split the context",
+   "why_it_matters": "With --parallel 1, a second user's request queues behind the first and evicts its cached prompt. Raising the slot count makes llama.cpp divide --ctx-size across slots (unless a unified cache is used). The whole memory-fit search sizes the context for one slot, so the fit, the policy and the admin's concurrency setting must be designed together.",
+   "evidence": "server_args: \"--parallel\".into(), \"1\".into(); fit_to_memory and largest_full_gpu_context size one context; prompt_cache_ram_mib sizes the RAM cache for switching conversations on one copy",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "214-226, 319-322"
+  },
+  {
+   "title": "Prompt-cache reuse depends on llama.cpp choosing the slot, and the side requests of a run must reach the same copy",
+   "why_it_matters": "Several things make 'same conversation to the same copy' a requirement:\n- the client never says which slot to use, so llama.cpp picks by prompt similarity;\n- the RAM prompt cache belongs to each copy;\n- completion checks and compaction notes are deliberately built on the run's own prompt (including the tool list) so they hit the cache.\nSo the affinity map (conversation or agent run to copy) must sit in a shared store that every stateless API server and worker reads. There must be a fallback when a copy is drained or dies, at the cost of re-reading the prompt. The app's stable-prefix ordering helps both llama.cpp and vLLM prefix caching.",
+   "evidence": "sampling_body \"cache_prompt\": true; chat_turns_on_run_prompt doc: same request without tools 'matched none of the run's cached prompt ... read in full (35,087 and 33,734 tokens)'; api.rs:126-135 legacy_prompt_order keeps prefix byte-identical",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "1297-1316, 1747-1776"
+  },
+  {
+   "title": "An agent run captures one server address at start and fails if that process dies",
+   "why_it_matters": "On a worker, a copy can be scaled in or restarted mid-run. Today the run never moves: it checks the in-process manager and stops with 'model server stopped'. The worker needs gateway health from the pool registry and re-routing to another copy (or pausing, as is decided for app disconnects).",
+   "evidence": "agent_runner.rs:2619-2637 snapshot (base_url, cfg); 3020-3029 stopped between steps => S::Failed; 3126 retry only while llama.is_running(); 3201-3211",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "2619-2637, 3020-3029, 3118-3129, 3201-3211"
+  },
+  {
+   "title": "Starting a copy can kill sibling copies on Windows",
+   "why_it_matters": "Before each start, every model-server process running the same program file whose parent process is gone is killed. With several copies on one Windows machine, a restart of the pool manager makes every surviving copy an 'orphan', and the next start kills them all. Reclaiming must be limited to copies the manager recorded.",
+   "evidence": "reap_orphaned_sidecars: filter exe()==target && parent missing => process.kill(); called in RunningSidecar::spawn before binding",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "408-415, 617-642"
+  },
+  {
+   "title": "Memory fit and calibration assume they have the whole GPU",
+   "why_it_matters": "These steps assume nothing else is using the GPU:\n- the fit preparation runs only when no model is loaded;\n- calibration stops the running model;\n- the policy counts all other GPU use as foreign;\n- notes tell the user to close other GPU-heavy applications;\n- GPU memory is read from nvidia-smi only, keeping the busiest card;\n- no option ever pins a copy to a GPU.\nSeveral copies or models on a multi-GPU server need GPU assignment per copy, memory reserved for copies that are starting, and one start at a time per GPU so concurrent fits cannot double-book memory.",
+   "evidence": "api.rs:1680/1702 prepare_fits returns if llama.is_running(); api.rs:9809-9812 calibrate stops model; metrics.rs:82-87 busiest card; hardware.rs:105-114 GPUs 'not enumerated'; server_args emits only --device none",
+   "file": "backend/src/api.rs",
+   "lines": "1671-1719, 2149-2166, 9809-9812"
+  },
+  {
+   "title": "Sampling values for every request are fixed into the model's load settings from one user's settings",
+   "why_it_matters": "Temperature, top-p, top-k and repeat penalty are copied from the single settings object when the model is loaded. Every later request reuses them, so the company, group and user setting levels cannot apply per user without separating sampling from the launch configuration.",
+   "evidence": "base_inference_config: temperature: settings.inference.temperature, top_p, top_k, repeat_penalty; sampling_body uses cfg.temperature etc.",
+   "file": "backend/src/api.rs",
+   "lines": "1565-1598"
+  },
+  {
+   "title": "The engine interface the comments describe does not exist; a fake engine is kept as a status mirror",
+   "why_it_matters": "The model gateway must be built new from the HTTP client code; there is no working abstraction to extend. Several status endpoints read context and speed from the stub (fake) engine instead of real data, so they must be rewritten rather than moved.",
+   "evidence": "inference.rs:3 'The rest of the application talks to IInferenceEngine'; LlamaCppEngine.generate returns 'not wired yet'; api.rs:2079-2085 'Mirror loaded state into the registry + stub engine for UI consistency'; system_info/cache_budget read s.inference",
+   "file": "backend/src/inference.rs",
+   "lines": "1-6, 1141-1335"
+  },
+  {
+   "title": "Tool input formats are hard-coded for built-in tools only",
+   "why_it_matters": "Plugin and MCP tools offered natively to a model would get an empty input format, and the forced answer format lists only the built-in registry. The ability profile and the plugin description files must supply each tool's format, or native tool calling will not work for plugins.",
+   "evidence": "tooling.rs parameters(): match on \"list_directory\", ..., _ => (json!({}), &[]); llamaserver.rs:1623 for tool in crate::tools::registry()",
+   "file": "backend/src/tooling.rs",
+   "lines": "178-306"
+  },
+  {
+   "title": "Request bodies include fields standard OpenAI and Anthropic APIs do not accept",
+   "why_it_matters": "Several fields in every request are llama.cpp extensions:\n- cache_prompt, top_k, repeat_penalty, timings_per_token, chat_template_kwargs;\n- a response_format of type json_object with a schema.\nThe hosted OpenAI API refuses unknown request fields (from general knowledge of that API, not checked here), and the Anthropic API uses a different format. The adapter split is a requirement before any outside provider works, not polish. Reporting the outside model's speed also needs a replacement for the llama.cpp timings data.",
+   "evidence": "sampling_body json; apply_options chat_template_kwargs; structured_action_schema {\"type\":\"json_object\",\"schema\":..}; stream(): body[\"timings_per_token\"]=true",
+   "file": "backend/src/llamaserver.rs",
+   "lines": "1297-1335, 1649, 2006-2013"
+  },
+  {
+   "title": "Any caller can start a model from any file path, and download from any address",
+   "why_it_matters": "The start endpoint takes a free file path and port from the request body, and the download endpoint accepts any http(s) address and writes to the server's disk. In a multi-user service both must be admin-only, audited, and checked against the network policy (downloads could otherwise reach internal addresses).",
+   "evidence": "InferenceStartReq { model_path, port }; (None, PathBuf::from(p)); DownloadManager::validate_request only checks the https:// / http:// prefix",
+   "file": "backend/src/api.rs",
+   "lines": "829-843, 879-880, 896-905"
+  },
+  {
+   "title": "Cancelling a load stops the running model for everyone",
+   "why_it_matters": "cancel_load stops the model server without the active-work check. With many users, one user's cancel would end every other user's replies and runs. Cancel must apply only to a starting copy and must be admin-only.",
+   "evidence": "cancel_load: s.load_progress.write().await.cancel_requested = true; s.llama.write().await.stop().await",
+   "file": "backend/src/api.rs",
+   "lines": "9317-9322"
+  },
+  {
+   "title": "The system overview lists every conversation without owner scoping",
+   "why_it_matters": "system_overview returns the 20 latest conversation titles from the whole database. In a multi-user service that leaks other users' titles. It must become an admin aggregate without conversation titles, or be scoped to the owner.",
+   "evidence": "let convs = st.list_conversations(); convs.into_iter().take(20).map(|c| json!({\"id\": c.id, \"title\": c.title, ..}))",
+   "file": "backend/src/api.rs",
+   "lines": "9237-9285"
+  },
+  {
+   "title": "Model identity is file name plus size, and fit keys contain local paths",
+   "why_it_matters": "Calibrations, template capabilities and tool checks are keyed by 'name:size'. Fit decisions also include the fit tool's absolute path and the file's modification date. Across machines and a shared model store these keys either collide (same name and size) or never match (different paths). A content hash and a machine-type key are needed.",
+   "evidence": "calibration::model_key = format!(\"{name}:{size}\"); fit_memory_key includes fit_tool.display() and modified(model); storage.rs:1232 template_caps keyed by model_key",
+   "file": "backend/src/calibration.rs",
+   "lines": "501-508"
+  },
+  {
+   "title": "Load settings live in the single user settings object, and changing them refits",
+   "why_it_matters": "The design says performance, tuning and model management belong to the admin. Today context size, automatic tuning, hardware threads and GPU layers, cache precision, drafting and the calibration profile are user settings. They are validated in put_settings, and a change restarts the fit search. They must move to admin settings for each deployment, and the user settings form must lose them, or users will tune shared GPUs.",
+   "evidence": "put_settings validates next.inference.context_size, next.hardware.*, next.runtime.kv_cache, next.runtime.speculative; previous.runtime != next.runtime => spawn_fit_preparation",
+   "file": "backend/src/api.rs",
+   "lines": "9046-9167"
+  },
+  {
+   "title": "The tool check runs inside the load and blocks it",
+   "why_it_matters": "start_sidecar runs the tool check before it marks the model ready, so the first load of a new model waits several seconds for 2 to 4 probe requests. With copies scaled automatically, the check must run once per (model, runtime, template) as a separate job, never per copy and never on the start path.",
+   "evidence": "start_sidecar: tooling_for_load(s, model, &binary, &base_url, &sidecar.cfg).await before s.llama.write().await.running = Some(sidecar)",
+   "file": "backend/src/api.rs",
+   "lines": "2066-2077"
+  }
+ ]
+}

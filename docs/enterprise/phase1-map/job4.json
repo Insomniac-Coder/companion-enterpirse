@@ -1,0 +1,226 @@
+{
+ "summary": "Second opinion on job 1's split of the agent loop and its tools. The core split holds up against the code. Every tool that touches the project or the PC goes to the desktop app. The loop, the server-side tools, approvals as records, and runs as database rows go to the worker or the API server. The list of about 14 places where the host (not the model) reads the project is accurate. I read about 45 of job 1's 98 items in the code and found 40 of them correct.\n\nThe main problems are in how job 1 treats a tool call as a single network round trip, and in how much the desktop can trust.\n\n1. **Approval inside the round trip.** If the desktop asks for approval as part of the tool request, the worker's \"timeout longer than the command timeout\" breaks. Today the wait for approval has no limit at all (rx.await, agent_runner.rs 4767). The device protocol also needs messages part-way through a request (\"waiting for approval\", \"approved, running\") so the run's screen and its event order stay right.\n\n2. **Losing the connection mid-step.** One step is not always safe to repeat: append_file adds the same text twice, and a command runs twice. Each request needs an id, and the desktop must keep results it could not deliver and send them on reconnect.\n\n3. **Where the approval prompt is shown.** If the desktop app loads the shared React screens from the server, a compromised server can serve code that clicks Allow itself. The same applies to adding an allowed folder. Both must be the app's own native screens, and the screens loaded from the server must not be able to trigger them.\n\n4. **Tools rated too low.** Three tools are rated moderate, which means one \"allow for this session\" click lets them run without asking again, yet each can run arbitrary code:\n   - git_commit runs the repository's own commit hooks.\n   - open_path opens a .bat or .lnk file with its default handler, which runs it.\n   - The page preview can read any service running on the user's PC (the loopback-only rule is not a safety boundary there).\n\n5. **Desktop porting work job 1 missed.**\n   - Commands, process kills, git and the browser are started without the \"no window\" flag. Inside a desktop app with no console, every command would flash a console window.\n   - Nothing kills background commands if the app quits or crashes.\n\n6. **Host reads that skip the checks.** The reads of AGENTS.md, HANDOFF.md and MEMORY.md, and the link checks on written pages, bypass both the folder boundary and approval (even in Ask mode). The batched \"run start\" and \"completion check\" requests must therefore be fixed-purpose messages, not a general \"read a file\" request.\n\n7. **Smaller issues:**\n   - The permission check is always told the action is inside the project, so Auto's \"outside the project\" refusal never fires.\n   - Web search asks for approval twice in Ask and Accept-edits modes.\n   - Slash commands start runs through a path that skips run_agent's folder checks.\n\n8. **Missed entirely.** These go under \"missed\":\n   - The model-request recorder: it saves every prompt, including project file text, under one global privacy switch.\n   - Shutdown, which ends every run instead of handing it back to the queue.\n   - The run-end cleanup that stops background commands. It never runs if the worker crashes.\n   - Reading attachment images from the local disk.\n   - The slash-command folder lookup.\n   - The diagnostics check that probes every saved project folder on the server's disk.",
+ "confirmed_count": 40,
+ "challenges": [
+  {
+   "item_name": "execute_local_tool",
+   "problem": "Job 1 has the worker send one request and wait 'with a timeout longer than the command timeout', with the desktop asking for approval itself. If approval happens inside that request, the wait includes a person deciding. Today that wait has no limit, so a slow approval would trip the timeout. A plain request and reply also loses the order of events on screen: the worker sends 'tool started' before the user has approved. Repeating a request after a dropped connection is not safe either. append_file would add the text twice and a command would run twice. edit_file is the only tool that notices an edit already made.",
+   "proposed_destination": "worker (device-channel client) plus desktop_app (request handling)",
+   "evidence": "await_approval waits with no timeout: let decision = rx.await.ok() (agent_runner.rs 4767). Approval comes before the snapshot and the tool_started event (3772-3815). append_file uses OpenOptions append(true) (tools.rs 474-529). execute_command has no idempotency. edit_already_made exists only for edits (tools.rs 1081). The settle wait for a background command is up to 120 s (tools.rs 790-792). The command timeout is up to 1800 s (terminal.rs 24).",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "4772-4825, 3757-3815, 4727-4770",
+   "severity": "high"
+  },
+  {
+   "item_name": "await_approval (and the decided 'desktop asks the user' rule)",
+   "problem": "Job 1 says the desktop asks for approval, but not where the prompt is shown. The design runs the same React screens in the desktop app and the browser. If the app's window shows screens served by the server, a compromised server can send code that approves on its own, or that calls the app's internal commands such as 'add allowed folder' or 'run tool'. Several other things must also move to the desktop:\n- Stop today answers a waiting approval with 'denied' so the run can end. With the prompt on the desktop, Stop and a lost connection must withdraw an open prompt. The desktop must also re-check, at the moment it runs the action, that the run is still live.\n- The rule that switching to Auto releases waiting actions must run on the desktop.",
+   "proposed_destination": "desktop_app (native approval window and run-state check) plus worker",
+   "evidence": "agent_stop wakes a waiting approval with Denied (api.rs 6062-6064). Switching mode calls resume_auto_approved_runs over all runs (api.rs 8981, 8993-9044). await_approval re-checks it under settings_update (agent_runner.rs 4759-4766). Today's only local defence for the loopback API is the CORS and Host checks (api.rs 432-433, 618).",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "4727-4770",
+   "severity": "high"
+  },
+  {
+   "item_name": "tool git_commit",
+   "problem": "Job 1 says it 'runs on the desktop unchanged'. But git commit runs the repository's own hook programs, so a commit is really a command. It is rated only moderate, which allows 'allow for this session'. Unlike the app's own git reads, it is run without the safe flags. A model or a compromised server could write a hook file with an ordinary edit (for example into a hooks folder the repo already uses), then commit, and so run code without ever asking for command approval.",
+   "proposed_destination": "desktop_app",
+   "evidence": "Command::new(\"git\").args([\"-C\", root, \"commit\", \"-m\", msg]) with no -c core.hooksPath or --no-verify (tools.rs 848-851). risk_of: git_commit => Moderate (tools.rs 213-214). Session grants allow Moderate tools (permissions.rs 174-181). Compare SAFE_GIT_* with core.fsmonitor=false (api.rs 5731-5733). touches_git_internals only protects .git/ (tools.rs 257-263).",
+   "file": "backend/src/tools.rs",
+   "lines": "836-858",
+   "severity": "medium"
+  },
+  {
+   "item_name": "tool open_path",
+   "problem": "Job 1 says it 'runs on the desktop only; unchanged'. Opening a file with its default app runs it when the file is a .bat, .cmd, .exe, .lnk, .url or .ps1 file. Accept-edits mode can write such a file without asking, then open_path runs it. open_path is rated only moderate and allows 'allow for this session', so code can run without command approval. The only other gate, 'the user asked to open something', is a check on the worker side only.",
+   "proposed_destination": "desktop_app",
+   "evidence": "explorer/open/xdg-open .spawn() on any path that exists (tools.rs 891-910). risk_of open_path => Moderate (tools.rs 214). opening_enabled = opening_requested(&spec.task), worker-only (agent_runner.rs 2681, 3694).",
+   "file": "backend/src/tools.rs",
+   "lines": "876-913",
+   "severity": "medium"
+  },
+  {
+   "item_name": "tool preview_page: page loading (preview.rs)",
+   "problem": "Job 1 keeps the loopback-only rule 'so the server cannot use the PC to reach other addresses'. On the user's PC, loopback is the sensitive part: any local service, such as another app's local web page or a local admin console, can be loaded. Its text, layout and console output then go back to the server. The preview is rated moderate, so 'allow for this session' covers it. The desktop should allow only addresses served by a background command this run started (or ports the user confirms).",
+   "proposed_destination": "desktop_app",
+   "evidence": "parse_local_url accepts any port on localhost|127.0.0.1|0.0.0.0|[::1] (preview.rs 56-88). risk_of preview_page => Moderate (tools.rs 214). The report includes the page text through html_to_text (preview.rs 550).",
+   "file": "backend/src/preview.rs",
+   "lines": "53-88",
+   "severity": "medium"
+  },
+  {
+   "item_name": "terminal::run with spawn / collect / kill_tree (and cdp::Browser, git_commit, project_check)",
+   "problem": "Job 1 says this code 'can be compiled into the desktop app almost unchanged'. It starts cmd.exe, taskkill, git and the browser without the Windows 'no window' flag. Today that works because the backend is a console program started by run.ps1. Inside a desktop app with no console, every command, process kill and commit would flash a console window on the user's screen. The code already uses the flag where it starts the model server and the metrics sampler, but not here.",
+   "proposed_destination": "desktop_app",
+   "evidence": "spawn: Command::new(\"cmd\") with raw_arg, no creation_flags (terminal.rs 116-146). kill_tree taskkill (terminal.rs 189-193). cdp taskkill and browser spawn (cdp.rs 33-37, 60-75). git_commit (tools.rs 848). Compare creation_flags(0x08000000) in llamaserver.rs 47/123/433, metrics.rs 69 and runtime_fit.rs 417. main.rs is a console server (main.rs 2, 283-322).",
+   "file": "backend/src/terminal.rs",
+   "lines": "106-206",
+   "severity": "medium"
+  },
+  {
+   "item_name": "Background command registry (start_background ... stop_background_for)",
+   "problem": "Job 1 says the desktop stops background commands 'when the run ends, is stopped, or the app exits'. Nothing in the code stops them when the program exits or crashes. Cleanup happens only when the run's loop finishes (a Drop guard). An orderly shutdown waits just 2 s for that. A crash leaves the commands running and holding their ports. In a desktop app this needs a new mechanism: a Windows Job Object set to kill its children when closed, or a process group plus an exit hook. It also needs a time limit for commands whose run's worker has disappeared.",
+   "proposed_destination": "desktop_app",
+   "evidence": "static RUNNING HashMap with no exit cleanup (terminal.rs 269-272). Stopping happens only through StopBackground Drop in run_loop (agent_runner.rs 2601-2610). shut_down waits 2 s for each run's loop (api.rs 242-247).",
+   "file": "backend/src/terminal.rs",
+   "lines": "247-406",
+   "severity": "medium"
+  },
+  {
+   "item_name": "project_instructions and project_notes (AGENTS.md / HANDOFF.md / MEMORY.md)",
+   "problem": "Job 1 batches these into one 'run start' request but leaves out two facts. First, they read root.join(name) directly, without the folder-boundary resolver. An AGENTS.md that is a link to a file outside the project is followed and its text goes to the model and the server. Second, they run without asking, even in Ask mode, where every model read needs approval. If the desktop accepts a general 'host read' that skips approval, a compromised server can read any file without a prompt. These requests must be fixed messages: named files only, sizes capped, and passed through the resolver.",
+   "proposed_destination": "desktop_app (fixed run-start message) plus worker",
+   "evidence": "std::fs::read_to_string(root.join(name)) (agent_runner.rs 1653, 1676). Assisted mode asks for every tool: (AutonomyLevel::Assisted, _) => RequireApproval (permissions.rs 189-191). The same unchecked pattern is in workspace_instructions (api.rs 7401-7412) and the chat snapshot (api.rs 2856).",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "1642-1690",
+   "severity": "medium"
+  },
+  {
+   "item_name": "spawn_agent_run",
+   "problem": "Job 1 puts the device and folder authorisation in run_agent. But runs are also started by the /review, /plan, /init, /build, /test and /run commands. Those call spawn_agent_run directly with a folder from command_workspace, which only checks that the folder exists on the server. So they skip run_agent's check that the folder matches the session's linked project. The owner, device and allowed-folder checks must sit in the one shared path that queues a job.",
+   "proposed_destination": "api_server",
+   "evidence": "Callers: spawn_agent_run (api.rs 5860, 6445, 6493). run_agent's checks: ws_root.is_dir() and canonicalize(linked) == canonicalize(requested) (api.rs 5774, 5822-5836). command_workspace only checks pb.is_dir() (api.rs 6246-6264).",
+   "file": "backend/src/api.rs",
+   "lines": "5875-5996",
+   "severity": "medium"
+  },
+  {
+   "item_name": "PermissionManager (decide_call)",
+   "problem": "Every caller passes 'inside the project = true', so Auto's 'never outside the selected project' refusal never fires. The desktop must work out 'inside' itself from its own allowed folders. There is also a mismatch: the loop grants 'allow for this session' against the narrowed project folder (ws_key), while the mode-switch release looks the grant up against the original folder. The two keys differ when a run is narrowed to a sub-project. Run modes (Plan, Inspect) are enforced only on the worker. The desktop needs the run's mode too, or a compromised server can send writes during a Plan run.",
+   "proposed_destination": "shared_library (rules) plus desktop_app (authority)",
+   "evidence": "decide_call(&call.name, &call.args, risk, true, Some(&ws_key)) (agent_runner.rs 3751-3756). resume_auto_approved_runs: decide_call(..., true, Some(&run.spec.workspace...)) (api.rs 9022-9028). Auto's !in_workspace => Deny (permissions.rs 155-159). spec.mode.allows_risk is checked only in run_loop (agent_runner.rs 3732).",
+   "file": "backend/src/permissions.rs",
+   "lines": "126-209",
+   "severity": "low"
+  },
+  {
+   "item_name": "VerificationState and its disk checks (page_reference_problems)",
+   "problem": "The link check joins the page's folder with whatever path the HTML names and asks whether it exists, without the folder-boundary resolver. A page that names ../../ paths reveals whether files exist outside the project. Moved to the desktop, this check must resolve each link inside the allowed folder. There is also a second disk check job 1 did not count: after each delete_file, VerificationState::observe checks that the file is gone. That check belongs inside the delete's own reply. Finally, remaining() repeats both scans (2939, 3511), so a completion claim runs them twice, not once.",
+   "proposed_destination": "desktop_app (checks) plus worker (bookkeeping)",
+   "evidence": "folder.join(target).exists() (agent_runner.rs 4603, 4608). The only filters are on scheme, a leading '/' and template markers, with no '..' check (4591-4601). The delete check is if !path.exists() (4510). needs_evidence plus remaining() at 2936-2939 and 3497-3511.",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "4334-4615",
+   "severity": "low"
+  },
+  {
+   "item_name": "repo_index::build and tree_text",
+   "problem": "Job 1 accepts it as 'build on the desktop'. A linked file inside the project is not seen as a folder, so the code reads it as a file and follows the link outside the project to pull out names. Only function and class names leak, but the desktop version should skip links, as search_text already does.",
+   "proposed_destination": "desktop_app",
+   "evidence": "is_dir from e.file_type() (does not follow the link), then std::fs::read_to_string(e.path()) (follows it) (repo_index.rs 142-169). search_dir handles links correctly: the ft.is_dir() / ft.is_file() branches skip them (tools.rs 1389-1397).",
+   "file": "backend/src/repo_index.rs",
+   "lines": "119-186",
+   "severity": "low"
+  },
+  {
+   "item_name": "tool web_search: execute_web_search",
+   "problem": "In Ask and Accept-edits modes the user is asked twice. The general permission check asks first, because web_search is moderate. Then the web_search branch asks again whenever the mode is not Auto. When approvals become durable records, there should be one approval record with one decision.",
+   "proposed_destination": "worker",
+   "evidence": "The gate: PermissionDecision::RequireApproval => await_approval (agent_runner.rs 3772-3773). Then, when not global_auto, a second await_approval(... \"Web access leaves the machine\") (3865-3873).",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "3853-3883",
+   "severity": "low"
+  },
+  {
+   "item_name": "run_chat_tool_round",
+   "problem": "Job 1's destination stands, but chat runs its project reads without consulting the permission rules at all. That differs from the agent, whose reads ask in Ask mode. The device request must say it comes from chat, and the desktop must check the chat-safe list itself. Otherwise a 'chat' label becomes a way to read files without a prompt.",
+   "proposed_destination": "api_server (or worker) plus desktop_app check",
+   "evidence": "Only chat_safe and offers() are checked, with no PermissionManager call (api.rs 3006-3027). tools::execute(&req, &ws, false) (api.rs 3102).",
+   "file": "backend/src/api.rs",
+   "lines": "2980-3180",
+   "severity": "low"
+  }
+ ],
+ "missed": [
+  {
+   "name": "request_recorder (model request records)",
+   "file": "backend/src/api.rs",
+   "lines": "191-228",
+   "what_it_does": "Saves the full text of every request sent to the model, and the model's raw answer, in the database. That text includes the project files the agent read on the user's PC. One switch, the same for everyone, turns it on or off. The activity log also keeps each tool's output and diff.",
+   "assumes": [
+    "global_settings",
+    "single_db_file",
+    "one_user"
+   ],
+   "destination": "worker",
+   "change": "Moving the tools to the PC does not keep the project's code off the server: prompts, activity records and these records all carry it. Make keeping model requests an admin setting with an owner and a retention period, store the records in PostgreSQL with the user and run, and state in the design that file contents reach the server and the model.",
+   "size": "M",
+   "evidence": "request_json: request.body.to_string(), raw_output (api.rs 209-210); if !state.settings.read().await.privacy.record_model_requests (220); attached to the run's model client in run_loop (agent_runner.rs 2639-2644); record_message_activity of events carrying output and diff (api.rs 5945)",
+   "confidence": "high"
+  },
+  {
+   "name": "AppState::shut_down and the shutdown reason",
+   "file": "backend/src/api.rs",
+   "lines": "235-265",
+   "what_it_does": "When the app closes, it stops every unfinished run, waits up to 2 seconds for each, and marks them 'interrupted' with the closing reason. It then stops the model server.",
+   "assumes": [
+    "in_memory_state",
+    "one_loaded_model"
+   ],
+   "destination": "worker",
+   "change": "A worker that is shutting down (rolling deploy, scale-down) must not end its users' runs. It should save each run's checkpoint, put the job back in the queue, tell the desktop the run is paused (so background commands stay up), and let another worker take it over. The 'Companion is closing' message no longer applies.",
+   "size": "M",
+   "evidence": "crate::shutdown::begin(reason); run.cancel.cancel() for agents.unfinished() (237-240); 2 s deadline (242); finish_task_context(..., \"interrupted\") (259); cancelled_message uses crate::shutdown::reason() (agent_runner.rs 5106-5110)",
+   "confidence": "high"
+  },
+  {
+   "name": "StopBackground guard in run_loop (host-side process stop at run end)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "2599-2610",
+   "what_it_does": "When a run ends in any way, the host itself (not the model) stops every background command, such as dev servers, started in that project folder.",
+   "assumes": [
+    "pc_processes",
+    "in_memory_state"
+   ],
+   "destination": "worker",
+   "change": "This becomes an explicit 'run ended' message from the worker to the desktop, which then stops that run's commands. It relies on Rust running cleanup when the loop ends, which never happens if the worker crashes or is killed. The desktop therefore also needs its own rule, for example a time limit with regular check-ins, to stop the commands of a run whose worker has gone silent.",
+   "size": "S",
+   "evidence": "struct StopBackground(String); impl Drop ... crate::terminal::stop_background_for(&self.0) (2601-2609); keyed by ws_key = focused_root path (2598, 2610)",
+   "confidence": "high"
+  },
+  {
+   "name": "Attachment images loaded by run_loop (prepare_conversation_images)",
+   "file": "backend/src/agent_runner.rs",
+   "lines": "2770-2787",
+   "what_it_does": "For a model that can see images, it reads the conversation's attached pictures from the app's local attachments folder and puts them on the messages they were sent with.",
+   "assumes": [
+    "pc_files",
+    "single_db_file"
+   ],
+   "destination": "worker",
+   "change": "Read attachments from object storage (S3/MinIO) through the shared file store, scoped to the owner. A worker on another machine has no local attachments folder. Move the chat prompt-building helpers this loop borrows from api.rs (build_turns_with_owners, history_char_budget, attachment_owner, prepare_conversation_images) into the shared library.",
+   "size": "S",
+   "evidence": "crate::api::prepare_conversation_images(&state.attachments_dir, &spec.conversation_id, &attachments) (2772); prepare_conversation_images reads files with std::fs::read (api.rs 4520-4530); also crate::api::build_turns_with_owners / history_char_budget (2763-2764)",
+   "confidence": "high"
+  },
+  {
+   "name": "command_workspace (slash-command folder lookup)",
+   "file": "backend/src/api.rs",
+   "lines": "6241-6277",
+   "what_it_does": "Finds the project folder for slash commands (/search, /find, /diff, /review, /plan, /build, /run). It takes either a folder path given directly or the chat's linked project, and accepts it if the folder exists on the machine the backend runs on.",
+   "assumes": [
+    "pc_files",
+    "one_user"
+   ],
+   "destination": "api_server",
+   "change": "Resolve to the user's own project record (owner, device, allowed-folder id) in PostgreSQL. Never accept a raw path. The PC-side commands it feeds (/search, /find, /diff) become device requests, and the run-starting commands must go through the same authorisation as run_agent.",
+   "size": "S",
+   "evidence": "let pb = PathBuf::from(p.trim()); if pb.is_dir() { return Ok(pb) } (6246-6250); linked workspace pb.is_dir() (6261-6263); used by spawn_agent_run at 6445 and 6493",
+   "confidence": "high"
+  },
+  {
+   "name": "Diagnostics: saved project folders check",
+   "file": "backend/src/api.rs",
+   "lines": "8005-8022",
+   "what_it_does": "In the system status check, lists every saved project and reports which folders are missing from the machine the backend runs on.",
+   "assumes": [
+    "pc_files",
+    "one_user",
+    "single_db_file"
+   ],
+   "destination": "desktop_app",
+   "change": "On a server it would report every user's projects as missing and show their names to whoever runs diagnostics. Move the 'is this folder still there' check to the desktop app, for that user's own projects. The server-side status page drops it.",
+   "size": "S",
+   "evidence": "st.list_workspaces() then .filter(|w| !std::path::Path::new(&w.path).is_dir()) (8007-8012)",
+   "confidence": "high"
+  }
+ ]
+}

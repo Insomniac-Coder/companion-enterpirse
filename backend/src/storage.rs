@@ -32,6 +32,9 @@ pub struct Conversation {
     /// Stage 27: optional related session id (§146 metadata link, not shared ctx).
     #[serde(default)]
     pub related_to: String,
+    /// The person whose conversation it is.
+    #[serde(default)]
+    pub user_id: String,
 }
 
 fn default_priority() -> String {
@@ -86,6 +89,9 @@ pub struct Workspace {
     pub path: String,
     pub build_system: String,
     pub created_at: String,
+    /// The person whose project it is.
+    #[serde(default)]
+    pub user_id: String,
 }
 
 /// Stage 11: record of an explicit web-search request (§121).
@@ -125,6 +131,9 @@ pub struct MemoryEntry {
     pub source: String,
     pub created_at: String,
     pub last_used: String,
+    /// The person who saved it.
+    #[serde(default)]
+    pub user_id: String,
 }
 
 #[derive(Debug, Default)]
@@ -217,6 +226,7 @@ fn conversation(r: &PgRow) -> DbResult<Conversation> {
         last_model: r.try_get("last_model")?,
         priority: r.try_get("priority")?,
         related_to: r.try_get("related_to")?,
+        user_id: r.try_get("user_id")?,
     })
 }
 
@@ -263,6 +273,7 @@ fn workspace(r: &PgRow) -> DbResult<Workspace> {
         path: r.try_get("path")?,
         build_system: r.try_get("build_system")?,
         created_at: r.try_get("created_at")?,
+        user_id: r.try_get("user_id")?,
     })
 }
 
@@ -275,6 +286,7 @@ fn memory(r: &PgRow) -> DbResult<MemoryEntry> {
         source: r.try_get("source")?,
         created_at: r.try_get("created_at")?,
         last_used: r.try_get("last_used")?,
+        user_id: r.try_get("user_id")?,
     })
 }
 
@@ -363,9 +375,9 @@ impl Storage {
     }
 
     pub async fn create_conversation(&self, c: &Conversation) -> DbResult<()> {
-        sqlx::query("INSERT INTO conversations(id,title,model_id,created_at,mode,workspace,reasoning_default,search_default,last_model,priority,related_to) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)")
+        sqlx::query("INSERT INTO conversations(id,title,model_id,created_at,mode,workspace,reasoning_default,search_default,last_model,priority,related_to,user_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)")
             .bind(&c.id).bind(&c.title).bind(&c.model_id).bind(&c.created_at).bind(&c.mode).bind(&c.workspace)
-            .bind(c.reasoning_default).bind(c.search_default).bind(&c.last_model).bind(&c.priority).bind(&c.related_to)
+            .bind(c.reasoning_default).bind(c.search_default).bind(&c.last_model).bind(&c.priority).bind(&c.related_to).bind(&c.user_id)
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -409,8 +421,10 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
-        sqlx::query("SELECT id,title,model_id,created_at,mode,workspace,reasoning_default,search_default,last_model,priority,related_to FROM conversations ORDER BY created_at DESC")
+    /// One person's conversations, newest first.
+    pub async fn list_conversations(&self, user: &str) -> DbResult<Vec<Conversation>> {
+        sqlx::query("SELECT id,title,model_id,created_at,mode,workspace,reasoning_default,search_default,last_model,priority,related_to,user_id FROM conversations WHERE user_id=$1 ORDER BY created_at DESC")
+            .bind(user)
             .fetch_all(&self.pool)
             .await?
             .iter()
@@ -419,7 +433,7 @@ impl Storage {
     }
 
     pub async fn get_conversation(&self, id: &str) -> DbResult<Option<Conversation>> {
-        sqlx::query("SELECT id,title,model_id,created_at,mode,workspace,reasoning_default,search_default,last_model,priority,related_to FROM conversations WHERE id=$1")
+        sqlx::query("SELECT id,title,model_id,created_at,mode,workspace,reasoning_default,search_default,last_model,priority,related_to,user_id FROM conversations WHERE id=$1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?
@@ -774,15 +788,17 @@ impl Storage {
     // ---- Stage 14 workspaces ----
 
     pub async fn create_workspace(&self, w: &Workspace) -> DbResult<()> {
-        sqlx::query("INSERT INTO workspaces(id,name,path,build_system,created_at) VALUES($1,$2,$3,$4,$5)")
-            .bind(&w.id).bind(&w.name).bind(&w.path).bind(&w.build_system).bind(&w.created_at)
+        sqlx::query("INSERT INTO workspaces(id,name,path,build_system,created_at,user_id) VALUES($1,$2,$3,$4,$5,$6)")
+            .bind(&w.id).bind(&w.name).bind(&w.path).bind(&w.build_system).bind(&w.created_at).bind(&w.user_id)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    pub async fn list_workspaces(&self) -> DbResult<Vec<Workspace>> {
-        sqlx::query("SELECT id,name,path,build_system,created_at FROM workspaces ORDER BY created_at")
+    /// One person's projects.
+    pub async fn list_workspaces(&self, user: &str) -> DbResult<Vec<Workspace>> {
+        sqlx::query("SELECT id,name,path,build_system,created_at,user_id FROM workspaces WHERE user_id=$1 ORDER BY created_at")
+            .bind(user)
             .fetch_all(&self.pool)
             .await?
             .iter()
@@ -791,7 +807,7 @@ impl Storage {
     }
 
     pub async fn get_workspace(&self, id: &str) -> DbResult<Option<Workspace>> {
-        sqlx::query("SELECT id,name,path,build_system,created_at FROM workspaces WHERE id=$1")
+        sqlx::query("SELECT id,name,path,build_system,created_at,user_id FROM workspaces WHERE id=$1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?
@@ -832,23 +848,25 @@ impl Storage {
         if !["session", "conversation", "workspace", "global"].contains(&m.scope.as_str()) {
             return Err(sqlx::Error::InvalidArgument("bad memory scope".into()));
         }
-        sqlx::query("INSERT INTO memory_entries(id,scope_id,scope,content,source,created_at,last_used) VALUES($1,$2,$3,$4,$5,$6,$7)")
-            .bind(&m.id).bind(&m.scope_id).bind(&m.scope).bind(&m.content).bind(&m.source).bind(&m.created_at).bind(&m.last_used)
+        sqlx::query("INSERT INTO memory_entries(id,scope_id,scope,content,source,created_at,last_used,user_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8)")
+            .bind(&m.id).bind(&m.scope_id).bind(&m.scope).bind(&m.content).bind(&m.source).bind(&m.created_at).bind(&m.last_used).bind(&m.user_id)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    /// Memories visible to a session: its own conversation id, its workspace
-    /// id, and globals. Never the whole store (§82: no silent bulk dump).
-    pub async fn memories_for(&self, conv_id: &str, workspace_id: &str) -> DbResult<Vec<MemoryEntry>> {
+    /// Memories visible to a session of `user`'s: its own conversation id, its
+    /// workspace id, and their globals. Never the whole store (§82: no silent
+    /// bulk dump), and never anyone else's: "global" means global to one person.
+    pub async fn memories_for(&self, user: &str, conv_id: &str, workspace_id: &str) -> DbResult<Vec<MemoryEntry>> {
         sqlx::query(
-            "SELECT id,scope_id,scope,content,source,created_at,last_used FROM memory_entries
-             WHERE scope='global' OR (scope IN ('conversation','session') AND scope_id=$1) OR (scope='workspace' AND scope_id=$2)
+            "SELECT id,scope_id,scope,content,source,created_at,last_used,user_id FROM memory_entries
+             WHERE user_id=$3 AND (scope='global' OR (scope IN ('conversation','session') AND scope_id=$1) OR (scope='workspace' AND scope_id=$2))
              ORDER BY seq",
         )
         .bind(conv_id)
         .bind(workspace_id)
+        .bind(user)
         .fetch_all(&self.pool)
         .await?
         .iter()
@@ -862,7 +880,7 @@ impl Storage {
     }
 
     pub async fn get_memory(&self, id: &str) -> DbResult<Option<MemoryEntry>> {
-        sqlx::query("SELECT id,scope_id,scope,content,source,created_at,last_used FROM memory_entries WHERE id=$1")
+        sqlx::query("SELECT id,scope_id,scope,content,source,created_at,last_used,user_id FROM memory_entries WHERE id=$1")
             .bind(id)
             .fetch_optional(&self.pool)
             .await?
@@ -876,14 +894,14 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn memory_export(&self, conv_id: &str, workspace_id: &str) -> DbResult<Vec<MemoryEntry>> {
-        self.memories_for(conv_id, workspace_id).await
+    pub async fn memory_export(&self, user: &str, conv_id: &str, workspace_id: &str) -> DbResult<Vec<MemoryEntry>> {
+        self.memories_for(user, conv_id, workspace_id).await
     }
 
     /// Bounded, deterministic context from explicitly saved memories only.
     /// The legacy session scope is a conversation alias, never a workspace.
-    pub async fn memory_context(&self, conv_id: &str, workspace_id: &str) -> DbResult<MemoryContext> {
-        Ok(memory_context_from(&self.memories_for(conv_id, workspace_id).await?))
+    pub async fn memory_context(&self, user: &str, conv_id: &str, workspace_id: &str) -> DbResult<MemoryContext> {
+        Ok(memory_context_from(&self.memories_for(user, conv_id, workspace_id).await?))
     }
 
     // ---- Stage 35 knowledge chunks ----
@@ -1381,6 +1399,7 @@ mod tests {
             last_model: "".into(),
             priority: "normal".into(),
             related_to: "".into(),
+            user_id: "local".into(),
         }
     }
 
@@ -1517,7 +1536,7 @@ mod tests {
         let s = testing::storage();
         s.create_conversation(&conversation_named("c1")).await.unwrap();
         s.add_message(&message_in("c1", "m1", "user", "hi", "2026-01-01T00:00:01Z")).await.unwrap();
-        assert_eq!(s.list_conversations().await.unwrap().len(), 1);
+        assert_eq!(s.list_conversations("local").await.unwrap().len(), 1);
         assert_eq!(s.messages_for("c1").await.unwrap().len(), 1);
     }
 
@@ -1634,11 +1653,12 @@ mod tests {
                 source: "user".into(),
                 created_at: now.into(),
                 last_used: now.into(),
+                user_id: "local".into(),
             })
             .await
             .unwrap();
         }
-        let vis: Vec<String> = s.memories_for("ce", "ws1").await.unwrap().into_iter().map(|m| m.id).collect();
+        let vis: Vec<String> = s.memories_for("local", "ce", "ws1").await.unwrap().into_iter().map(|m| m.id).collect();
         assert!(vis.contains(&"g1".to_string()));
         assert!(vis.contains(&"c1".to_string()));
         assert!(vis.contains(&"w1".to_string()));
@@ -1668,11 +1688,12 @@ mod tests {
                     source: "user".into(),
                     created_at: "now".into(),
                     last_used: "now".into(),
+                    user_id: "local".into(),
                 })
                 .await
                 .unwrap();
         }
-        let context = storage.memory_context("session-a", "workspace-a").await.unwrap();
+        let context = storage.memory_context("local", "session-a", "workspace-a").await.unwrap();
         assert_eq!(context.entries, 4);
         assert!(
             context.text.contains("fact-own")
@@ -1691,15 +1712,16 @@ mod tests {
                 source: "user".into(),
                 created_at: "now".into(),
                 last_used: "now".into(),
+                user_id: "local".into(),
             })
             .await
             .unwrap();
-        let context = storage.memory_context("session-a", "workspace-a").await.unwrap();
+        let context = storage.memory_context("local", "session-a", "workspace-a").await.unwrap();
         assert!(context.text.chars().count() <= 2000);
         assert!(context.text.contains("[trimmed]"));
         assert_eq!(
             context.text,
-            storage.memory_context("session-a", "workspace-a").await.unwrap().text,
+            storage.memory_context("local", "session-a", "workspace-a").await.unwrap().text,
             "context selection is deterministic"
         );
     }

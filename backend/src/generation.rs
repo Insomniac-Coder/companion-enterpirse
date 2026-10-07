@@ -149,6 +149,7 @@ mod tests {
                 last_model: "".into(),
                 priority: "normal".into(),
                 related_to: "".into(),
+                user_id: "local".into(),
             }).await
             .unwrap();
 

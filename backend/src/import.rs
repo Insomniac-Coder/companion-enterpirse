@@ -7,8 +7,8 @@
 //! defaults. Rows are read in their original order, so conversations and
 //! journals keep their order. Rows already present are skipped, so running it
 //! twice copies nothing twice. It is one transaction: all or nothing.
-// ponytail: imported records have no owner yet; they get the importing person
-// as owner when users arrive (task 5).
+//! Conversations, projects and memories belong to `owner` (a user id): the local
+//! person on a laptop, or the person named with `--owner` on a server.
 
 use sqlx::{AssertSqlSafe, Row};
 use std::collections::{HashMap, HashSet};
@@ -87,8 +87,9 @@ fn bind<'q>(
     })
 }
 
-/// Copy the history in the SQLite file at `path` into the database `pool` points at.
-pub async fn import_sqlite(path: &Path, pool: &sqlx::PgPool) -> Result<ImportReport, String> {
+/// Copy the history in the SQLite file at `path` into the database `pool` points at,
+/// as `owner`'s.
+pub async fn import_sqlite(path: &Path, pool: &sqlx::PgPool, owner: &str) -> Result<ImportReport, String> {
     let source = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     let mut tx = pool.begin().await.map_err(|e| format!("cannot start the import: {e}"))?;
@@ -117,8 +118,14 @@ pub async fn import_sqlite(path: &Path, pool: &sqlx::PgPool) -> Result<ImportRep
         .map(|row| (row.get::<String, _>("name"), row.get::<String, _>("type")))
         .collect();
         let columns: Vec<&String> = source_columns.iter().filter(|name| destination.contains_key(*name)).collect();
-        let column_list = columns.iter().map(|name| format!("\"{name}\"")).collect::<Vec<_>>().join(",");
-        let placeholders = (1..=columns.len()).map(|n| format!("${n}")).collect::<Vec<_>>().join(",");
+        // The person the records belong to: a Companion file has no such column.
+        let owned = destination.contains_key("user_id") && !columns.iter().any(|name| name.as_str() == "user_id");
+        let mut column_list = columns.iter().map(|name| format!("\"{name}\"")).collect::<Vec<_>>().join(",");
+        let mut placeholders = (1..=columns.len()).map(|n| format!("${n}")).collect::<Vec<_>>().join(",");
+        if owned {
+            column_list.push_str(",\"user_id\"");
+            placeholders.push_str(&format!(",${}", columns.len() + 1));
+        }
         // Journals have no id of their own: they come with the messages this import adds.
         let conflict = if table == "message_activities" { "" } else { " ON CONFLICT DO NOTHING" };
         let returning = if table == "messages" { " RETURNING id" } else { "" };
@@ -147,6 +154,9 @@ pub async fn import_sqlite(path: &Path, pool: &sqlx::PgPool) -> Result<ImportRep
             let mut query = sqlx::query(AssertSqlSafe(insert.clone()));
             for (value, name) in values.into_iter().zip(&columns) {
                 query = bind(query, value, &destination[*name]).map_err(|e| format!("{table}.{name}: {e}"))?;
+            }
+            if owned {
+                query = query.bind(owner);
             }
             if table == "messages" {
                 match query.fetch_optional(&mut *tx).await.map_err(|e| format!("{table}: {e}"))? {
@@ -203,7 +213,7 @@ mod tests {
     async fn an_old_companion_file_imports_in_order_and_only_once() {
         let storage = crate::storage::testing::storage();
         let file = old_companion_file();
-        let report = import_sqlite(&file, storage.pool()).await.unwrap();
+        let report = import_sqlite(&file, storage.pool(), "local").await.unwrap();
         let copied: HashMap<String, u64> = report.copied.into_iter().collect();
         assert_eq!(copied["conversations"], 1);
         assert_eq!(copied["messages"], 2);
@@ -213,11 +223,12 @@ mod tests {
         let conversation = storage.get_conversation("c1").await.unwrap().unwrap();
         assert!(conversation.reasoning_default, "0/1 became a boolean");
         assert_eq!(conversation.mode, "chat", "a column the old file lacks takes its default");
+        assert_eq!(conversation.user_id, "local", "the records are the importing person's");
         let messages = storage.messages_for("c1").await.unwrap();
         assert_eq!(messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["b", "a"], "the file's order, not alphabetical");
         assert!(storage.tool_executions_for("c1", 10).await.unwrap()[0].approved);
 
-        let again = import_sqlite(&file, storage.pool()).await.unwrap();
+        let again = import_sqlite(&file, storage.pool(), "local").await.unwrap();
         assert!(again.copied.iter().all(|(_, n)| *n == 0), "{again:?}");
         assert_eq!(storage.messages_for("c1").await.unwrap().len(), 2);
         assert_eq!(storage.message_activities("a").await.unwrap().len(), 1, "the journal came with its message, once");

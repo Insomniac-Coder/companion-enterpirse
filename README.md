@@ -164,6 +164,9 @@ it again copies nothing twice:
 cd backend && cargo run --bin companion-backend -- import-sqlite path/to/companion.db
 ```
 
+On a server with sign-in, add `--owner <email>` to make the history that person's (they must have
+signed in once); without it, it belongs to the local person, whom nobody on a server can be.
+
 ## 5. Add models
 
 Model weights are not kept in this repository. Put each model in its own folder under `models/`, e.g. `models/my-model/my-model-Q4_K_M.gguf`.
@@ -413,6 +416,10 @@ in the token; their memberships then stay as they were.)
 For now, on a server with sign-in, the settings and the agents' permission mode apply to everyone, so
 only a platform admin changes them; people get their own with later updates. A laptop install has no
 sign-in and its one person has every role, as before.
+
+Everyone sees only their own conversations, projects, saved memories and agent runs; a record of
+someone else's is "not found", for platform admins too (running the server is not reading people's
+work). On a server, projects are folders of the server, typed in rather than browsed.
 
 People sign in with their company account; a sign-in lasts 12 hours. **Settings > Account** shows who
 is signed in, signs out, and makes **API keys** for software such as a build server or a script: it

@@ -544,6 +544,14 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   activity, is wrapped in `admin(...)` in `api::router` and answers 403 to anyone but a platform admin
   (`roles::tests::PLATFORM_ADMIN_ROUTES` lists them; add a new one there too). Roles are read from
   `role_grants` on every request, so a withdrawn role is gone from the next one.
+- Owners (`ownership.rs`, task 5): conversations, projects and memories carry `user_id`; everything
+  else hangs off a conversation or a project; an agent run carries its person in `AgentSpec`. One
+  middleware checks every path that names a record (`/api/conversations/<id>`, `/api/sessions/<id>`,
+  `/api/workspaces/<id>`, `/api/memory/<id>`, `/api/agent/runs/<id>`, `/api/artifacts/<id>`) and
+  answers 404 for anyone else's, before any handler; handlers check ids named in a body
+  (`ownership::conversation`, `ownership::workspace`), scope lists to the caller, and stamp new
+  records. Storage functions that list or read memory take the person explicitly. Agents and direct
+  tool calls work only inside the caller's own saved projects.
 - `LLM → ToolRequest → PermissionManager → Tool → OS`. No direct OS access.
 - `WorkspaceManager::resolve` is the only path joiner; lexical + canonical checks.
 - MODERATE/DANGEROUS tools require `approved=true` (permission UX sets it, §26).

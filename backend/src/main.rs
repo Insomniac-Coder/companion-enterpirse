@@ -30,6 +30,7 @@ mod logfile;
 mod metrics;
 mod models;
 mod outline;
+mod ownership;
 mod permissions;
 mod pgsql;
 mod preview;
@@ -122,7 +123,12 @@ async fn main() {
                     eprintln!("cannot open the database: {e}");
                     1
                 }
-                Ok(storage) => match import::import_sqlite(std::path::Path::new(file), storage.pool()).await {
+                Ok(storage) => match async {
+                    let owner = import_owner(&storage, &args).await?;
+                    import::import_sqlite(std::path::Path::new(file), storage.pool(), &owner).await
+                }
+                .await
+                {
                     Ok(report) => {
                         for (table, rows) in &report.copied {
                             println!("{table}: {rows} copied");
@@ -137,7 +143,7 @@ async fn main() {
                 },
             }
         } else {
-            eprintln!("usage: companion-backend import-sqlite <path to companion.db>");
+            eprintln!("usage: companion-backend import-sqlite <path to companion.db> [--owner <email of someone who has signed in>]");
             2
         };
         // A server a running Companion uses stays up.
@@ -262,6 +268,21 @@ async fn main() {
         cluster.stop();
     }
     tracing::info!("local companion exited cleanly");
+}
+
+/// Whose the imported records are: `--owner <email>` (someone who has signed in at least once),
+/// or the local person of an install without sign-in.
+async fn import_owner(storage: &storage::Storage, args: &[String]) -> Result<String, String> {
+    let Some(at) = args.iter().position(|arg| arg == "--owner") else {
+        return Ok("local".into());
+    };
+    let email = args.get(at + 1).ok_or("--owner needs an email address")?;
+    sqlx::query_scalar::<_, String>("SELECT id FROM users WHERE lower(email) = lower($1) AND id <> 'local'")
+        .bind(email)
+        .fetch_optional(storage.pool())
+        .await
+        .map_err(|e| format!("cannot look up {email}: {e}"))?
+        .ok_or_else(|| format!("nobody with the email {email} has signed in yet; they appear after their first sign-in"))
 }
 
 /// Companion's private PostgreSQL, running, and the URL of its database.

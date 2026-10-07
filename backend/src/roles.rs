@@ -325,7 +325,7 @@ pub async fn revoke_role(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
@@ -367,7 +367,7 @@ mod tests {
 
     /// A server with sign-in. Nobody signs in through a provider here: people and their sessions
     /// are written straight into the database.
-    fn server() -> (axum::Router, AppState) {
+    pub(crate) fn server() -> (axum::Router, AppState) {
         let auth = crate::auth::Auth {
             open_id: Some(crate::auth::OpenId {
                 issuer: "https://login.example.com/v2.0".into(),
@@ -382,7 +382,7 @@ mod tests {
     }
 
     /// A signed-in person with `roles` granted here; returns their id and session cookie.
-    async fn person(state: &AppState, name: &str, roles: &[&str]) -> (String, String) {
+    pub(crate) async fn person(state: &AppState, name: &str, roles: &[&str]) -> (String, String) {
         let pool = state.storage.pool();
         let id = uuid::Uuid::new_v4().to_string();
         sqlx::query("INSERT INTO users (id, issuer, subject, email, name) VALUES ($1, 'https://login.example.com/v2.0', $2, $3, $4)")
@@ -406,7 +406,12 @@ mod tests {
         (id, format!("companion_session={token}"))
     }
 
-    fn call(method: &str, uri: &str, cookie: &str, body: Option<serde_json::Value>) -> Request<Body> {
+    /// The id of the person named `name` (made with `person`).
+    pub(crate) async fn user_of(state: &AppState, name: &str) -> String {
+        sqlx::query_scalar("SELECT id FROM users WHERE subject = $1").bind(name).fetch_one(state.storage.pool()).await.unwrap()
+    }
+
+    pub(crate) fn call(method: &str, uri: &str, cookie: &str, body: Option<serde_json::Value>) -> Request<Body> {
         let request = Request::builder().method(method).uri(uri).header("cookie", cookie);
         match body {
             Some(body) => request.header("content-type", "application/json").body(Body::from(body.to_string())).unwrap(),
@@ -414,11 +419,11 @@ mod tests {
         }
     }
 
-    async fn status(app: &axum::Router, request: Request<Body>) -> StatusCode {
+    pub(crate) async fn status(app: &axum::Router, request: Request<Body>) -> StatusCode {
         app.clone().oneshot(request).await.unwrap().status()
     }
 
-    async fn json(app: &axum::Router, request: Request<Body>) -> serde_json::Value {
+    pub(crate) async fn json(app: &axum::Router, request: Request<Body>) -> serde_json::Value {
         let response = app.clone().oneshot(request).await.unwrap();
         serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1_000_000).await.unwrap()).unwrap()
     }

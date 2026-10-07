@@ -1672,6 +1672,7 @@ export default function App({ me }: { me?: Me }) {
           }}
           onClose={() => setProjectLauncherOpen(false)}
           notify={notify}
+          serverFolders={!!me?.sign_in}
         />
       )}
 

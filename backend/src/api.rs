@@ -24,7 +24,8 @@ use axum::response::{
     IntoResponse, Response,
 };
 use axum::routing::{delete, get, patch, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
+use crate::auth::Caller;
 use futures::stream;
 use futures::StreamExt as _;
 use serde::{Deserialize, Serialize};
@@ -663,7 +664,9 @@ pub fn router(state: AppState) -> Router {
         // Stage 38: first-run + benchmark.
         .route("/api/setup/status", get(admin(setup_status)))
         .route("/api/system/benchmark", post(admin(benchmark)))
-        // Innermost: CORS answers preflight requests before anyone is asked who they are.
+        // Innermost first: a path naming a record must name one of the caller's (ownership.rs),
+        // after they are known; CORS answers preflight requests before anyone is asked who they are.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::ownership::owned_paths))
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::authenticate))
         .layer(cors)
         .layer(axum::middleware::from_fn(move |request: axum::extract::Request, next: axum::middleware::Next| {
@@ -2617,7 +2620,7 @@ pub(crate) async fn assemble_request_context_with(
         .map(|(_, name, root)| workspace_snapshot(&root.to_string_lossy(), name))
         .unwrap_or_default();
     let memory = st
-        .memory_context(cid, &conv.workspace).await
+        .memory_context(&conv.user_id, cid, &conv.workspace).await
         .map_err(|error| ApiError::internal(format!("Could not read saved memory: {error}")))?
         .text;
     let legacy = legacy_prompt_order();
@@ -3337,6 +3340,7 @@ fn stream_conversation(
 /// stream the deterministic result, attach the UI action to `done`.
 async fn run_command_as_chat(
     s: &AppState,
+    caller: &Caller,
     conv_id: Option<String>,
     name: &str,
     args: &str,
@@ -3365,7 +3369,7 @@ async fn run_command_as_chat(
             Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
         }
     }
-    let outcome = run_slash_command(s, conv_id.clone(), name, args).await;
+    let outcome = run_slash_command(s, caller, conv_id.clone(), name, args).await;
     let (text, action) = match &outcome {
         Ok(o) => (o.text(), Some(o.action_json())),
         Err(e) => (format!("Command failed: {}", e.message), None),
@@ -3396,6 +3400,7 @@ fn chat_output_budget(n_ctx: u32, input_tokens: u32, reasoning: ReasoningMode, b
 
 async fn chat_sse(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Json(req): Json<ChatReq>,
 ) -> Result<Sse<futures::stream::BoxStream<'static, Result<Event, Infallible>>>, ApiError> {
     let request_started = std::time::Instant::now();
@@ -3411,13 +3416,16 @@ async fn chat_sse(
     } else {
         Some(req.conversation_id.clone())
     };
+    if let Some(cid) = &conv_id {
+        crate::ownership::conversation(&s, &caller, cid).await?;
+    }
 
     // Stage 12: deterministic commands bypass inference entirely (§137).
     // Unknown /names fall through to the model... no: unknown commands get a
     // direct correction so inference budget is never spent on typos.
     if let Some((cmd_name, cmd_args)) = crate::commands::parse(&req.message) {
         if crate::commands::find(&cmd_name).is_some() {
-            return run_command_as_chat(&s, conv_id, &cmd_name, &cmd_args).await;
+            return run_command_as_chat(&s, &caller, conv_id, &cmd_name, &cmd_args).await;
         }
         let hint = format!("Unknown command '/{cmd_name}'. Try /help.");
         return Ok(stream_text(hint, None));
@@ -4316,9 +4324,10 @@ async fn chat_stop(State(s): State<AppState>) -> Json<crate::generation::CancelO
 
 async fn list_conversations(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
 ) -> Result<Json<Vec<Conversation>>, ApiError> {
     let st = &s.storage;
-    st.list_conversations().await
+    st.list_conversations(&caller.id).await
         .map(Json)
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))
 }
@@ -4347,6 +4356,7 @@ fn default_conv_mode() -> String {
 
 async fn create_conversation(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Json(req): Json<NewConv>,
 ) -> Result<Json<Conversation>, ApiError> {
     let title = if req.title.trim().is_empty() {
@@ -4378,15 +4388,11 @@ async fn create_conversation(
                 "Select a project before starting a code session.",
             ));
         }
-        match st.get_workspace(&workspace).await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                return Err(ApiError::bad(
-                    "selected workspace no longer exists",
-                    "Select an available project and try again.",
-                ))
-            }
-            Err(error) => return Err(ApiError::internal(format!("storage error: {error}"))),
+        if crate::ownership::workspace(&s, &caller, &workspace).await.is_err() {
+            return Err(ApiError::bad(
+                "selected workspace no longer exists",
+                "Select an available project and try again.",
+            ));
         }
     }
     let c = Conversation {
@@ -4401,6 +4407,7 @@ async fn create_conversation(
         last_model: String::new(),
         priority: "normal".into(),
         related_to: String::new(),
+        user_id: caller.id.clone(),
     };
     st.create_conversation(&c).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
@@ -4779,6 +4786,7 @@ async fn latest_agent_context(
 
 async fn conversation_context(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let st = &s.storage;
@@ -4822,7 +4830,7 @@ async fn conversation_context(
         .map(|conversation| conversation.workspace)
         .unwrap_or_default();
     let memory = st
-        .memory_context(&id, &workspace).await
+        .memory_context(&caller.id, &id, &workspace).await
         .map_err(|error| ApiError::internal(format!("Could not read saved memory: {error}")))?;
     let attach_tok = estimate_tokens(attached_chars.saturating_sub(saved_chars));
     let tool_tok = (tool_chars / 4) as u32;
@@ -5301,8 +5309,10 @@ async fn attachment_file(
 
 async fn list_artifacts(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     axum::extract::Query(q): axum::extract::Query<ArtifactQuery>,
 ) -> Result<Json<Vec<crate::storage::ArtifactRow>>, ApiError> {
+    crate::ownership::conversation(&s, &caller, &q.conversation_id).await?;
     s.storage
         .artifacts_for(&q.conversation_id).await
         .map(Json)
@@ -5363,6 +5373,7 @@ struct ExecuteToolReq {
 /// `tools::execute` calls from handlers are not added elsewhere.
 async fn execute_tool(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Json(req): Json<ExecuteToolReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if req.tool.trim().is_empty() {
@@ -5371,7 +5382,10 @@ async fn execute_tool(
             "Pick a tool from GET /api/tools.",
         ));
     }
-    let ws_root = saved_project_folder(&s, &req.workspace).await?;
+    let ws_root = saved_project_folder(&s, &caller.id, &req.workspace).await?;
+    if !req.conversation_id.trim().is_empty() {
+        crate::ownership::conversation(&s, &caller, req.conversation_id.trim()).await?;
+    }
     let ws_key = ws_root
         .canonicalize()
         .map(|p| p.to_string_lossy().into_owned())
@@ -5556,7 +5570,7 @@ async fn record_tool_call(
 /// The folder a direct tool call may work in: a saved project, or a folder
 /// inside one. Any existing path used to be enough, so a caller could list,
 /// read or change any folder on the machine.
-async fn saved_project_folder(s: &AppState, requested: &str) -> Result<std::path::PathBuf, ApiError> {
+async fn saved_project_folder(s: &AppState, user: &str, requested: &str) -> Result<std::path::PathBuf, ApiError> {
     let wanted = std::path::Path::new(requested).canonicalize().map_err(|_| {
         ApiError::bad(
             format!("workspace not found: {requested}"),
@@ -5565,7 +5579,7 @@ async fn saved_project_folder(s: &AppState, requested: &str) -> Result<std::path
     })?;
     let projects = s
         .storage
-        .list_workspaces().await
+        .list_workspaces(user).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     let inside = projects
         .iter()
@@ -5647,8 +5661,10 @@ fn default_exec_limit() -> usize {
 
 async fn list_tool_executions(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     axum::extract::Query(q): axum::extract::Query<ExecQuery>,
 ) -> Result<Json<Vec<crate::storage::ToolExecution>>, ApiError> {
+    crate::ownership::conversation(&s, &caller, &q.conversation_id).await?;
     let st = &s.storage;
     st.tool_executions_for(&q.conversation_id, q.limit.clamp(1, 200)).await
         .map(Json)
@@ -5862,6 +5878,7 @@ const SAFE_GIT_STATUS: &str = "git -c core.fsmonitor=false status --short";
 /// events via GET /api/agent/runs/:id/events and approves via .../resume.
 async fn run_agent(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Json(req): Json<AgentReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if req.task.trim().is_empty() {
@@ -5869,6 +5886,9 @@ async fn run_agent(
             "task is empty",
             "Describe what the agent should do.",
         ));
+    }
+    if !req.conversation_id.trim().is_empty() {
+        crate::ownership::conversation(&s, &caller, req.conversation_id.trim()).await?;
     }
     let intent = answering_intent(&s, req.conversation_id.trim(), &req.task).await;
     if matches!(
@@ -5895,13 +5915,9 @@ async fn run_agent(
             "Select a workspace folder first (§27); the agent never gets full-disk access.",
         ));
     }
-    let ws_root = std::path::PathBuf::from(&req.workspace);
-    if !ws_root.is_dir() {
-        return Err(ApiError::bad(
-            format!("workspace not found: {}", req.workspace),
-            "Select an existing workspace folder first (§27).",
-        ));
-    }
+    // One of the caller's own saved projects (or a folder inside one): naming
+    // someone else's folder, or any folder of the machine, is not enough.
+    let ws_root = saved_project_folder(&s, &caller.id, &req.workspace).await?;
     let mode = req.mode.unwrap_or(AgentMode::Agent);
     if mode == AgentMode::Chat {
         return Err(ApiError::bad(
@@ -5984,6 +6000,7 @@ async fn run_agent(
         .unwrap_or(conversation_reasoning || s.settings.read().await.reasoning.default_on);
     let run_id = spawn_agent_run(
         &s,
+        caller.id.clone(),
         ws_root,
         task,
         mode,
@@ -5999,6 +6016,7 @@ async fn run_agent(
 
 async fn spawn_agent_run(
     s: &AppState,
+    user_id: String,
     ws_root: std::path::PathBuf,
     task: String,
     mode: AgentMode,
@@ -6028,6 +6046,7 @@ async fn spawn_agent_run(
             conversation_id,
             search_enabled: search,
             reasoning,
+            user_id,
         },
         cancel: CancelToken::new(),
         events: std::sync::Mutex::new(vec![]),
@@ -6226,8 +6245,8 @@ async fn agent_status(
     }
 }
 
-async fn agent_runs(State(s): State<AppState>) -> Json<Vec<crate::agent_runner::RunSummary>> {
-    Json(s.agents.read().await.summaries())
+async fn agent_runs(State(s): State<AppState>, Extension(caller): Extension<Caller>) -> Json<Vec<crate::agent_runner::RunSummary>> {
+    Json(s.agents.read().await.summaries().into_iter().filter(|run| run.user_id == caller.id).collect())
 }
 
 /// Tail a run's events: replay the log, then stream live until terminal (§45).
@@ -6405,6 +6424,7 @@ async fn command_workspace(
 
 async fn run_slash_command(
     s: &AppState,
+    caller: &Caller,
     conv_id: Option<String>,
     name: &str,
     args: &str,
@@ -6495,6 +6515,7 @@ async fn run_slash_command(
                 last_model: String::new(),
                 priority: "normal".into(),
                 related_to: String::new(),
+                user_id: caller.id.clone(),
             };
             s.storage
                 .create_conversation(&c).await
@@ -6568,6 +6589,7 @@ async fn run_slash_command(
             let reasoning = s.settings.read().await.reasoning.default_on;
             let run_id = spawn_agent_run(
                 s,
+                caller.id.clone(),
                 ws,
                 task,
                 if name == "plan" { AgentMode::Plan } else { AgentMode::CodeAssist },
@@ -6616,6 +6638,7 @@ async fn run_slash_command(
             let reasoning = s.settings.read().await.reasoning.default_on;
             let run_id = spawn_agent_run(
                 s,
+                caller.id.clone(),
                 ws,
                 task,
                 AgentMode::Agent,
@@ -6720,14 +6743,14 @@ async fn context_numbers(s: &AppState, cid: &str) -> Result<(usize, usize, usize
         .attachments_for(cid).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     let turns = build_turns(&history, &attachments);
-    let workspace = st
+    let (workspace, owner) = st
         .get_conversation(cid).await
         .ok()
         .flatten()
-        .map(|conversation| conversation.workspace)
+        .map(|conversation| (conversation.workspace, conversation.user_id))
         .unwrap_or_default();
     let memory = st
-        .memory_context(cid, &workspace).await
+        .memory_context(&owner, cid, &workspace).await
         .map_err(|error| ApiError::internal(format!("Could not read saved memory: {error}")))?;
     let chars: usize = turns.iter().map(|t| t.content.len()).sum::<usize>() + memory.text.len();
     Ok((
@@ -7078,7 +7101,7 @@ async fn prepare_conversation(
                         }
                     }
                     let a = st.attachments_for(&id).await.unwrap_or_default().len();
-                    let memory = match st.memory_context(&id, &c.workspace).await {
+                    let memory = match st.memory_context(&c.user_id, &id, &c.workspace).await {
                         Ok(memory) => memory.entries,
                         Err(error) => {
                             fail(format!("Could not read saved memory: {error}"));
@@ -7319,7 +7342,14 @@ struct NewWorkspace {
 
 /// Open the operating system's folder chooser. This keeps filesystem paths
 /// out of the normal UX while returning only the folder the user selected.
-async fn pick_folder() -> Result<Json<serde_json::Value>, ApiError> {
+async fn pick_folder(State(s): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    if s.auth.sign_in_required() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "the folder chooser would open on the server, not on your PC",
+            "Type the project's folder on the server instead.",
+        ));
+    }
     #[cfg(not(target_os = "linux"))]
     let picked = tokio::task::spawn_blocking(|| {
         rfd::FileDialog::new()
@@ -7352,15 +7382,17 @@ async fn pick_folder() -> Result<Json<serde_json::Value>, ApiError> {
 
 async fn list_workspaces(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
 ) -> Result<Json<Vec<crate::storage::Workspace>>, ApiError> {
     s.storage
-        .list_workspaces().await
+        .list_workspaces(&caller.id).await
         .map(Json)
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))
 }
 
 async fn create_workspace(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Json(req): Json<NewWorkspace>,
 ) -> Result<Json<crate::storage::Workspace>, ApiError> {
     let name = req.name.trim();
@@ -7404,6 +7436,7 @@ async fn create_workspace(
             format!("{build_system} ({file_count} files)")
         },
         created_at: chrono::Utc::now().to_rfc3339(),
+        user_id: caller.id.clone(),
     };
     s.storage
         .create_workspace(&w).await
@@ -8028,7 +8061,7 @@ async fn run_plugin_command(
 
 /// Stage 34 diagnostics (§51): every check is infallible — failures become
 /// rows, never a 500, so a broken subsystem can't hide the rest.
-async fn doctor(State(s): State<AppState>) -> Json<serde_json::Value> {
+async fn doctor(State(s): State<AppState>, Extension(caller): Extension<Caller>) -> Json<serde_json::Value> {
     let mut rows: Vec<serde_json::Value> = Vec::new();
     let mut row = |id: &str, label: &str, status: &str, detail: String| {
         rows.push(
@@ -8041,12 +8074,12 @@ async fn doctor(State(s): State<AppState>) -> Json<serde_json::Value> {
         "ok",
         "doctor ran against the live API".into(),
     );
-    match s.storage.list_conversations().await {
+    match s.storage.list_conversations(&caller.id).await {
         Ok(n) => row(
             "database",
             "Database",
             "ok",
-            format!("SQLite readable ({} conversations)", n.len()),
+            format!("Database readable ({} of your conversations)", n.len()),
         ),
         Err(e) => row("database", "Database", "fail", format!("SQLite error: {e}")),
     }
@@ -8131,7 +8164,7 @@ async fn doctor(State(s): State<AppState>) -> Json<serde_json::Value> {
     }
     {
         let st = &s.storage;
-        match st.list_workspaces().await {
+        match st.list_workspaces(&caller.id).await {
             Ok(ws) => {
                 let missing: Vec<String> = ws
                     .iter()
@@ -8199,7 +8232,7 @@ async fn doctor(State(s): State<AppState>) -> Json<serde_json::Value> {
 // ---- Stage 38 setup + benchmark ----
 
 /// Stage 38 first-run wizard data (§88): what exists, what's missing.
-async fn setup_status(State(s): State<AppState>) -> Json<serde_json::Value> {
+async fn setup_status(State(s): State<AppState>, Extension(caller): Extension<Caller>) -> Json<serde_json::Value> {
     let mm = s.models.read().await;
     let list = mm.list();
     let ggufs = list.iter().filter(|m| m.gguf_path().is_file()).count();
@@ -8209,7 +8242,7 @@ async fn setup_status(State(s): State<AppState>) -> Json<serde_json::Value> {
     let running = s.llama.write().await.is_running();
     let convs = s
         .storage
-        .list_conversations().await
+        .list_conversations(&caller.id).await
         .map(|v| v.len())
         .unwrap_or(0);
     let steps = vec![
@@ -8324,6 +8357,7 @@ struct PatchConv {
 /// Update session fields: title/model/mode/workspace/capability defaults.
 async fn patch_conversation(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Json(req): Json<PatchConv>,
 ) -> Result<Json<Conversation>, ApiError> {
@@ -8378,11 +8412,8 @@ async fn patch_conversation(
             }
         }
         if !w.is_empty() {
-            match st.get_workspace(&w).await {
-                Ok(Some(_)) => c.workspace = w,
-                Ok(None) => return Err(ApiError::not_found(format!("unknown workspace '{w}'"))),
-                Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
-            }
+            crate::ownership::workspace(&s, &caller, &w).await.map_err(|_| ApiError::not_found(format!("unknown workspace '{w}'")))?;
+            c.workspace = w;
         } else {
             c.workspace = String::new();
         }
@@ -8413,6 +8444,7 @@ struct ForkReq {
 /// Stage 14 fork (§145): new id, shared snapshot, divergent future.
 async fn fork_conversation(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Json(req): Json<ForkReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -8441,6 +8473,7 @@ async fn fork_conversation(
             last_model: src.last_model.clone(),
             priority: src.priority.clone(),
             related_to: src.related_to.clone(),
+            user_id: caller.id.clone(),
         }).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
         let n = st
@@ -8494,6 +8527,7 @@ fn default_share_turns() -> usize {
 /// Stage 14 cross-session share (§§98–99): compact package, explicit target.
 async fn share_conversation(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Json(req): Json<ShareReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -8509,7 +8543,7 @@ async fn share_conversation(
         Ok(None) => return Err(ApiError::not_found("conversation not found")),
         Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
     };
-    if matches!(st.get_conversation(&req.target_id).await, Ok(None)) {
+    if crate::ownership::conversation(&s, &caller, &req.target_id).await.is_err() {
         return Err(ApiError::not_found("target conversation not found"));
     }
     let history = st
@@ -8581,7 +8615,7 @@ async fn share_conversation(
             .flatten()
             .map(|c| c.workspace)
             .unwrap_or_default();
-        let mems = st.memory_export(&id, &tgt_ws).await.unwrap_or_default();
+        let mems = st.memory_export(&caller.id, &id, &tgt_ws).await.unwrap_or_default();
         if mems.is_empty() {
             package.push_str("\nMemory: none visible to source\n");
         } else {
@@ -8612,10 +8646,10 @@ async fn share_conversation(
 /// ACTIVE = generating now or an agent run touching it; WARM = inference up;
 /// COLD = everything else. KV residency itself is llama-server's slots —
 /// history here is always the source of truth (§122).
-async fn list_sessions(State(s): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn list_sessions(State(s): State<AppState>, Extension(caller): Extension<Caller>) -> Result<Json<serde_json::Value>, ApiError> {
     let st = &s.storage;
     let convs = st
-        .list_conversations().await
+        .list_conversations(&caller.id).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     let generating: std::collections::HashSet<String> = {
         let mut set = std::collections::HashSet::new();
@@ -8694,6 +8728,7 @@ struct PatchSession {
 /// Stage 27: priority + session relationships (§138, §146).
 async fn patch_session(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Json(req): Json<PatchSession>,
 ) -> Result<Json<Conversation>, ApiError> {
@@ -8714,7 +8749,7 @@ async fn patch_session(
         c.priority = p;
     }
     if let Some(r) = req.related_to {
-        if !r.is_empty() && r != id && matches!(st.get_conversation(&r).await, Ok(None)) {
+        if !r.is_empty() && r != id && crate::ownership::conversation(&s, &caller, &r).await.is_err() {
             return Err(ApiError::not_found("related session not found"));
         }
         c.related_to = r;
@@ -8795,7 +8830,7 @@ fn logs_zip(dir: Option<&std::path::Path>, about: &str) -> Vec<u8> {
 /// Stage 27 recovery (§83, §103): stale model contexts + live work.
 /// Registries are in-memory, so after a restart anything that was live is
 /// reported stale with Resume (prepare) / Discard actions — never resumed blindly.
-async fn sessions_recovery(State(s): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+async fn sessions_recovery(State(s): State<AppState>, Extension(caller): Extension<Caller>) -> Result<Json<serde_json::Value>, ApiError> {
     let loaded = s
         .models
         .read()
@@ -8805,7 +8840,7 @@ async fn sessions_recovery(State(s): State<AppState>) -> Result<Json<serde_json:
         .unwrap_or_default();
     let st = &s.storage;
     let convs = st
-        .list_conversations().await
+        .list_conversations(&caller.id).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     let busy: Vec<String> = {
         let mut b = Vec::new();
@@ -9273,7 +9308,7 @@ async fn system_metrics(
 
 /// Stage 15: one-screen overview — hardware, inference, shared weights,
 /// per-session attribution, alerts (§§130–133).
-async fn system_overview(State(s): State<AppState>) -> Json<serde_json::Value> {
+async fn system_overview(State(s): State<AppState>, Extension(caller): Extension<Caller>) -> Json<serde_json::Value> {
     let hw = hardware::detect();
     let inf = s.inference.read().await;
     let latest_sample = s.metrics.lock().ok().and_then(|log| log.latest());
@@ -9300,7 +9335,7 @@ async fn system_overview(State(s): State<AppState>) -> Json<serde_json::Value> {
     // Attribution (§132): live inference/agent work is measured-or-estimated,
     // everything else is honestly unknown.
     let st = &s.storage;
-    let convs = st.list_conversations().await.unwrap_or_default();
+    let convs = st.list_conversations(&caller.id).await.unwrap_or_default();
     let mut active = std::collections::HashSet::new();
     if let Some(cid) = s.generations.read().await.active_conversation() {
         if !cid.is_empty() {
@@ -9420,6 +9455,7 @@ struct NewMemory {
 
 async fn list_memory(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Vec<crate::storage::MemoryEntry>>, ApiError> {
     let conv = q.get("conversation_id").cloned().unwrap_or_default();
@@ -9436,13 +9472,14 @@ async fn list_memory(
         ws
     };
     s.storage
-        .memories_for(&conv, &ws).await
+        .memories_for(&caller.id, &conv, &ws).await
         .map(Json)
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))
 }
 
 async fn add_memory(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Json(req): Json<NewMemory>,
 ) -> Result<Json<crate::storage::MemoryEntry>, ApiError> {
     if req.content.trim().is_empty() {
@@ -9474,6 +9511,7 @@ async fn add_memory(
             "Non-global memories need a conversation or workspace id.",
         ));
     }
+    memory_scope_is_theirs(&s, &caller, &scope, req.scope_id.trim()).await?;
     let now = now_rfc3339();
     let m = crate::storage::MemoryEntry {
         id: uuid::Uuid::new_v4().to_string(),
@@ -9487,11 +9525,26 @@ async fn add_memory(
         },
         created_at: now.clone(),
         last_used: now,
+        user_id: caller.id.clone(),
     };
     s.storage
         .add_memory(&m).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     Ok(Json(m))
+}
+
+/// A memory for a conversation or a project must be for one of the caller's.
+async fn memory_scope_is_theirs(s: &AppState, caller: &Caller, scope: &str, scope_id: &str) -> Result<(), ApiError> {
+    let theirs = match scope {
+        "conversation" | "session" => crate::ownership::conversation(s, caller, scope_id).await.is_ok(),
+        "workspace" => crate::ownership::workspace(s, caller, scope_id).await.is_ok(),
+        _ => true,
+    };
+    if theirs {
+        Ok(())
+    } else {
+        Err(ApiError::not_found(format!("no {scope} '{scope_id}' of yours")))
+    }
 }
 
 async fn delete_memory(
@@ -9520,6 +9573,7 @@ fn default_mem_scope() -> String {
 /// Stage 26 explicit share (§83): copy one memory into another scope.
 async fn share_memory(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Json(req): Json<ShareMemoryReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -9535,6 +9589,7 @@ async fn share_memory(
         Ok(None) => return Err(ApiError::not_found("unknown memory")),
         Err(e) => return Err(ApiError::internal(format!("storage error: {e}"))),
     };
+    memory_scope_is_theirs(&s, &caller, &req.scope, req.target_id.trim()).await?;
     let now = now_rfc3339();
     let copy = crate::storage::MemoryEntry {
         id: uuid::Uuid::new_v4().to_string(),
@@ -9548,6 +9603,7 @@ async fn share_memory(
         source: format!("shared from {}", src.scope),
         created_at: now.clone(),
         last_used: now,
+        user_id: caller.id.clone(),
     };
     st.add_memory(&copy).await
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
@@ -10360,6 +10416,7 @@ mod tests {
                 conversation_id: String::new(),
                 search_enabled,
                 reasoning: false,
+                user_id: "local".into(),
             },
             cancel: CancelToken::new(),
             events: std::sync::Mutex::new(vec![crate::agent::AgentEvent::activity(
@@ -10726,6 +10783,7 @@ Would you like me to fix it?")]));
     #[tokio::test]
     async fn agent_continuation_without_task_returns_clarification_not_run() {
         let state = AppState::new_stub();
+        save_project(&router(state.clone()), &std::env::temp_dir().to_string_lossy()).await;
         let response = router(state.clone())
             .oneshot(json_req(
                 "POST",
@@ -11049,7 +11107,7 @@ Would you like me to fix it?")]));
                 &crate::agent::AgentEvent::context(crate::agent::AgentState::Planning, 2, latest),
             ).await
             .unwrap();
-        let result = conversation_context(State(state), Path(conversation))
+        let result = conversation_context(State(state), Extension(crate::auth::Caller::local()), Path(conversation))
             .await
             .unwrap()
             .0;
@@ -11087,13 +11145,14 @@ Would you like me to fix it?")]));
                 source: "user".into(),
                 created_at: "now".into(),
                 last_used: "now".into(),
+                user_id: "local".into(),
             }).await
             .unwrap();
         let expected = state
             .storage
-            .memory_context(&conversation, "").await
+            .memory_context("local", &conversation, "").await
             .unwrap();
-        let result = conversation_context(State(state), Path(conversation))
+        let result = conversation_context(State(state), Extension(crate::auth::Caller::local()), Path(conversation))
             .await
             .unwrap()
             .0;
@@ -11683,6 +11742,13 @@ Would you like me to fix it?")]));
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Save `path` as a project of the local person, through the API as the screens do: agents
+    /// and tools work only in the caller's own saved projects.
+    async fn save_project(app: &Router, path: &str) {
+        let r = app.clone().oneshot(json_req("POST", "/api/workspaces", serde_json::json!({ "name": "project", "path": path }))).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "saving {path} as a project");
+    }
+
     fn agent_ws() -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
         static M: AtomicU64 = AtomicU64::new(0);
@@ -11698,6 +11764,7 @@ Would you like me to fix it?")]));
     async fn agent_run_without_inference_fails_gracefully() {
         let a = app();
         let ws = agent_ws();
+        save_project(&a, &ws).await;
         let before_start = chrono::Utc::now();
         let r = a
             .clone()
@@ -11796,6 +11863,7 @@ Would you like me to fix it?")]));
     async fn agent_unknown_run_is_404_and_chat_mode_refused() {
         let a = app();
         let ws = agent_ws();
+        save_project(&a, &ws).await;
         for (method, uri) in [
             ("GET", "/api/agent/runs/nope".to_string()),
             ("GET", "/api/agent/runs/nope/events".to_string()),
@@ -12036,9 +12104,27 @@ Would you like me to fix it?")]));
     }
 
     /// A router whose state has `path` saved as a project, as the screens do
-    /// before any tool runs in it.
+    /// before any tool runs in it, and a conversation "c-audit" to record tool calls in.
     async fn app_with_project(path: &str) -> Router {
         let state = AppState::new_stub();
+        state
+            .storage
+            .create_conversation(&Conversation {
+                id: "c-audit".into(),
+                title: "Tools".into(),
+                model_id: String::new(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                mode: "chat".into(),
+                workspace: String::new(),
+                reasoning_default: false,
+                search_default: false,
+                last_model: String::new(),
+                priority: "normal".into(),
+                related_to: String::new(),
+                user_id: "local".into(),
+            })
+            .await
+            .unwrap();
         state
             .storage
             .create_workspace(&crate::storage::Workspace {
@@ -12047,6 +12133,7 @@ Would you like me to fix it?")]));
                 path: path.into(),
                 build_system: String::new(),
                 created_at: chrono::Utc::now().to_rfc3339(),
+                user_id: "local".into(),
             }).await
             .unwrap();
         router(state)
@@ -12076,7 +12163,7 @@ Would you like me to fix it?")]));
             .oneshot(json_req(
                 "POST",
                 "/api/tools/execute",
-                exec_body(&inner, "read_file", serde_json::json!({"path": "b.txt"}), serde_json::json!({})),
+                exec_body(&inner, "read_file", serde_json::json!({"path": "b.txt"}), serde_json::json!({"conversation_id": "c-audit"})),
             ))
             .await
             .unwrap();
@@ -12084,7 +12171,7 @@ Would you like me to fix it?")]));
         assert!(body_json(r).await["output"].as_str().unwrap().contains("inside"));
         // The record says how the call was allowed, not just "approved".
         let r = a
-            .oneshot(Request::builder().uri("/api/tools/executions?conversation_id=direct").body(Body::empty()).unwrap())
+            .oneshot(Request::builder().uri("/api/tools/executions?conversation_id=c-audit").body(Body::empty()).unwrap())
             .await
             .unwrap();
         let records = body_json(r).await;
@@ -12654,12 +12741,9 @@ Would you like me to fix it?")]));
             ))
             .await
             .unwrap();
-        // Streams SSE; first frame is an error event.
-        assert_eq!(r.status(), StatusCode::OK);
-        let b = axum::body::to_bytes(r.into_body(), 100_000).await.unwrap();
-        assert!(String::from_utf8(b.to_vec())
-            .unwrap()
-            .contains("event: error"));
+        // No conversation of the caller's by that id: refused before anything is prepared.
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(r).await["error"], "conversation not found");
     }
 
     #[test]
@@ -12699,10 +12783,15 @@ Would you like me to fix it?")]));
                 persisted: Default::default(),
                 handle: tokio::spawn(std::future::pending()),
             });
+        let created = router(state.clone())
+            .oneshot(json_req("POST", "/api/conversations", serde_json::json!({"title": "Prepare", "model_id": ""})))
+            .await
+            .unwrap();
+        let conversation = body_json(created).await["id"].as_str().unwrap().to_string();
         let response = router(state.clone())
             .oneshot(json_req(
                 "POST",
-                "/api/conversations/nope/prepare",
+                &format!("/api/conversations/{conversation}/prepare"),
                 serde_json::json!({}),
             ))
             .await
@@ -12868,7 +12957,8 @@ Would you like me to fix it?")]));
             .await
             .unwrap();
         assert!(body_json(r).await.as_array().unwrap().is_empty());
-        // Explicit share copies into the target scope.
+        // Explicit share copies into the target scope: one of the person's own projects.
+        let (a, ws9) = seed_workspace(a, "Shared").await;
         let r = a
             .clone()
             .oneshot(json_req(
@@ -12878,12 +12968,22 @@ Would you like me to fix it?")]));
             ))
             .await
             .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "no project of yours by that id");
+        let r = a
+            .clone()
+            .oneshot(json_req(
+                "POST",
+                &format!("/api/memory/{mid}/share"),
+                serde_json::json!({"target_id": ws9, "scope": "workspace"}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
         let r = a
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/memory?workspace_id=ws9")
+                    .uri(format!("/api/memory?workspace_id={ws9}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -13618,8 +13718,11 @@ Would you like me to fix it?")]));
             .as_str()
             .unwrap()
             .to_string();
+        // Another of the person's own projects: saved, but not this session's.
+        let other = agent_ws();
+        save_project(&a, &other).await;
         let response = a.oneshot(json_req("POST", "/api/agent/run", serde_json::json!({
-            "conversation_id": conversation, "workspace": agent_ws(), "task": "Inspect", "mode": "plan"
+            "conversation_id": conversation, "workspace": other, "task": "Inspect", "mode": "plan"
         }))).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(body_json(response).await["error"]
@@ -13644,8 +13747,10 @@ Would you like me to fix it?")]));
             .as_str()
             .unwrap()
             .to_string();
+        let ws = agent_ws();
+        save_project(&a, &ws).await;
         let response = a.clone().oneshot(json_req("POST", "/api/agent/run", serde_json::json!({
-            "conversation_id": conversation, "workspace": agent_ws(), "task": "Inspect", "mode": "plan"
+            "conversation_id": conversation, "workspace": ws, "task": "Inspect", "mode": "plan"
         }))).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let run_id = body_json(response).await["run_id"]

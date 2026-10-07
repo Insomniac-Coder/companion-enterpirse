@@ -2413,6 +2413,8 @@ pub struct AgentSpec {
     pub search_enabled: bool,
     /// Native thinking allowed for this run's action requests.
     pub reasoning: bool,
+    /// The person who started the run: only they see or steer it.
+    pub user_id: String,
 }
 
 #[derive(Debug)]
@@ -2507,6 +2509,9 @@ pub struct RunSummary {
     pub mode: AgentMode,
     /// The run ended with present_plan: there is a plan to approve.
     pub plan_ready: bool,
+    /// Whose run it is (only they see it).
+    #[serde(skip)]
+    pub user_id: String,
 }
 
 #[derive(Default)]
@@ -2572,6 +2577,7 @@ impl AgentRegistry {
                     conversation_id: r.spec.conversation_id.clone(),
                     mode: r.spec.mode,
                     plan_ready: evs.last().is_some_and(presents_plan),
+                    user_id: r.spec.user_id.clone(),
                 }
             })
             .collect()
@@ -2750,7 +2756,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             .flatten()
             .map(|conversation| conversation.workspace)
             .unwrap_or_default();
-        if let Ok(memory) = st.memory_context(&spec.conversation_id, &workspace).await {
+        if let Ok(memory) = st.memory_context(&spec.user_id, &spec.conversation_id, &workspace).await {
             transcript[0].content.push_str(&memory.text);
         }
         let mut history = st
@@ -5428,6 +5434,7 @@ CONTENT>>>
                     conversation_id: String::new(),
                     search_enabled: false,
                     reasoning: false,
+                    user_id: "local".into(),
                 },
                 cancel: CancelToken::new(),
                 events: Mutex::new(vec![AgentEvent::new(state, "fixture".into(), 1)]),
@@ -5463,6 +5470,7 @@ CONTENT>>>
                 conversation_id: String::new(),
                 search_enabled: false,
                 reasoning: false,
+                user_id: "local".into(),
             },
             cancel: CancelToken::new(),
             events: Mutex::new(vec![]),

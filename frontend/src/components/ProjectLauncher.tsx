@@ -12,14 +12,19 @@ export default function ProjectLauncher({
   onChoose,
   onClose,
   notify,
+  serverFolders,
 }: {
   recent: Workspace[];
   onChoose: (workspace: Workspace) => void;
   onClose: () => void;
   notify: (kind: 'success' | 'error' | 'info', text: string) => void;
+  /** On a server with sign-in, projects are folders of the server: typed, not browsed (the
+   * folder chooser would open on the server's own screen). */
+  serverFolders: boolean;
 }) {
   const [name, setName] = useState('');
   const [manualPath, setManualPath] = useState('');
+  const [parentPath, setParentPath] = useState('');
   const [busy, setBusy] = useState(false);
 
   async function addExisting(path?: string) {
@@ -45,8 +50,11 @@ export default function ProjectLauncher({
     }
     setBusy(true);
     try {
-      const parent = await pickProjectFolder();
-      if (!parent) return;
+      const parent = serverFolders ? parentPath.trim() : await pickProjectFolder();
+      if (!parent) {
+        if (serverFolders) notify('info', 'Enter the folder on the server where the project should go.');
+        return;
+      }
       const workspace = await createWorkspace(name.trim(), parent, true);
       onChoose(workspace);
       notify('success', `Created ${workspace.name}.`);
@@ -61,18 +69,31 @@ export default function ProjectLauncher({
   return (
     <Dialog title="Open a project" description="The agent can only read and change files inside the project you choose." icon="folder" size="lg" onClose={onClose}>
       <div className="launch-grid">
-        <button type="button" className="launch-card" disabled={busy} onClick={() => void addExisting()}>
-          <Icon name="folder" size={20} />
-          <strong>Open an existing folder</strong>
-          <small>Browse your computer for a project you already have.</small>
-        </button>
+        {serverFolders ? (
+          <div className="launch-card">
+            <Icon name="folder" size={20} />
+            <strong>Open an existing folder</strong>
+            <small>Projects are folders on the server Companion runs on.</small>
+            <form className="inline-form" onSubmit={(event) => { event.preventDefault(); if (manualPath.trim()) void addExisting(manualPath.trim()); }}>
+              <input value={manualPath} onChange={(event) => setManualPath(event.target.value)} placeholder="Folder on the server" aria-label="Project folder path on the server" />
+              <Button type="submit" disabled={busy || !manualPath.trim()} style={{ height: 34 }}>Open</Button>
+            </form>
+          </div>
+        ) : (
+          <button type="button" className="launch-card" disabled={busy} onClick={() => void addExisting()}>
+            <Icon name="folder" size={20} />
+            <strong>Open an existing folder</strong>
+            <small>Browse your computer for a project you already have.</small>
+          </button>
+        )}
         <div className="launch-card">
           <Icon name="folderPlus" size={20} />
           <strong>Create a new project</strong>
-          <small>Name it, then choose where the folder should go.</small>
+          <small>{serverFolders ? 'Name it, and give the server folder it goes in.' : 'Name it, then choose where the folder should go.'}</small>
           <form className="inline-form" onSubmit={(event) => { event.preventDefault(); void createNew(); }}>
             <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Project name" aria-label="New project name" />
-            <Button type="submit" disabled={busy || !name.trim()} style={{ height: 34 }}>Choose location</Button>
+            {serverFolders && <input value={parentPath} onChange={(event) => setParentPath(event.target.value)} placeholder="Folder on the server" aria-label="Server folder for the new project" />}
+            <Button type="submit" disabled={busy || !name.trim() || (serverFolders && !parentPath.trim())} style={{ height: 34 }}>{serverFolders ? 'Create' : 'Choose location'}</Button>
           </form>
         </div>
       </div>
@@ -89,13 +110,13 @@ export default function ProjectLauncher({
         </div>
       )}
 
-      <details className="manual-path">
+      {!serverFolders && <details className="manual-path">
         <summary><Icon name="chevronRight" size={13} /> Enter a path instead</summary>
         <form className="inline-form" onSubmit={(event) => { event.preventDefault(); if (manualPath.trim()) void addExisting(manualPath.trim()); }}>
           <input value={manualPath} onChange={(event) => setManualPath(event.target.value)} placeholder="C:\Projects\my-app" aria-label="Project folder path" />
           <Button type="submit" disabled={busy || !manualPath.trim()} style={{ height: 34 }}>Open</Button>
         </form>
-      </details>
+      </details>}
     </Dialog>
   );
 }

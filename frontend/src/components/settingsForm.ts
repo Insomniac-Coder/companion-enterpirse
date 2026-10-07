@@ -42,3 +42,12 @@ export function withValues(base: any, over: any): any {
   }
   return out;
 }
+
+/** The part of `values` a model has its own value for: context, sampling, performance, hardware
+ *  (the server's `settings_levels::model_field`). */
+export function modelOwnValues(values: Record<string, any>): Record<string, any> {
+  const out: Record<string, any> = {};
+  for (const key of ['inference', 'runtime', 'hardware']) if (values[key] && Object.keys(values[key]).length) out[key] = values[key];
+  if ('runtime_auto' in values) out.runtime_auto = values.runtime_auto;
+  return out;
+}

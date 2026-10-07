@@ -64,6 +64,12 @@ async function req(path: string, init?: RequestInit) {
   return r.json();
 }
 
+/** The models people can choose: the ones the admins host (one today). */
+export async function listAvailableModels(): Promise<ModelMeta[]> {
+  return req('/api/models/available');
+}
+
+/** The whole model library (admins). */
 export async function listModels(): Promise<ModelMeta[]> {
   return req('/api/models');
 }

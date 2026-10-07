@@ -72,8 +72,9 @@ function fieldSections(path) {
 }
 
 test('every settings section contains explicit field rows, including conditional fields', () => {
-  // The dashboard's model server, web search, rules and privacy, plus the manual hardware overrides.
-  assert.equal(fieldSections(sourcePath), 5);
+  // The dashboard's startup model, a model's settings, web search, rules and privacy, plus the manual
+  // hardware overrides.
+  assert.equal(fieldSections(sourcePath), 6);
   // Companion's own: general, chats, memory and context, code and agents, keyboard.
   assert.equal(fieldSections(personalPath), 5);
 });

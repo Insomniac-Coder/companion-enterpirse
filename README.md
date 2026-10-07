@@ -439,7 +439,17 @@ group's defaults for the personal settings. A platform admin can **lock** a pers
 for the whole company (a team admin for their group): it shows as locked in people's Settings, with the
 reason, and nobody below can change it, the admin's own Settings included. When a person's groups
 disagree, the group with the lowest priority number wins. A laptop install has one person and one set
-of settings, so its dashboard offers no locks. The same is open to scripts through the API:
+of settings, so its dashboard offers no locks.
+
+Models have their own settings: on the dashboard's **Models** page, each model's **Settings** sets its
+context, sampling, performance, cache and hardware; each field starts from the defaults on the **Model
+server** page (which also names the model loaded at startup), and a model keeps only what it changes,
+used from its next load. **Servers** lists the servers hosting models (this one, for now) and shows what
+each is using. People choose among the models the admins host, from the model chip in the message
+box; the server lists them at `GET /api/models/available`, while the whole library (`/api/models`) and
+each model's settings (`/api/admin/models/<id>/settings`) are the admins'.
+
+The same is open to scripts through the API:
 `GET /api/admin/settings`, `PUT /api/admin/settings/company` with `{"settings": {...}}`,
 `PUT /api/admin/settings/groups/<id>` with `{"settings": {...}, "priority": 10}`, and
 `PUT`/`DELETE /api/admin/settings/locks` with `{"path": "appearance.theme", "group_id": null, "reason": "..."}`.

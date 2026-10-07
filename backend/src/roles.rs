@@ -338,8 +338,12 @@ pub(crate) mod tests {
     use tower::ServiceExt as _;
 
     /// Every route that changes the server for everyone, or shows everyone's activity.
-    const PLATFORM_ADMIN_ROUTES: [(&str, &str); 27] = [
+    const PLATFORM_ADMIN_ROUTES: [(&str, &str); 31] = [
         ("PUT", "/api/admin/settings/company"),
+        ("GET", "/api/models"),
+        ("GET", "/api/admin/models/m/settings"),
+        ("PUT", "/api/admin/models/m/settings"),
+        ("GET", "/api/admin/servers"),
         ("POST", "/api/models/load"),
         ("POST", "/api/models/unload"),
         ("POST", "/api/models/scan"),
@@ -446,7 +450,7 @@ pub(crate) mod tests {
             }
         }
         // Their own work stays open to them.
-        for uri in ["/api/conversations", "/api/models", "/api/settings", "/api/me", "/api/workspaces"] {
+        for uri in ["/api/conversations", "/api/models/available", "/api/settings", "/api/me", "/api/workspaces"] {
             assert_eq!(status(&app, call("GET", uri, &user, None)).await, StatusCode::OK, "{uri}");
         }
     }

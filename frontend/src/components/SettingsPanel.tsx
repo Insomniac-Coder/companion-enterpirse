@@ -63,17 +63,17 @@ export function HardwareOverrides({ settings, set }: { settings: any; set: SetPr
 }
 
 /** What the selected mode means for the default model, in measured terms. */
-export function PerformanceModeNote({ settings, status }: { settings: any; status: CalibrationStatus | null }) {
+export function PerformanceModeNote({ settings, status, forModel }: { settings: any; status: CalibrationStatus | null; forModel?: boolean }) {
   const mode = performanceMode(settings);
   const base = 'Applies at the next model load. Profiles are measured per model: calibrate a model from its details on the Models page.';
   if (mode === 'auto' || mode === 'manual') return <span>{base}</span>;
-  if (!settings?.general?.default_model) return <span>{base} Choose a default model to see what this profile does for it.</span>;
+  if (!forModel && !settings?.general?.default_model) return <span>{base} Choose a default model to see what this profile does for it.</span>;
   const calibration = status?.calibration;
   if (!calibration) return <span>{base} The default model is not calibrated yet, so it will load with automatic settings until it is.</span>;
   const stale = staleReason(status);
   if (stale) return <span>{base} {stale}</span>;
   const profile = calibration.profiles.find((candidate) => candidate.name === mode);
-  return <span>{base}{profile ? <span className="settings-mode-measured"> For the default model: {profileSummary(profile)}.</span> : null}</span>;
+  return <span>{base}{profile ? <span className="settings-mode-measured"> For {forModel ? 'this' : 'the default'} model: {profileSummary(profile)}.</span> : null}</span>;
 }
 
 export function RuntimeSummary({ policy, dirty }: { policy: RuntimePolicy; dirty: boolean }) {
@@ -173,17 +173,12 @@ function Lines({ value, set, placeholder }: { value: string[] | undefined; set: 
   return <textarea rows={3} placeholder={placeholder} value={text} onChange={(event) => setText(event.target.value)} onBlur={() => set(text.split('\n').map((line) => line.trim()).filter(Boolean))} />;
 }
 
-/** The dashboard's settings: the parts of Companion the people running it decide. */
-export type ServiceSection = 'models' | 'search' | 'rules' | 'privacy';
+/** The dashboard's settings: the parts of Companion the people running it decide. `startup`: which
+ *  model loads when the server starts; `model`: a model's context, sampling, performance and hardware
+ *  (the company's defaults, or one model's own). */
+export type ServiceSection = 'startup' | 'model' | 'search' | 'rules' | 'privacy';
 
-export const SERVICE_SECTION_TITLES: Record<ServiceSection, string> = {
-  models: 'Model server',
-  search: 'Web search',
-  rules: 'Rules',
-  privacy: 'Privacy and logging',
-};
-
-export default function ServiceSettings({ sections, scope, setToasts, readOnly, note }: {
+export default function ServiceSettings({ sections, scope, setToasts, readOnly, note, model, bare }: {
   sections: ServiceSection[];
   scope: SettingsScope;
   setToasts: React.Dispatch<React.SetStateAction<Toast[]>>;
@@ -191,6 +186,10 @@ export default function ServiceSettings({ sections, scope, setToasts, readOnly, 
   readOnly?: boolean;
   /** What this level is, shown above the fields. */
   note?: ReactNode;
+  /** One model's own settings, not the defaults for every model. */
+  model?: { id: string; name: string };
+  /** Inside a dialog: no page frame. */
+  bare?: boolean;
 }) {
   const draft = useSettingsDraft(scope, (message) => pushToast(setToasts, 'error', message));
   const { s, set } = draft;
@@ -200,8 +199,9 @@ export default function ServiceSettings({ sections, scope, setToasts, readOnly, 
   const [calibrationStatus, setCalibrationStatus] = useState<CalibrationStatus | null>(null);
   const [policy, setPolicy] = useState<RuntimePolicy | null>(null);
   const [policyError, setPolicyError] = useState('');
-  const withModels = sections.includes('models');
-  const defaultModelId: string = s?.general?.default_model ?? '';
+  const withModels = sections.includes('model') || sections.includes('startup');
+  // Calibration and the runtime plan describe one model: this one, or the one loaded at startup.
+  const defaultModelId: string = model?.id ?? s?.general?.default_model ?? '';
 
   const refreshModels = async (rescan = false) => {
     setModelListState('loading');
@@ -228,38 +228,45 @@ export default function ServiceSettings({ sections, scope, setToasts, readOnly, 
     return () => { current = false; };
   }, [withModels, defaultModelId]);
 
-  if (!s) return <div className="page"><div className="page-inner"><div className="panel empty-state" role="status">{draft.error ? <><Icon name="alertCircle" size={26} /><strong>Settings unavailable</strong><p>{draft.error}</p></> : <><Lamp state="caution" pulse /><p>Loading settings…</p></>}</div></div></div>;
+  const frame = (content: ReactNode) => bare ? <div className="settings-page">{content}</div> : <div className="page"><div className="page-inner"><div className="settings-page">{content}</div></div></div>;
+  if (!s) return frame(<div className="panel empty-state" role="status">{draft.error ? <><Icon name="alertCircle" size={26} /><strong>Settings unavailable</strong><p>{draft.error}</p></> : <><Lamp state="caution" pulse /><p>Loading settings…</p></>}</div>);
 
   const conflict = withModels ? cacheConflict(s, performanceMode(s)) : null;
   const save = async () => {
     if (conflict) return;
     const next = await draft.save();
     if (!next) return;
-    if (withModels) void refreshPolicy(next.general?.default_model);
-    pushToast(setToasts, 'success', 'Saved. People get the new values with their next request; model server changes apply on the next model load.');
+    if (withModels) void refreshPolicy(model?.id ?? next.general?.default_model);
+    pushToast(setToasts, 'success', model ? `Saved. ${model.name} uses them from its next load.` : 'Saved. People get the new values with their next request; model changes apply on the next model load.');
   };
   const modes = Object.keys(PERMISSION_MODE_LABELS) as (keyof typeof PERMISSION_MODE_LABELS)[];
 
-  return <FieldsContext.Provider value={draft.fields}><div className="page">
-    <div className="page-inner">
-      <div className="settings-page">
+  return <FieldsContext.Provider value={draft.fields}>{frame(<>
         {note && <p className="settings-capability-note">{note}</p>}
         <fieldset className="settings-readonly" disabled={readOnly}>
-          {withModels && (
-            <section className="settings-section settings-performance" data-settings-title="Model server">
-              <h2><Icon name="layers" size={16} />Model server</h2><p className="settings-section-intro">The model everyone uses, how big its context is, how it samples words, and how the hardware runs it.</p>
+          {sections.includes('startup') && (
+            <section className="settings-section" data-settings-title="Model loaded at startup">
+              <h2><Icon name="power" size={16} />Model loaded at startup</h2><p className="settings-section-intro">The model the server loads when it starts, for everyone. People choose among the models running.</p>
               <div className="settings-fields">
                 <SettingField label="Model loaded at startup" path="general.default_model" description={<><span>Loaded when the server starts. A model already running keeps running until it is switched on the Models page.</span><span className="settings-model-status" role={modelListState === 'error' ? 'alert' : 'status'}>{modelListState === 'loading' ? 'Looking for models…' : modelListState === 'error' ? `Could not refresh models. ${modelListNotice}` : modelListNotice || (models.length === 0 ? 'No models found. Add one on the Models page, then refresh.' : s.general?.default_model && !models.some((model) => model.id === s.general.default_model) ? 'The saved model is not installed any more. Choose another.' : '')}</span></>}>
                   <select value={s.general?.default_model ?? ''} disabled={modelListState === 'loading' && models.length === 0} onChange={(event) => set(['general', 'default_model'], event.target.value)}>{defaultModelOptions(models, s.general?.default_model ?? '', modelListState).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
                   <button className="btn secondary" type="button" disabled={modelListState === 'loading'} onClick={() => void refreshModels(true)} aria-label={modelListState === 'error' ? 'Retry model discovery' : 'Refresh detected models'}>{modelListState === 'loading' ? 'Refreshing…' : modelListState === 'error' ? 'Retry' : 'Refresh'}</button>
                 </SettingField>
+              </div>
+            </section>
+          )}
+          {sections.includes('model') && (
+            <section className="settings-section settings-performance" data-settings-title={model ? model.name : 'Defaults for every model'}>
+              <h2><Icon name="layers" size={16} />{model ? model.name : 'Defaults for every model'}</h2>
+              <p className="settings-section-intro">{model ? 'This model\u2019s context, sampling, performance and hardware. Each field starts from the defaults for every model (Model server); what you change here applies to this model only, from its next load.' : 'What every model starts with: context, sampling, performance and hardware. A model\u2019s own Settings (on the Models page) can change any of them for that model.'}</p>
+              <div className="settings-fields">
                 <SettingField label="Context size" path="inference.context_size" description={<><span>The window to ask for. Applies on the next model load; the next setting decides what happens when it does not fit memory.</span>{contextSupportWarning(Number(s.inference?.context_size), models, s.general?.default_model) && <span className="settings-context-warning" role="status">{contextSupportWarning(Number(s.inference?.context_size), models, s.general?.default_model)}</span>}</>}><Num obj={s.inference} k="context_size" set={(value) => set(['inference', 'context_size'], value)} /></SettingField>
                 <SettingField label="When the context size does not fit" path="runtime.context_fit" description="Fit it to memory keeps the whole model on the GPU by loading a smaller window, which is faster. Use the size as written keeps the window and lets part of the model run on the CPU, which is slower."><select value={s.runtime?.context_fit === 'requested' ? 'requested' : 'fit'} onChange={(event) => set(['runtime', 'context_fit'], event.target.value)}><option value="fit">Fit it to memory (faster)</option><option value="requested">Use the size as written (slower)</option></select></SettingField>
                 <SettingField label="Temperature" path="inference.temperature"><Num obj={s.inference} k="temperature" set={(value) => set(['inference', 'temperature'], value)} /></SettingField>
                 <SettingField label="Top-p" path="inference.top_p"><Num obj={s.inference} k="top_p" set={(value) => set(['inference', 'top_p'], value)} /></SettingField>
                 <SettingField label="Top-k" path="inference.top_k"><Num obj={s.inference} k="top_k" set={(value) => set(['inference', 'top_k'], value)} /></SettingField>
                 <SettingField label="Repeat penalty" path="inference.repeat_penalty"><Num obj={s.inference} k="repeat_penalty" set={(value) => set(['inference', 'repeat_penalty'], value)} /></SettingField>
-                <SettingField label="Performance mode" path="runtime.mode" description={<PerformanceModeNote settings={s} status={calibrationStatus} />}>
+                <SettingField label="Performance mode" path="runtime.mode" description={<PerformanceModeNote settings={s} status={calibrationStatus} forModel={!!model} />}>
                   <div className="settings-mode-options" role="radiogroup" aria-label="Performance mode">
                     {MODES.map((option) => (
                       <label key={option.value} className={`settings-mode-option${performanceMode(s) === option.value ? ' selected' : ''}`}>
@@ -274,7 +281,7 @@ export default function ServiceSettings({ sections, scope, setToasts, readOnly, 
                 <SettingField label="KV cache precision" path="runtime.kv_cache" description={<><span>f16 is the compatibility default. q8_0 halves cache memory, which allows a larger context on the same GPU; it measured no slower with Flash Attention on. Applies on the next model load.</span>{quantizedCacheUnavailable(s, performanceMode(s)) && <span className="settings-context-warning" role={cacheConflict(s, performanceMode(s)) ? 'alert' : 'status'}>{cacheConflict(s, performanceMode(s)) ?? QUANTIZED_CACHE_UNAVAILABLE_NOTE}</span>}</>}><select value={s.runtime?.kv_cache ?? 'f16'} onChange={(event) => set(['runtime', 'kv_cache'], event.target.value)}><option value="f16">f16 (default)</option><option value="q8_0" disabled={quantizedCacheUnavailable(s, performanceMode(s))}>q8_0 (half the cache memory{quantizedCacheUnavailable(s, performanceMode(s)) ? '; needs Flash Attention' : ''})</option></select></SettingField>
               </div>
               <HardwareOverrides settings={s} set={set} />
-              {policyError && <p className="settings-policy-error" role="alert">Could not read the runtime configuration. <button className="btn secondary sm" type="button" onClick={() => void refreshPolicy(s.general?.default_model)}>Retry</button></p>}
+              {policyError && <p className="settings-policy-error" role="alert">Could not read the runtime configuration. <button className="btn secondary sm" type="button" onClick={() => void refreshPolicy(defaultModelId)}>Retry</button></p>}
               {policy && !policyError && <RuntimeSummary policy={policy} dirty={draft.dirty} />}
             </section>
           )}
@@ -318,7 +325,5 @@ export default function ServiceSettings({ sections, scope, setToasts, readOnly, 
           )}
         </fieldset>
         {draft.dirty && !readOnly && <SaveBar saving={draft.saving} blocked={conflict ? 'Cannot save: an 8-bit KV cache needs Flash Attention' : null} onSave={() => void save()} onDiscard={draft.discard} />}
-      </div>
-    </div>
-  </div></FieldsContext.Provider>;
+  </>)}</FieldsContext.Provider>;
 }

@@ -7,9 +7,9 @@ import Toasts, { pushToast, type Toast } from '../components/Toasts';
 import Rig from './Rig';
 import ModelsPage from './ModelsPage';
 import RuntimePage from './RuntimePage';
-import ResourcesPanel from './ResourcesPanel';
+import ServersPage from './ServersPage';
 import PeoplePage from './PeoplePage';
-import { PeopleDefaultsPage, ServiceSettingsPage } from './SettingsPages';
+import { ModelSettingsDialog, PeopleDefaultsPage, ServiceSettingsPage } from './SettingsPages';
 import AuditPage from './AuditPage';
 import {
   agentRuns, deleteModel, inferenceStart, inferenceStatus, listDownloads, listModels, loadModel, stopAgent, systemInfo, unloadModels,
@@ -35,7 +35,7 @@ const DESCRIPTIONS: Record<DashboardPage, string> = {
   audit: 'Who did what, from where, with which model, and how it was allowed',
   models: 'Load, inspect and add the models everyone uses',
   system: 'The model server, health checks and speed',
-  resources: 'Live processor, memory and graphics readings for the server',
+  servers: 'The servers that host models: pick one to see what it is using',
 };
 
 export default function AdminApp({ me }: { me?: Me }) {
@@ -57,6 +57,8 @@ export default function AdminApp({ me }: { me?: Me }) {
   const [guard, setGuard] = useState<{ kind: 'load' | 'start'; id: string; detail: string } | null>(null);
   const [confirm, setConfirm] = useState<Confirm | null>(null);
   const [mobileNav, setMobileNav] = useState(false);
+  // The model whose own settings are open, from the Models page.
+  const [modelSettingsFor, setModelSettingsFor] = useState<ModelMeta | null>(null);
 
   useEffect(() => {
     const onHash = () => setPage(pageFromHash(window.location.hash, admin));
@@ -284,7 +286,7 @@ export default function AdminApp({ me }: { me?: Me }) {
             onUnload={requestEject}
             onReload={requestReload}
             onOpenModels={() => go('models')}
-            onOpenResources={() => go('resources')}
+            onOpenResources={() => go('servers')}
             notify={(kind, text) => notify(kind, text)}
           />
         )}
@@ -303,10 +305,10 @@ export default function AdminApp({ me }: { me?: Me }) {
         </header>
         {page === 'people' && <PeoplePage canChange={admin} me={me} notify={notify} />}
         {page === 'defaults' && <PeopleDefaultsPage canChange={admin} signIn={!!me?.sign_in} setToasts={setToasts} notify={notify} />}
-        {page === 'rules' && <ServiceSettingsPage key="rules" section="rules" canChange={admin} signIn={!!me?.sign_in} setToasts={setToasts} notify={notify} />}
-        {page === 'model-server' && admin && <ServiceSettingsPage key="models" section="models" canChange={admin} signIn={!!me?.sign_in} setToasts={setToasts} notify={notify} />}
-        {page === 'search' && <ServiceSettingsPage key="search" section="search" canChange={admin} signIn={!!me?.sign_in} setToasts={setToasts} notify={notify} />}
-        {page === 'privacy' && <ServiceSettingsPage key="privacy" section="privacy" canChange={admin} signIn={!!me?.sign_in} setToasts={setToasts} notify={notify} />}
+        {page === 'rules' && <ServiceSettingsPage key="rules" sections={['rules']} canChange={admin} signIn={!!me?.sign_in} setToasts={setToasts} notify={notify} />}
+        {page === 'model-server' && admin && <ServiceSettingsPage key="models" sections={['startup', 'model']} canChange={admin} signIn={!!me?.sign_in} setToasts={setToasts} notify={notify} />}
+        {page === 'search' && <ServiceSettingsPage key="search" sections={['search']} canChange={admin} signIn={!!me?.sign_in} setToasts={setToasts} notify={notify} />}
+        {page === 'privacy' && <ServiceSettingsPage key="privacy" sections={['privacy']} canChange={admin} signIn={!!me?.sign_in} setToasts={setToasts} notify={notify} />}
         {page === 'audit' && <AuditPage notify={notify} />}
         {page === 'models' && admin && (
           <ModelsPage
@@ -316,6 +318,7 @@ export default function AdminApp({ me }: { me?: Me }) {
             notify={notify}
             onLoad={requestLoad}
             onDelete={confirmDelete}
+            onSettings={setModelSettingsFor}
             refreshModels={refreshModels}
             refreshDownloads={refreshDownloads}
           />
@@ -333,7 +336,7 @@ export default function AdminApp({ me }: { me?: Me }) {
             setSys={setSys}
           />
         )}
-        {page === 'resources' && admin && <ResourcesPanel notify={notify} />}
+        {page === 'servers' && admin && <ServersPage notify={notify} />}
       </div>
 
       {guard && (
@@ -350,6 +353,7 @@ export default function AdminApp({ me }: { me?: Me }) {
           </>}
         />
       )}
+      {modelSettingsFor && <ModelSettingsDialog model={modelSettingsFor} onClose={() => setModelSettingsFor(null)} setToasts={setToasts} />}
       {confirm && (
         <Dialog
           size="sm"

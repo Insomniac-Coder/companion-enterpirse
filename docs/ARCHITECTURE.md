@@ -584,6 +584,12 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   screens, so a field cannot appear on the wrong side. `PUT /api/settings` saves only the caller's own
   unlocked personal choices, platform admins included; company values change only through
   `PUT /api/admin/settings/company` (on a laptop, one person, everything is the company's).
+- Each model's own settings (`model_settings`, migration 0007): `settings_levels::settings_for_model`
+  lays a model's own context, sampling, performance and hardware (`model_field`: `inference.*`,
+  `runtime.*`, `runtime_auto`, `hardware.*`) over the company's settings; loading (`start_sidecar`),
+  the fit search, the runtime plan and calibration use it. Sampling is fixed into the running model's
+  config at load. People see only hosted models (`GET /api/models/available`); the library is the
+  admins'. `GET /api/admin/servers` lists the servers hosting models (one: this one).
 - Two apps, one set of parts (task 9): `frontend/index.html` is Companion (`src/App.tsx`, the
   person's own work) and `frontend/admin/index.html` the dashboard (`src/admin/`: people, company and
   group settings, audit records, and the models, runtime and resources screens that left the user

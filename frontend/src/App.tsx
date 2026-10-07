@@ -36,7 +36,7 @@ import {
   agentRuns, saveLogsArchive, compactConversation, createConversation, deleteConversation, deleteWorkspace, discardStale, editMessage, forkConversation,
   getContext, getConversationMetrics, getMessages, getRecovery, getPermissionMode, getSettings,
   inferenceStatus, listCommands, listConversations,
-  listModels, listSessions, listTools, listWorkspaces, patchSession, stopAgent,
+  listAvailableModels, listSessions, listTools, listWorkspaces, patchSession, stopAgent,
   patchConversation, shareConversation,
   setPermissionMode as updatePermissionMode, startAgent, stopChat, streamChat,
   uploadAttachment, modelDetail,
@@ -127,6 +127,7 @@ export default function App({ me }: { me?: Me }) {
   const [removeProjectTasks, setRemoveProjectTasks] = useState(true);
   const [removingProject, setRemovingProject] = useState(false);
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [showShare, setShowShare] = useState(false);
   const [focusRun, setFocusRun] = useState<string | null>(null);
   const [confirmState, setConfirmState] = useState<{ title: string; body: string; action: string; icon?: IconName; onConfirm: () => void } | null>(null);
@@ -262,7 +263,8 @@ export default function App({ me }: { me?: Me }) {
 
   async function refreshModels() {
     try {
-      const [next, initialSettings] = await Promise.all([listModels(), modelDefaultsRead.current ? Promise.resolve(null) : getSettings().catch(() => null)]);
+      // Only the models the admins host: the server says which are available.
+      const [next, initialSettings] = await Promise.all([listAvailableModels(), modelDefaultsRead.current ? Promise.resolve(null) : getSettings().catch(() => null)]);
       if (initialSettings) { preferredDefaultModel.current = initialSettings.general?.default_model ?? ''; modelDefaultsRead.current = true; }
       setModels(same(next));
       // A model can disappear between launches (for example, after its
@@ -1779,11 +1781,24 @@ export default function App({ me }: { me?: Me }) {
                       </Toggle>
                     </div>
                     <div className="composer-end">
-                      {/* Status only. Loading or switching models never happens from the composer. */}
+                      {/* The models the admins host, and which one answers here. Loading is the dashboard's. */}
                       {loadedMeta && (
-                        <span className="model-chip" title={`${loadedMeta.name} answers here. ${boundary}.`}>
-                          <span className="model-chip-name">{loadedMeta.name}</span>
-                          <em>· {boundary === 'On this PC' ? 'this PC' : 'inside'}</em>
+                        <span className="pop-anchor">
+                          <button type="button" className="model-chip" aria-haspopup="menu" aria-expanded={modelMenuOpen} title={`${loadedMeta.name} answers here. ${boundary}.`} onClick={() => setModelMenuOpen((open) => !open)}>
+                            <span className="model-chip-name">{loadedMeta.name}</span>
+                            <em>· {boundary === 'On this PC' ? 'this PC' : 'inside'}</em>
+                            <Icon name="chevronsUpDown" size={13} />
+                          </button>
+                          <Popover open={modelMenuOpen} onClose={() => setModelMenuOpen(false)} label="Models" side="top" align="end">
+                            <PopLabel>Models available</PopLabel>
+                            {models.map((model) => (
+                              <PopItem key={model.id} checked={model.id === modelId} hint={model.context_length ? `${Math.round(model.context_length / 1024)}K` : undefined} onClick={() => { setModelId(model.id); setModelMenuOpen(false); }}>
+                                {model.name}
+                              </PopItem>
+                            ))}
+                            <PopDivider />
+                            <PopLabel>{admin ? 'Models are hosted from the dashboard.' : 'Your admin chooses which models run.'}</PopLabel>
+                          </Popover>
                         </span>
                       )}
                       {!loadedMeta && backendUp !== false && !busy && !agentBusy && (

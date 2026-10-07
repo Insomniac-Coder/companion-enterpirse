@@ -422,3 +422,21 @@
 .admin-group-bar select { height: 30px; padding: 0 8px; border-radius: 7px; border: 1px solid var(--line-2); background: var(--raised); color: var(--text); font: inherit; font-size: 13px; }
 .dashboard-nav .sb-section { padding: 14px 10px 4px; }
 .dashboard-nav .sb-section:first-child { padding-top: 4px; }
+
+/* ---- Dashboard: servers, and a model's own settings ---- */
+.server-list-page { flex: none; }
+.server-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
+.server-card { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 12px 14px; border-radius: 10px; background: var(--raised); box-shadow: inset 0 0 0 1px var(--line); color: var(--text-2); text-align: left; font-size: 12.5px; }
+.server-card:hover { box-shadow: inset 0 0 0 1px var(--line-2); }
+.server-card[aria-current='true'] { box-shadow: inset 0 0 0 1px var(--tally-line); background-image: linear-gradient(var(--tally-wash), var(--tally-wash)); }
+.server-card-head { display: flex; align-items: center; gap: 8px; width: 100%; }
+.server-card-head strong { color: var(--text); font-size: 13.5px; font-weight: 500; }
+.server-state { margin-left: auto; font: 11px var(--font-mono); letter-spacing: 0.03em; text-transform: uppercase; color: var(--text-3); }
+.server-models { color: var(--text); }
+.server-spec { color: var(--text-3); font: 11.5px/1.5 var(--font-mono); }
+.model-settings-dialog .dialog-body { padding: 0; }
+.model-settings-body { max-height: min(640px, 72dvh); overflow-y: auto; padding: 16px 22px 20px; border-top: 1px solid var(--line); }
+.model-settings-body .settings-section { padding: 0; border: 0; background: none; box-shadow: none; }
+.model-settings-body .save-bar { bottom: 0; }
+button.model-chip { cursor: pointer; }
+button.model-chip:hover { box-shadow: inset 0 0 0 1px var(--line-3); color: var(--text); }

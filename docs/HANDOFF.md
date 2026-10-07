@@ -43,7 +43,10 @@ fork to drop the model weights (Git LFS); commit ids differ from the Companion's
   `audit::Who`. Task 9 part 1 (2026-10-07): the dashboard (`frontend/admin/index.html`, `src/admin/`)
   with people, company/group settings with locks, audit records, and the moved models, runtime and
   resources screens (tools and plugins went back to Companion: people's own); every request through `services/server.ts`. Part 2: the Graphite look
-  (tokens in `workbench.css`, built list in `docs/enterprise/ui/README.md`). Next: task 10 (checks
+  (tokens in `workbench.css`, built list in `docs/enterprise/ui/README.md`). After the owner's review:
+  bubbles; Settings is a dialog in Companion with personal fields only, the dashboard has the rest
+  plus People's defaults with locks; each model has its own settings (`settings_for_model`); Servers;
+  people pick among hosted models. Next: task 10 (checks
   that people stay apart, every route).
 - Everything below this section is the Companion's own handoff, kept as it was at the fork.
 

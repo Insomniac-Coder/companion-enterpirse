@@ -80,6 +80,25 @@ export const saveGroupSettings = (group: string, settings: Record<string, unknow
 export const lockSetting = (path: string, groupId: string | null, reason: string) => call('/api/admin/settings/locks', send('PUT', { path, group_id: groupId, reason }));
 export const unlockSetting = (path: string, groupId: string | null) => call('/api/admin/settings/locks', send('DELETE', { path, group_id: groupId }));
 
+/** A model's own settings (only what differs from the company's), and what loading it uses. */
+export const modelSettings = (id: string) => call<{ model_id: string; settings: any; effective: any }>(`/api/admin/models/${encodeURIComponent(id)}/settings`);
+export const saveModelSettings = (id: string, settings: Record<string, unknown>) => call(`/api/admin/models/${encodeURIComponent(id)}/settings`, send('PUT', { settings }));
+
+export interface Server {
+  id: string;
+  name: string;
+  os: string;
+  cpu: string;
+  ram_gb: number;
+  gpus: { model: string; vram_gb: number }[];
+  /** The models it hosts now. */
+  models: { id: string; name: string }[];
+  state: 'serving' | 'idle';
+}
+
+/** The servers that host models (one today). */
+export const listServers = () => call<{ servers: Server[] }>('/api/admin/servers');
+
 export interface AuditRecord {
   seq: number;
   at: string;
@@ -184,9 +203,9 @@ export const DASHBOARD_PAGES = [
   { id: 'defaults', label: 'People’s defaults', icon: 'sliders', auditor: true, group: 'People' },
   { id: 'rules', label: 'Rules', icon: 'shield', auditor: true, group: 'People' },
   { id: 'models', label: 'Models', icon: 'layers', auditor: false, group: 'Models' },
-  { id: 'model-server', label: 'Model server', icon: 'cpu', auditor: false, group: 'Models' },
+  { id: 'model-server', label: 'Model server', icon: 'sliders', auditor: false, group: 'Models' },
   { id: 'system', label: 'Runtime and diagnostics', icon: 'gauge', auditor: false, group: 'Models' },
-  { id: 'resources', label: 'Resources', icon: 'activity', auditor: false, group: 'Models' },
+  { id: 'servers', label: 'Servers', icon: 'cpu', auditor: false, group: 'Models' },
   { id: 'search', label: 'Web search', icon: 'globe', auditor: true, group: 'Service' },
   { id: 'privacy', label: 'Privacy and logging', icon: 'lock', auditor: true, group: 'Service' },
   { id: 'audit', label: 'Audit records', icon: 'list', auditor: true, group: 'Service' },

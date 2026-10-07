@@ -327,6 +327,83 @@ pub async fn fields(State(state): State<AppState>, Extension(caller): Extension<
     Ok(Json(fields))
 }
 
+// --- Each model's own settings (per the owner): context, sampling, performance, hardware. ---
+
+/// Whether a model has its own value for `path`: its context, sampling, performance and hardware.
+pub fn model_field(path: &str) -> bool {
+    ["inference.", "runtime.", "hardware."].iter().any(|prefix| path.starts_with(prefix)) || path == "runtime_auto"
+}
+
+async fn model_values(pool: &sqlx::PgPool, model: &str) -> Result<Value, sqlx::Error> {
+    let found: Option<Value> = sqlx::query_scalar("SELECT settings FROM model_settings WHERE model_id = $1").bind(model).fetch_optional(pool).await?;
+    Ok(found.unwrap_or_else(|| serde_json::json!({})))
+}
+
+/// The company's settings with `model`'s own values laid over them: what loading it uses.
+pub async fn settings_for_model(state: &AppState, model: Option<&str>) -> AppSettings {
+    let company = state.settings.read().await.clone();
+    let Some(model) = model else {
+        return company;
+    };
+    match model_values(state.storage.pool(), model).await {
+        Ok(values) => {
+            let own: Vec<(String, Value)> = leaves(&values).into_iter().filter(|(path, _)| model_field(path)).collect();
+            apply(&company, &own).unwrap_or(company)
+        }
+        Err(error) => {
+            tracing::warn!(%model, "cannot read the model's settings, using the company's: {error}");
+            company
+        }
+    }
+}
+
+/// GET /api/admin/models/<id>/settings: the model's own values, and what loading it would use.
+pub async fn get_model_settings(State(state): State<AppState>, Path(model): Path<String>) -> Result<Json<Value>, ApiError> {
+    let own = model_values(state.storage.pool(), &model).await.map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
+    let effective = crate::api::without_secrets(settings_for_model(&state, Some(&model)).await);
+    Ok(Json(serde_json::json!({ "model_id": model, "settings": own, "effective": effective })))
+}
+
+#[derive(Deserialize)]
+pub struct ModelValues {
+    /// Only the fields that differ from the company's, nested as in the settings.
+    settings: Value,
+}
+
+/// PUT /api/admin/models/<id>/settings: replace the model's own values.
+pub async fn put_model_settings(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(model): Path<String>,
+    Json(request): Json<ModelValues>,
+) -> Result<Json<Value>, ApiError> {
+    if state.models.read().await.get(&model).is_none() {
+        return Err(ApiError::not_found(format!("unknown model '{model}'")));
+    }
+    let values = leaves(&request.settings);
+    let other: Vec<&str> = values.iter().filter(|(path, _)| !model_field(path)).map(|(path, _)| path.as_str()).collect();
+    if !request.settings.is_object() || !other.is_empty() {
+        return Err(ApiError::bad(
+            format!("a model cannot set these: {}", other.join(", ")),
+            "A model has its own context, sampling, performance and hardware; the rest is the company's.",
+        ));
+    }
+    // The values must make sense on top of the company's.
+    crate::api::check_settings(&apply(&state.settings.read().await.clone(), &values)?)?;
+    sqlx::query(
+        "INSERT INTO model_settings (model_id, settings, updated_by) VALUES ($1, $2, $3)
+         ON CONFLICT (model_id) DO UPDATE SET settings = EXCLUDED.settings, updated_by = EXCLUDED.updated_by, updated_at = now()",
+    )
+    .bind(&model)
+    .bind(&request.settings)
+    .bind(&caller.id)
+    .execute(state.storage.pool())
+    .await
+    .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
+    tracing::info!(by = %caller.id, %model, "model settings set");
+    Ok(Json(serde_json::json!({ "model_id": model, "settings": request.settings })))
+}
+
 // --- The admin's side: group values and locks. ---
 
 /// May `caller` set values or locks for `group` (None: the company)?
@@ -609,6 +686,53 @@ mod tests {
 
     use axum::http::StatusCode;
     use tower::ServiceExt as _;
+
+    #[tokio::test]
+    async fn a_model_has_its_own_context_sampling_and_hardware() {
+        let (app, state) = server();
+        let (_, boss) = person(&state, "boss", &[PLATFORM_ADMIN]).await;
+        let (_, ada) = person(&state, "ada", &[]).await;
+        let dir = std::env::temp_dir().join(format!("companion-model-settings-{}", uuid::Uuid::new_v4().simple()));
+        for id in ["tiny", "other"] {
+            let folder = dir.join(id);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("model.gguf"), crate::models::test_gguf_bytes()).unwrap();
+            std::fs::write(folder.join("metadata.json"), format!(r#"{{"id":"{id}","name":"{id}","architecture":"llama","quantization":"Q4_K_M","parameters":"1B","context_length":4096,"vision":false,"tool_calling":false}}"#)).unwrap();
+        }
+        {
+            let (found, _) = crate::models::scan_models_dir(&dir);
+            let mut registry = state.models.write().await;
+            for model in found {
+                registry.register(model).unwrap();
+            }
+        }
+        let put = |who: &str, model: &str, body: Value| call("PUT", &format!("/api/admin/models/{model}/settings"), who, Some(json!({ "settings": body })));
+        assert_eq!(status(&app, put(&boss, "tiny", json!({ "inference": { "temperature": 0.2, "context_size": 8192 } }))).await, StatusCode::OK);
+        let tiny = settings_for_model(&state, Some("tiny")).await;
+        assert_eq!((tiny.inference.temperature, tiny.inference.context_size), (0.2, 8192));
+        let company = state.settings.read().await.clone();
+        assert_eq!(settings_for_model(&state, Some("other")).await.inference.temperature, company.inference.temperature, "another model keeps the company's");
+        let shown = json(&app, call("GET", "/api/admin/models/tiny/settings", &boss, None)).await["effective"]["inference"]["temperature"].as_f64().unwrap();
+        assert!((shown - 0.2).abs() < 1e-6, "{shown}");
+        // Only a model's own kind of field, for a known model, checked like the company's, by an admin.
+        assert_eq!(status(&app, put(&boss, "tiny", json!({ "search": { "provider": "brave" } }))).await, StatusCode::BAD_REQUEST);
+        assert_eq!(status(&app, put(&boss, "tiny", json!({ "inference": { "temperature": 9.0 } }))).await, StatusCode::BAD_REQUEST);
+        assert_eq!(status(&app, put(&boss, "nope", json!({}))).await, StatusCode::NOT_FOUND);
+        assert_eq!(status(&app, put(&ada, "tiny", json!({}))).await, StatusCode::FORBIDDEN);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_person_sees_only_the_models_the_admins_host() {
+        let (app, state) = server();
+        let (_, ada) = person(&state, "ada", &[]).await;
+        let (_, boss) = person(&state, "boss", &[PLATFORM_ADMIN]).await;
+        assert_eq!(json(&app, call("GET", "/api/models/available", &ada, None)).await, json!([]), "nothing is running");
+        assert_eq!(status(&app, call("GET", "/api/models", &ada, None)).await, StatusCode::FORBIDDEN, "the library is the admins'");
+        let servers = json(&app, call("GET", "/api/admin/servers", &boss, None)).await;
+        assert_eq!(servers["servers"].as_array().map(Vec::len), Some(1), "{servers}");
+        assert_eq!(servers["servers"][0]["state"], "idle");
+    }
 
     #[tokio::test]
     async fn team_admins_set_their_groups_values_and_locks_only() {

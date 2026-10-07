@@ -16,6 +16,7 @@ export default function ModelsPage({
   notify,
   onLoad,
   onDelete,
+  onSettings,
   refreshModels,
   refreshDownloads,
 }: {
@@ -25,6 +26,8 @@ export default function ModelsPage({
   notify: Notify;
   onLoad: (id: string) => void;
   onDelete: (model: ModelMeta) => void;
+  /** The model's own settings. */
+  onSettings: (model: ModelMeta) => void;
   refreshModels: () => unknown;
   refreshDownloads: () => unknown;
 }) {
@@ -115,6 +118,7 @@ export default function ModelsPage({
                 onToolingChecked={() => void refreshModels()}
                 onLoad={() => onLoad(m.id)}
                 onDelete={() => onDelete(m)}
+                onSettings={() => onSettings(m)}
               />
             ))}
           </div>

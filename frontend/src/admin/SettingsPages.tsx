@@ -4,11 +4,12 @@
 // beside each field. People's own choices are never edited here.
 import { useEffect, useState } from 'react';
 import ServiceSettings, { LockContext, FieldsContext, SaveBar, useSettingsDraft, type ServiceSection, type SettingsScope } from '../components/SettingsPanel';
+import { Dialog } from '../ui/primitives';
 import { PERSONAL_SECTIONS, PersonalSection } from '../components/PersonalSettings';
-import { changedSettings, withValues } from '../components/settingsForm';
+import { changedSettings, modelOwnValues, withValues } from '../components/settingsForm';
 import { pushToast, type Toast } from '../components/Toasts';
 import {
-  groupFields, listGroups, lockSetting, saveCompanySettings, saveGroupSettings, settingsOverview, unlockSetting,
+  groupFields, listGroups, lockSetting, modelSettings, saveCompanySettings, saveGroupSettings, saveModelSettings, settingsOverview, unlockSetting,
   type Group, type SettingsLock, type SettingsOverview,
 } from '../services/admin';
 import { getSettingFields } from '../services/settingsFields';
@@ -35,6 +36,31 @@ function groupScope(id: string): SettingsScope {
       return withValues(company, own);
     },
   };
+}
+
+/** One model's own settings: the company's defaults with its own values; saving keeps only what
+ *  differs, and only the fields a model has (context, sampling, performance, hardware). */
+function modelScope(id: string): SettingsScope {
+  return {
+    load: () => modelSettings(id).then((found) => found.effective),
+    save: async (_changed, all) => {
+      const company = (await settingsOverview()).company;
+      const own = modelOwnValues(changedSettings(company, all));
+      await saveModelSettings(id, own);
+      return withValues(company, own);
+    },
+  };
+}
+
+/** A model's Settings, from the Models page. */
+export function ModelSettingsDialog({ model, onClose, setToasts }: { model: { id: string; name: string }; onClose: () => void; setToasts: React.Dispatch<React.SetStateAction<Toast[]>> }) {
+  return (
+    <Dialog size="xl" className="settings-dialog model-settings-dialog" icon="sliders" title={`Settings for ${model.name}`} description="Used from this model's next load." onClose={onClose}>
+      <div className="model-settings-body">
+        <ServiceSettings key={model.id} sections={['model']} scope={modelScope(model.id)} setToasts={setToasts} model={model} bare />
+      </div>
+    </Dialog>
+  );
 }
 
 /** The lock beside a field: locked (with its reason; click to unlock), or a lock to set with a reason. */
@@ -109,31 +135,27 @@ function useOverview(notify: Notify) {
   return { overview, groups, refresh };
 }
 
-/** What a page adds to its section's own introduction. */
-const NOTES: Partial<Record<ServiceSection, string>> = {
-  models: 'Company-wide until each model gets its own settings on the Models page.',
-};
 
 /** One service page. Rules can differ per group and be locked for the company; the rest are the
  *  company's alone. */
 /** `signIn`: a company server; a laptop install has one person, so there is nobody for a lock to bind. */
-export function ServiceSettingsPage({ section, canChange, signIn, setToasts, notify }: { section: ServiceSection; canChange: boolean; signIn: boolean; setToasts: React.Dispatch<React.SetStateAction<Toast[]>>; notify: Notify }) {
+export function ServiceSettingsPage({ sections, canChange, signIn, setToasts, notify }: { sections: ServiceSection[]; canChange: boolean; signIn: boolean; setToasts: React.Dispatch<React.SetStateAction<Toast[]>>; notify: Notify }) {
   const { overview, groups, refresh } = useOverview(notify);
   const [group, setGroup] = useState<string | null>(null);
   if (!overview) return <div className="page"><div className="page-inner"><p className="settings-capability-note"><Lamp state="caution" pulse /> Loading settings…</p></div></div>;
-  const perGroup = section === 'rules';
+  const perGroup = sections.includes('rules');
   const lock = perGroup && canChange && signIn && !group ? (path: string) => <LockControl path={path} groupId={null} locks={overview.locks} onChange={() => void refresh()} notify={notify} /> : null;
   return (
     <>
       {perGroup && groups.length > 0 && <ScopePicker groups={groups} value={group} onChange={setGroup} overview={overview} canChange={canChange} notify={notify} onSaved={() => void refresh()} />}
       <LockContext.Provider value={lock}>
         <ServiceSettings
-          key={`${section}-${group ?? 'company'}`}
-          sections={[section]}
+          key={`${sections.join('-')}-${group ?? 'company'}`}
+          sections={sections}
           scope={group ? groupScope(group) : companyScope()}
           setToasts={setToasts}
           readOnly={!canChange}
-          note={[NOTES[section], canChange ? '' : 'Read only: an auditor sees these but does not change them.', lock ? 'A lock beside a field keeps groups from setting their own value.' : ''].filter(Boolean).join(' ') || undefined}
+          note={[canChange ? '' : 'Read only: an auditor sees these but does not change them.', lock ? 'A lock beside a field keeps groups from setting their own value.' : ''].filter(Boolean).join(' ') || undefined}
         />
       </LockContext.Provider>
     </>

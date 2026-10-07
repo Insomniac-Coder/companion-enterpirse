@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { updateSetting, settingsSearchMatches, expertSectionOpen, changedSettings, withValues } from '../src/components/settingsForm.ts';
+import { updateSetting, settingsSearchMatches, expertSectionOpen, changedSettings, withValues, modelOwnValues } from '../src/components/settingsForm.ts';
 
 test('simplified settings preserve inactive preferences and unrelated manual overrides', () => {
   const source = { advanced: { kv_cache_type: 'Q8_0' }, privacy: { telemetry: false }, hardware: { cpu_threads: 6 }, runtime_auto: false };
@@ -31,4 +31,10 @@ test("a level saves only what differs, and lays its values over the company's", 
   assert.deepEqual(withValues(company, group).appearance, { theme: 'light', density: 'comfortable' });
   assert.equal(company.appearance.theme, 'dark', "the company's values are not changed");
   assert.deepEqual(changedSettings(company, withValues(company, group)), group, "a group's own values come back out");
+});
+
+test('a model keeps only its own kind of value: context, sampling, performance, hardware', () => {
+  const changed = { inference: { temperature: 0.2 }, runtime: { kv_cache: 'q8_0' }, hardware: {}, runtime_auto: false, search: { provider: 'brave' }, appearance: { theme: 'light' } };
+  assert.deepEqual(modelOwnValues(changed), { inference: { temperature: 0.2 }, runtime: { kv_cache: 'q8_0' }, runtime_auto: false });
+  assert.deepEqual(modelOwnValues({}), {});
 });

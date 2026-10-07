@@ -8,7 +8,7 @@ import CalibrationCard from './CalibrationCard';
 import OptimizeCard from './OptimizeCard';
 
 type Notify = (kind: 'info' | 'success' | 'warning' | 'error', text: string) => void;
-type Props = { model: ModelMeta; loadingModel: boolean; onLoad: () => void; onDelete: () => void; notify: Notify; onToolingChecked?: () => void };
+type Props = { model: ModelMeta; loadingModel: boolean; onLoad: () => void; onDelete: () => void; onSettings: () => void; notify: Notify; onToolingChecked?: () => void };
 
 /** What the model's tool check found, with Check again for the loaded model. */
 export function ToolingDetails({ model, notify, onChecked }: { model: ModelMeta; notify: Notify; onChecked?: () => void }) {
@@ -75,7 +75,7 @@ export function ModelDetails({ detail, notify }: { detail: ModelDetail; notify: 
   </>;
 }
 
-function ModelLibraryCard({ model, loadingModel, onLoad, onDelete, notify, onToolingChecked }: Props) {
+function ModelLibraryCard({ model, loadingModel, onLoad, onDelete, onSettings, notify, onToolingChecked }: Props) {
   const [expanded, setExpanded] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const [detail, setDetail] = useState<ModelDetail | null>(null);
@@ -128,6 +128,7 @@ function ModelLibraryCard({ model, loadingModel, onLoad, onDelete, notify, onToo
         <button type="button" className="btn ghost sm" ref={detailsButton} aria-expanded={expanded} aria-controls={detailsId} aria-label={`${expanded ? 'Hide' : 'Show'} details for ${model.name}`} onClick={() => { if (expanded) close(); else { setLoading(true); setExpanded(true); } }}>
           <span className="btn-label">{expanded ? 'Hide details' : 'Details'}</span>
         </button>
+        <Button type="button" size="sm" variant="ghost" icon="sliders" onClick={onSettings} aria-label={`Settings for ${model.name}`}>Settings</Button>
         <IconButton icon="trash" label={`Delete ${model.name}`} size="md" tone="danger" tipSide="left" onClick={onDelete} />
       </div>
     </div>

@@ -549,7 +549,11 @@ pub fn router(state: AppState) -> Router {
         // Phase 1 task 8: audit records.
         .route("/api/admin/audit", get(admin_or_auditor(crate::audit::list)))
         .route("/api/runtime/policy", get(runtime_policy))
-        .route("/api/models", get(list_models))
+        // The full library is the admins'; people see the models the admins host.
+        .route("/api/models", get(admin(list_models)))
+        .route("/api/models/available", get(available_models))
+        .route("/api/admin/models/:id/settings", get(admin(crate::settings_levels::get_model_settings)).put(admin(crate::settings_levels::put_model_settings)))
+        .route("/api/admin/servers", get(admin(list_servers)))
         .route("/api/models/load", post(admin(load_model)))
         .route("/api/models/unload", post(admin(unload_models)))
         .route("/api/models/scan", post(admin(scan_models)))
@@ -782,6 +786,46 @@ async fn health() -> Json<serde_json::Value> {
         "name": "companion-backend",
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// The models people can choose: the ones the admins host, loaded and running. One today; the model
+/// list of Phase 2 hosts several.
+async fn available_models(State(s): State<AppState>) -> Json<Vec<crate::models::ModelMetadata>> {
+    let running = s.llama.write().await.is_running();
+    let all = list_models(State(s)).await.0;
+    Json(all.into_iter().filter(|model| running && model.loaded).collect())
+}
+
+/// The servers that host models, for the dashboard: this one today (several servers come later).
+async fn list_servers(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let hw = hardware::detect();
+    let running = s.llama.write().await.is_running();
+    let hosted: Vec<serde_json::Value> = if running {
+        s.models.read().await.current().map(|model| serde_json::json!({ "id": model.id, "name": model.name })).into_iter().collect()
+    } else {
+        Vec::new()
+    };
+    // The live readings name the GPU the runtime uses; the hardware probe only guesses.
+    let gpus: Vec<serde_json::Value> = match s.metrics.lock().ok().and_then(|log| Some((log.gpu_name()?.to_string(), log.latest()?.vram_total_gb))) {
+        Some((model, vram)) => vec![serde_json::json!({ "model": model, "vram_gb": vram.unwrap_or(0.0) })],
+        None => hw.gpus.iter().filter(|gpu| gpu.vram_gb > 0.0).map(|gpu| serde_json::json!({ "model": gpu.model, "vram_gb": gpu.vram_gb })).collect(),
+    };
+    let name = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|name| name.trim().to_string()))
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "This server".into());
+    Json(serde_json::json!({ "servers": [{
+        "id": "this",
+        "name": name,
+        "os": hw.os,
+        "cpu": hw.cpu.model,
+        "ram_gb": hw.ram.total_gb,
+        "gpus": gpus,
+        "models": hosted,
+        "state": if running { "serving" } else { "idle" },
+    }] }))
 }
 
 async fn list_models(State(s): State<AppState>) -> Json<Vec<crate::models::ModelMetadata>> {
@@ -1783,10 +1827,7 @@ pub fn spawn_fit_preparation(s: &AppState, delay: std::time::Duration) {
 
 async fn prepare_fits(s: &AppState) {
     use std::sync::atomic::Ordering;
-    let settings = s.settings.read().await.clone();
-    if !settings.runtime_auto {
-        return;
-    }
+    let company = s.settings.read().await.clone();
     let Ok(binary) = SidecarBinary::detect(&s.runtime_dir()) else {
         return;
     };
@@ -1798,11 +1839,16 @@ async fn prepare_fits(s: &AppState) {
     }
     let mut models = s.models.read().await.list();
     // The default model first: it is the one most likely loaded next.
-    models.sort_by_key(|model| model.id != settings.general.default_model);
+    models.sort_by_key(|model| model.id != company.general.default_model);
     let preparation = &s.fit_preparation;
     for model in models {
         let gguf = model.gguf_path();
         if !gguf.is_file() || !model.load_issues.is_empty() {
+            continue;
+        }
+        // Each model with its own settings; one set by hand needs no fit.
+        let settings = crate::settings_levels::settings_for_model(s, Some(&model.id)).await;
+        if !settings.runtime_auto {
             continue;
         }
         let generation = preparation.generation.load(Ordering::SeqCst);
@@ -1979,7 +2025,8 @@ async fn start_sidecar(
         )));
     }
 
-    let settings = s.settings.read().await.clone();
+    // The company's defaults with this model's own context, sampling, performance and hardware.
+    let settings = crate::settings_levels::settings_for_model(s, model_id.as_deref()).await;
     let model = match model_id.as_ref() {
         Some(id) => s.models.read().await.get(id).cloned(),
         None => None,
@@ -9098,6 +9145,8 @@ async fn runtime_policy(
                 .or_else(|| registry.get(&settings.general.default_model).cloned())
         }
     };
+    // The plan for that model: the company's defaults with its own values.
+    let settings = crate::settings_levels::settings_for_model(&s, model.as_ref().map(|model| model.id.as_str())).await;
     let requested = InferenceConfig {
         n_ctx: settings.inference.context_size,
         n_batch: settings.inference.batch_size,
@@ -10115,7 +10164,7 @@ async fn calibrate_model(
         bg.models.write().await.unload_all();
         bg.inference.write().await.unload();
 
-        let settings = bg.settings.read().await.clone();
+        let settings = crate::settings_levels::settings_for_model(&bg, Some(&model.id)).await;
         let context = settings
             .inference
             .context_size

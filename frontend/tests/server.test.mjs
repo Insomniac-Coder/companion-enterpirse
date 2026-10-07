@@ -19,3 +19,16 @@ test('requests go to the chosen server and carry its token', async () => {
   assert.equal(serverUrl('/api/x'), 'https://companion.example.com/api/x');
   useServer('');
 });
+
+test('the user app names the dashboard but never links to it: it is a separate tool for admins', async () => {
+  const { readFileSync, readdirSync } = await import('node:fs');
+  const files = ['App.tsx', ...readdirSync(new URL('../src/components/', import.meta.url)).map((name) => `components/${name}`)];
+  for (const file of files) {
+    const source = readFileSync(new URL(`../src/${file}`, import.meta.url), 'utf8');
+    assert.doesNotMatch(source, /serverUrl\(\s*['`"]\/admin|href=\{?['"`]\/admin|location\.href\s*=\s*['"`][^'"`]*\/admin/, `${file} links to the dashboard`);
+  }
+  const { dashboardAddress } = await import('../src/services/server.ts');
+  globalThis.location = { href: 'https://companion.example.com/chat' };
+  assert.equal(dashboardAddress(), 'https://companion.example.com/admin/');
+  delete globalThis.location;
+});

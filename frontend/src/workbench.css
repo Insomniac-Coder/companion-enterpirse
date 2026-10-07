@@ -1037,8 +1037,22 @@ a.chip:hover { border-color: var(--line-3); color: var(--text); background: var(
 .history-loading i:nth-child(4) { width: 64%; }
 
 .message-row { display: flex; flex-direction: column; align-items: stretch; min-width: 0; }
-.message-row + .message-row { border-top: 1px solid var(--line); }
-.message-row { padding: 14px 0; }
+.message-row { padding: 9px 0; }
+/* Chat bubbles: the person's on the right, the assistant's on the left, each with the quiet line
+   above it. An agent's activity timeline keeps its own cards, full width. */
+.message-row.user { align-items: flex-end; }
+.msg.user { display: flex; flex-direction: column; align-items: flex-end; width: fit-content; max-width: min(80%, 560px); }
+.msg.assistant:not(.structured-message) { width: fit-content; max-width: 92%; }
+.msg-bubble { min-width: 0; max-width: 100%; padding: 10px 14px; border: 1px solid var(--line); }
+.msg.user .msg-bubble { border-color: var(--line-2); border-radius: 14px 14px 4px 14px; background: var(--selected); }
+.msg.assistant .msg-bubble { border-radius: 14px 14px 14px 4px; background: var(--raised); }
+.msg-bubble > :first-child { margin-top: 0; }
+.msg-bubble > :last-child, .msg-bubble > p:last-of-type { margin-bottom: 0; }
+.message-row.user .msg-line { flex-direction: row-reverse; }
+.message-row.user .msg-line .tm { order: 1; margin-left: 0; padding-left: 0; }
+.message-row.user .msg-line .msg-actions { order: 2; }
+.message-row .msg-line .msg-actions { margin: -4px 0; }
+.msg.assistant .msg-line { gap: 10px 10px; }
 .msg { min-width: 0; color: var(--text); overflow-wrap: anywhere; }
 .msg.user { font-size: 14px; line-height: 1.6; }
 .msg-text { white-space: pre-wrap; color: var(--text); }
@@ -1047,9 +1061,8 @@ a.chip:hover { border-color: var(--line-3); color: var(--text); background: var(
 .msg-line b { font-weight: 500; color: var(--text-2); }
 .msg-line .sep { color: var(--text-4); }
 .msg-line .ok { color: var(--tally); }
-.msg-line .tm { margin-left: auto; color: var(--text-4); }
-.message-row .msg-line .msg-actions { margin: -4px 0 -4px auto; opacity: 0; transition: opacity 0.12s; }
-.message-row .msg-line .msg-actions + .tm { margin-left: 0; }
+.msg-line .tm { margin-left: auto; padding-left: 14px; color: var(--text-4); }
+.message-row .msg-line .msg-actions { opacity: 0; transition: opacity 0.12s; }
 .message-row:hover .msg-line .msg-actions, .msg-line .msg-actions:focus-within { opacity: 1; }
 .msg.assistant > .msg-line + * { margin-top: 0; }
 .msg.assistant p { color: var(--text-2); }

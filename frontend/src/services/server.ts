@@ -16,6 +16,12 @@ export function serverUrl(path: string): string {
   return base + path;
 }
 
+/** The dashboard's full address on this server, to tell an admin where it is: the user app never
+ *  links to it (it is a separate tool for the people running Companion). */
+export function dashboardAddress(): string {
+  return new URL(serverUrl('/admin/'), globalThis.location?.href ?? 'http://localhost/').href;
+}
+
 /** `fetch` against the server, carrying the token when there is one. */
 export function serverFetch(path: string, init: RequestInit = {}): Promise<Response> {
   if (!token) return fetch(base + path, init);

@@ -2,7 +2,7 @@ import type { ModelMeta, Workspace } from '../services/api';
 import { Button, Lamp } from '../ui/primitives';
 import { Icon, type IconName } from '../ui/Icon';
 import { type RigState } from '../services/workbench';
-import { serverUrl } from '../services/server.ts';
+import { dashboardAddress } from '../services/server.ts';
 import StartScripts from './StartScripts';
 
 type Starter = { icon: IconName; label: string; description: string; text: string };
@@ -121,10 +121,7 @@ export default function Welcome({
             <div className="welcome-eyebrow eyebrow"><Lamp state="off" /> No model loaded</div>
             <h1 className="welcome-title">No model is running yet.</h1>
             {canLoad ? <>
-              <p className="welcome-lede">Models are loaded from the dashboard, where you also add and check them.</p>
-              <div className="welcome-actions">
-                <Button variant="primary" size="lg" icon="layers" onClick={() => { window.location.href = serverUrl('/admin/#models'); }}>Open the dashboard</Button>
-              </div>
+              <p className="welcome-lede">Models are loaded from the dashboard, the separate page where admins add, check and load them: <code>{dashboardAddress()}</code></p>
             </> : <p className="welcome-lede">A platform admin of this server loads models for everyone. You can start once one is running.</p>}
           </>
         )}

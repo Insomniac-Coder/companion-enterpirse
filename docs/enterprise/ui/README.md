@@ -59,8 +59,9 @@ Both apps use it: the colours are the tokens at the top of `frontend/src/workben
 accent names stay, so `--tally` is now the blue signal), the fonts are in `frontend/src/fonts` with
 their licence. Built: the dense sidebar (Workspace with counts, Recent with status dots, the person
 with Settings at the bottom), the top bar's crumb, command bar and boundary mark ("Inside the
-company" on a server, "On this PC" on a laptop), the quiet line above every message, messages as
-plain text divided by rules, the composer's model chip, the main button in inverted ink, the amber
+company" on a server, "On this PC" on a laptop), the quiet line above every message, chat bubbles
+(the person's on the right, the assistant's on the left; the owner's call on 2026-10-07, over the
+mockups' plain text divided by rules), the composer's model chip, the main button in inverted ink, the amber
 "Waiting for you" approval card. Still to come with the features they belong to: source chips (RAG,
 Phase 6), a model picker per conversation (the model list, Phase 2), approval keys Enter/E/Esc
 (the card has buttons until approvals reach the chat with the desktop app, Phase 3), the amber

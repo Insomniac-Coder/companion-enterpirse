@@ -215,7 +215,7 @@ export default function MessageView({
           </span>
           {time && <span className="tm">{fmtTime(time)}</span>}
         </div>
-        <div className="msg-text">{text}</div>
+        <div className="msg-bubble msg-text">{text}</div>
       </div>
     );
   }
@@ -271,21 +271,23 @@ export default function MessageView({
   return (
     <div className={`msg ${role}${streaming ? ' streaming' : ''}`}>
       {line}
-      {chatDetails.length > 0 && <details className="chat-file-activity">
-        <summary>View file activity</summary>
-        <ToolTimeline events={chatDetails} />
-      </details>}
-      {thinking && (
-        <details className="thinking-block" open={streaming && !answerBody}>
-          <summary>{streaming && !answerBody ? 'Thinking…' : 'Thought process'}</summary>
-          <pre>{thinking}</pre>
-        </details>
-      )}
-      <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
-        {answerBody}
-      </ReactMarkdown>
-      {streaming && <span className="live-rule" role="status" aria-label="Generating" />}
-      <Sources sources={sources} />
+      <div className="msg-bubble">
+        {chatDetails.length > 0 && <details className="chat-file-activity">
+          <summary>View file activity</summary>
+          <ToolTimeline events={chatDetails} />
+        </details>}
+        {thinking && (
+          <details className="thinking-block" open={streaming && !answerBody}>
+            <summary>{streaming && !answerBody ? 'Thinking…' : 'Thought process'}</summary>
+            <pre>{thinking}</pre>
+          </details>
+        )}
+        <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
+          {answerBody}
+        </ReactMarkdown>
+        {streaming && <span className="live-rule" role="status" aria-label="Generating" />}
+        <Sources sources={sources} />
+      </div>
       {(!streaming || tps != null) && (text || streaming) && meta}
     </div>
   );

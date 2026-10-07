@@ -22,7 +22,7 @@ import Welcome from './components/Welcome';
 import { PERMISSION_MODE_DESCRIPTIONS, PERMISSION_MODE_LABELS, PROJECT_BOUNDARY_DESCRIPTION, SEARCH_PERMISSION_DESCRIPTION } from './components/permissionCopy';
 import { VisibleOutputMeter, type GenerationPhase, type OutputTiming } from './services/outputTiming';
 import { isPlatformAdmin, signOut, type Me } from './services/account';
-import { serverUrl } from './services/server.ts';
+import { dashboardAddress } from './services/server.ts';
 import { attachmentTooLarge } from './services/settingsFields';
 import { applyAgentContext } from './services/contextUsage';
 import { currentActivitySnapshot, parseActivityStart, visibleWorkActivity } from './services/workElapsed';
@@ -77,10 +77,10 @@ function shortcutLabel(binding: string) {
 }
 
 export default function App({ me }: { me?: Me }) {
-  // Models, downloads, company settings and system checks are in the dashboard (src/admin/), a
-  // platform admin's; an auditor reads it. The permission mode is each person's own.
+  // Models, downloads, company settings and system checks are in the dashboard (src/admin/, its own
+  // address /admin/), a separate tool for the people running Companion: this app never links to it.
+  // The permission mode is each person's own.
   const admin = isPlatformAdmin(me);
-  const dashboard = admin || !!me?.roles?.includes('auditor');
   // Graphite's boundary mark: a company server keeps data inside the company, a laptop on this PC.
   const boundary = me?.sign_in ? 'Inside the company' : 'On this PC';
   const initials = (me?.sign_in && me.name ? me.name : 'You').split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase();
@@ -1191,7 +1191,6 @@ export default function App({ me }: { me?: Me }) {
     { id: 'mode-chat', group: 'Go to', icon: 'chat', label: 'Chat', detail: 'Conversations', run: () => switchMode('chat') },
     { id: 'mode-code', group: 'Go to', icon: 'code', label: 'Code', detail: 'Project sessions', run: () => switchMode('code') },
     ...destinations.map(({ id, label }) => ({ id, group: 'Go to', icon: PAGE_META[id].icon, label, detail: PAGE_META[id].description, run: () => { setTab(id); setMobileNav(false); } })),
-    ...(dashboard ? [{ id: 'dashboard', group: 'Go to', icon: 'layers' as IconName, label: 'Dashboard', detail: 'Models, people, company settings and the audit records', run: () => { window.location.href = serverUrl('/admin/'); } }] : []),
     ...convs.map((conversation) => ({ id: conversation.id, group: 'Sessions', icon: (conversation.mode === 'code' ? 'code' : 'chat') as IconName, label: conversation.title || 'Untitled', detail: conversation.mode === 'code' ? `Code session${workspaces.find((w) => w.id === conversation.workspace) ? ` · ${workspaces.find((w) => w.id === conversation.workspace)!.name}` : ''}` : 'Conversation', run: () => void selectConv(conversation.id) })),
   ];
 
@@ -1424,12 +1423,6 @@ export default function App({ me }: { me?: Me }) {
         )}
 
         <nav className="sb-utility" aria-label="Manage Companion">
-          {dashboard && (
-            <a className="sb-link" href={serverUrl('/admin/')} aria-label="Dashboard" data-tip={rail ? 'Dashboard' : undefined} data-tip-side={rail ? 'right' : undefined}>
-              <Icon name="layers" size={16} />
-              {!rail && <span>Dashboard</span>}
-            </a>
-          )}
           <div className="sb-person" title={me?.sign_in ? me.email || me.name : 'This PC\u2019s one person'}>
             <span className="sb-person-initial" aria-hidden="true">{initials}</span>
             {!rail && <span className="sb-person-name">{me?.sign_in && me.name ? me.name : 'You'}</span>}
@@ -1589,9 +1582,8 @@ export default function App({ me }: { me?: Me }) {
             className="global-notice"
             title="The model server stopped"
             onDismiss={() => setDismissedStop(inf.stopped ?? null)}
-            actions={admin ? <Button size="sm" variant="primary" icon="layers" onClick={() => { window.location.href = serverUrl('/admin/#models'); }}>Open the dashboard</Button> : undefined}
           >
-            {modelStoppedDetail(inf.stopped)} Companion itself is still running and your conversations are safe. The model server’s output is in logs/model-server.log in Companion’s data folder.
+            {modelStoppedDetail(inf.stopped)} Companion itself is still running and your conversations are safe. {admin ? <>Load it again from the dashboard (<code>{dashboardAddress()}</code>); the model server’s output is in logs/model-server.log in Companion’s data folder.</> : 'A platform admin can load it again.'}
           </Notice>
         )}
 

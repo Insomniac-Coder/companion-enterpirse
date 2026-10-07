@@ -243,9 +243,9 @@ another backend).
 ### First steps in the app
 
 Companion is two apps from one set of screens: **Companion** itself (`/`), where people chat and
-work in projects, and the **dashboard** (`/admin/`, or **Dashboard** in Companion's sidebar), where
-the people running it manage models, the model server, people and roles, company and group settings
-with their locks, and read the audit records. A platform admin sees all of the dashboard, an auditor
+work in projects, and the **dashboard** (`/admin/`), a separate tool where the people running it
+manage models, the model server, people and roles, company and group settings with their locks, and
+read the audit records. Companion does not link to the dashboard; admins open its address. A platform admin sees all of the dashboard, an auditor
 its people, settings and audit pages; others are not let in. On a laptop install you are both.
 
 1. **Dashboard > Models**: select a model and **Load**. The app sizes the context and places the

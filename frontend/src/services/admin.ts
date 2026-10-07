@@ -186,7 +186,6 @@ export const DASHBOARD_PAGES = [
   { id: 'models', label: 'Models', icon: 'layers', auditor: false },
   { id: 'system', label: 'Runtime and diagnostics', icon: 'gauge', auditor: false },
   { id: 'resources', label: 'Resources', icon: 'activity', auditor: false },
-  { id: 'tools', label: 'Tools and plugins', icon: 'terminal', auditor: false },
 ] as const;
 
 export type DashboardPage = (typeof DASHBOARD_PAGES)[number]['id'];

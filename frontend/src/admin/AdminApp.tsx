@@ -1,6 +1,6 @@
 // The dashboard (Phase 1, task 9): the people running Companion for everyone. A platform admin
-// manages people and roles, company and group settings with their locks, models, the runtime and
-// tools; an auditor reads people, settings and the audit records. Shares its parts (src/ui,
+// manages people and roles, company and group settings with their locks, models and the model
+// server; an auditor reads people, settings and the audit records. Shares its parts (src/ui,
 // src/services, the settings screen) with the user app.
 import { useCallback, useEffect, useState } from 'react';
 import Toasts, { pushToast, type Toast } from '../components/Toasts';
@@ -8,13 +8,12 @@ import Rig from './Rig';
 import ModelsPage from './ModelsPage';
 import RuntimePage from './RuntimePage';
 import ResourcesPanel from './ResourcesPanel';
-import ToolsPage from './ToolsPage';
 import PeoplePage from './PeoplePage';
 import CompanySettingsPage from './CompanySettingsPage';
 import AuditPage from './AuditPage';
 import {
-  agentRuns, deleteModel, inferenceStart, inferenceStatus, listDownloads, listModels, listTools, loadModel, stopAgent, systemInfo, unloadModels,
-  type DownloadInfo, type InferenceStatus, type ModelMeta, type ToolDescriptor,
+  agentRuns, deleteModel, inferenceStart, inferenceStatus, listDownloads, listModels, loadModel, stopAgent, systemInfo, unloadModels,
+  type DownloadInfo, type InferenceStatus, type ModelMeta,
 } from '../services/api';
 import { isPlatformAdmin, signOut, type Me } from '../services/account';
 import { DASHBOARD_PAGES, pageFromHash, type DashboardPage } from '../services/admin';
@@ -33,7 +32,6 @@ const DESCRIPTIONS: Record<DashboardPage, string> = {
   models: 'Load, inspect and add the models everyone uses',
   system: 'The model server, health checks and speed',
   resources: 'Live processor, memory and graphics readings for the server',
-  tools: 'Every action Companion can take and the approval it needs',
 };
 
 export default function AdminApp({ me }: { me?: Me }) {
@@ -52,7 +50,6 @@ export default function AdminApp({ me }: { me?: Me }) {
   const [sys, setSys] = useState<any>(null);
   const [backendUp, setBackendUp] = useState<boolean | null>(null);
   const [loadingModel, setLoadingModel] = useState(false);
-  const [registry, setRegistry] = useState<ToolDescriptor[]>([]);
   const [guard, setGuard] = useState<{ kind: 'load' | 'start'; id: string; detail: string } | null>(null);
   const [confirm, setConfirm] = useState<Confirm | null>(null);
   const [mobileNav, setMobileNav] = useState(false);
@@ -82,7 +79,6 @@ export default function AdminApp({ me }: { me?: Me }) {
     void refreshDownloads();
     check();
     systemInfo().then(setSys).catch(() => setSys(null));
-    listTools().then(setRegistry).catch(() => {});
     const downloadsTimer = setInterval(() => void refreshDownloads(), 2000);
     const statusTimer = setInterval(() => { if (!document.hidden) { void refreshModels(); check(); } }, 10000);
     return () => { clearInterval(downloadsTimer); clearInterval(statusTimer); };
@@ -327,7 +323,6 @@ export default function AdminApp({ me }: { me?: Me }) {
           />
         )}
         {page === 'resources' && admin && <ResourcesPanel notify={notify} />}
-        {page === 'tools' && admin && <ToolsPage registry={registry} wsId="" notify={notify} onRefresh={() => void listTools().then(setRegistry).catch(() => {})} />}
       </div>
 
       {guard && (

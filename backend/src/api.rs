@@ -705,7 +705,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/workspaces/:id/git", get(workspace_git))
         // Stage 37: plugins.
         .route("/api/plugins", get(list_plugins))
-        .route("/api/plugins/:id/run", post(admin(run_plugin_command)))
+        // A person runs a plugin's tool in their own project, like any direct tool call.
+        .route("/api/plugins/:id/run", post(run_plugin_command))
         // Stage 34: diagnostics.
         .route("/api/doctor", get(admin(doctor)))
         // Stage 38: first-run + benchmark.
@@ -8082,7 +8083,7 @@ async fn list_plugins(State(s): State<AppState>) -> Json<serde_json::Value> {
 
 #[derive(Deserialize, Default)]
 struct PluginRunReq {
-    /// Workspace required for workspace-scoped tools.
+    /// One of the caller's saved projects: plugin tools run inside it.
     #[serde(default)]
     workspace_id: String,
     tool: String,
@@ -8121,12 +8122,16 @@ async fn run_plugin_command(
     if crate::tools::registry().iter().all(|t| t.name != req.tool) {
         return Err(ApiError::not_found(format!("unknown tool '{}'", req.tool)));
     }
-    let ws_root = if req.workspace_id.trim().is_empty() {
-        std::env::temp_dir()
-    } else {
-        let ws = load_workspace(&s, req.workspace_id.trim()).await?;
-        resolve_workspace_root(&s, &ws)?
-    };
+    // The caller's own project, inside the folders the company allows: the same rule as direct tool
+    // calls. (Admins only used to run these, in the server's temporary folder when no project was named.)
+    if req.workspace_id.trim().is_empty() {
+        return Err(ApiError::bad(
+            "choose a project",
+            "Plugin tools work inside one of your projects: open one, then run the tool again.",
+        ));
+    }
+    let project = crate::ownership::workspace(&s, &caller, req.workspace_id.trim()).await?;
+    let ws_root = saved_project_folder(&s, &caller.id, &project.path).await?;
     let ws_key = ws_root
         .canonicalize()
         .map(|p| p.to_string_lossy().into_owned())
@@ -14586,8 +14591,9 @@ Would you like me to fix it?")]));
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
-        // Declared SAFE tool runs (temp dir root when no workspace given).
+        // Without a project nothing runs (it used to run in the server's temporary folder).
         let r = a
+            .clone()
             .oneshot(json_req(
                 "POST",
                 "/api/plugins/filesystem/run",
@@ -14595,8 +14601,39 @@ Would you like me to fix it?")]));
             ))
             .await
             .unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        // A declared read-only tool runs in a saved project.
+        let (a, id) = seed_workspace(a, "Plugin project").await;
+        let r = a
+            .oneshot(json_req(
+                "POST",
+                "/api/plugins/filesystem/run",
+                serde_json::json!({"workspace_id": id, "tool": "list_directory", "args": {"path": "."}}),
+            ))
+            .await
+            .unwrap();
         assert_eq!(r.status(), StatusCode::OK);
-        assert_eq!(body_json(r).await["ok"], true);
+        let v = body_json(r).await;
+        assert_eq!(v["ok"], true, "{v}");
+        assert!(v["output"].as_str().unwrap_or_default().contains("notes.md"), "{v}");
+    }
+
+    #[tokio::test]
+    async fn anyone_runs_a_plugin_tool_but_only_in_their_own_project() {
+        use crate::roles::tests::{call, json, person, server, status};
+        let (app, state) = server();
+        let (_, ada) = person(&state, "ada", &[]).await;
+        let (_, bob) = person(&state, "bob", &[]).await;
+        let folder = std::env::temp_dir().join(format!("companion-plugin-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("ada.txt"), "hers").unwrap();
+        let path = folder.to_string_lossy().into_owned();
+        let project = json(&app, call("POST", "/api/workspaces", &ada, Some(serde_json::json!({ "name": "p", "path": path })))).await["id"].as_str().unwrap().to_string();
+        let run = |who: &str| call("POST", "/api/plugins/filesystem/run", who, Some(serde_json::json!({ "workspace_id": project, "tool": "list_directory", "args": { "path": "." } })));
+        let mine = json(&app, run(&ada)).await;
+        assert!(mine["output"].as_str().unwrap_or_default().contains("ada.txt"), "a person, not only an admin, runs it: {mine}");
+        assert_eq!(status(&app, run(&bob)).await, StatusCode::NOT_FOUND, "someone else's project is not found");
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     #[tokio::test]

@@ -579,8 +579,8 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   does not fail the request.
 - Two apps, one set of parts (task 9): `frontend/index.html` is Companion (`src/App.tsx`, the
   person's own work) and `frontend/admin/index.html` the dashboard (`src/admin/`: people, company and
-  group settings, audit records, and the models, runtime, resources and tools screens that left the
-  user app; the user app never links to it, the dashboard is a separate tool at its own address, and a
+  group settings, audit records, and the models, runtime and resources screens that left the user
+  app; tools and plugins are people's own, in the user app; the user app never links to it, the dashboard is a separate tool at its own address, and a
   test keeps it so). Both start in `SignInGate` and share `src/ui`, `src/services` and the settings screen
   (`SettingsPanel`'s `scope` edits the company's or a group's values, saving only what differs).
   Every request goes through `services/server.ts` (`serverFetch`, `serverUrl`): the page's own server

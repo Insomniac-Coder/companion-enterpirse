@@ -4,6 +4,7 @@ import PrepareBanner from './components/PrepareBanner';
 import SettingsPanel from './components/SettingsPanel';
 import Toasts, { pushToast, type Toast } from './components/Toasts';
 import { ContextGauge } from './components/ContextBar';
+import ToolsPage from './components/ToolsPage';
 import DiffModal from './components/DiffModal';
 import ShareDialog, { type ShareOptions } from './components/ShareDialog';
 import RecoveryBanner from './components/RecoveryBanner';
@@ -48,10 +49,11 @@ import {
 type Msg = { id: string; role: 'user' | 'assistant' | 'tool'; text: string; time: string; activities?: AgentEvent[] };
 
 type Theme = 'dark' | 'light' | 'system';
-type PageId = 'settings';
+type PageId = 'tools' | 'settings';
 type Perf = { tps: number | null; timing?: OutputTiming | null; legacy: boolean; model?: string };
 
 const PAGE_META: Record<PageId, { title: string; description: string; icon: IconName }> = {
+  tools: { title: 'Tools and plugins', description: 'Every action Companion can take for you, the approval each needs, and the plugins you can run', icon: 'wrench' },
   settings: { title: 'Settings', description: 'Appearance, assistant behaviour, search and performance', icon: 'sliders' },
 };
 
@@ -1336,6 +1338,7 @@ export default function App({ me }: { me?: Me }) {
               <div className="sb-modes-rail" role="group" aria-label="Work mode">
                 <IconButton icon="chat" label="Chat" pressed={mode === 'chat' && tab === 'chat'} tipSide="right" onClick={() => switchMode('chat')} />
                 <IconButton icon="code" label="Code" pressed={mode === 'code' && tab === 'chat'} tipSide="right" onClick={() => switchMode('code')} />
+                <IconButton icon="wrench" label="Tools and plugins" pressed={tab === 'tools'} tipSide="right" onClick={() => setTab(tab === 'tools' ? 'chat' : 'tools')} />
               </div>
             </>
           ) : (
@@ -1351,6 +1354,9 @@ export default function App({ me }: { me?: Me }) {
                 <button type="button" role="tab" aria-selected={mode === 'chat'} onClick={() => switchMode('chat')} title="Chats (Ctrl 1)"><Icon name="chat" size={15} />Chats<span className="sb-count">{convs.filter((c) => (c.mode || 'chat') === 'chat').length}</span></button>
                 <button type="button" role="tab" aria-selected={mode === 'code'} onClick={() => switchMode('code')} title="Code tasks (Ctrl 2)"><Icon name="code" size={15} />Code tasks<span className="sb-count">{convs.filter((c) => c.mode === 'code').length}</span></button>
               </div>
+              <button type="button" className="sb-workspace-page" aria-current={tab === 'tools' ? 'page' : undefined} onClick={() => { setTab(tab === 'tools' ? 'chat' : 'tools'); setMobileNav(false); }}>
+                <Icon name="wrench" size={15} />Tools<span className="sb-count">{registry.length || ''}</span>
+              </button>
               {mode === 'code' && (
                 <div className="project-switch">
                   <button
@@ -1850,6 +1856,7 @@ export default function App({ me }: { me?: Me }) {
           </>
         )}
 
+        {tab === 'tools' && <ToolsPage registry={registry} wsId={wsId} notify={notify} onRefresh={() => void refreshRegistry()} />}
         {tab === 'settings' && <SettingsPanel setToasts={setToasts} me={me} />}
 
         {diffWs && <DiffModal wsId={diffWs} onClose={() => setDiffWs(null)} />}

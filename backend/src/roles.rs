@@ -338,7 +338,7 @@ pub(crate) mod tests {
     use tower::ServiceExt as _;
 
     /// Every route that changes the server for everyone, or shows everyone's activity.
-    const PLATFORM_ADMIN_ROUTES: [(&str, &str); 28] = [
+    const PLATFORM_ADMIN_ROUTES: [(&str, &str); 27] = [
         ("PUT", "/api/admin/settings/company"),
         ("POST", "/api/models/load"),
         ("POST", "/api/models/unload"),
@@ -359,7 +359,6 @@ pub(crate) mod tests {
         ("GET", "/api/logs/archive"),
         ("POST", "/api/system/calibrate"),
         ("POST", "/api/models/m/calibrate"),
-        ("POST", "/api/plugins/p/run"),
         ("GET", "/api/doctor"),
         ("GET", "/api/setup/status"),
         ("POST", "/api/system/benchmark"),

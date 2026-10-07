@@ -399,7 +399,7 @@ Everyone who signs in is a user. On top of that:
 
 | Role | What it is for |
 | --- | --- |
-| Platform admin | runs the server for everyone: models, downloads, settings, system checks, plugins, the logs |
+| Platform admin | runs the server for everyone: models, downloads, settings, system checks, the logs |
 | Team admin | looks after one group: its settings and locks |
 | Auditor | reads who has which role and group, the settings, and the audit records |
 

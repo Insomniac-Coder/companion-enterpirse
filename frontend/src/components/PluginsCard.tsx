@@ -18,9 +18,9 @@ export default function PluginsCard({
   const load = () => listPlugins().then((r) => setPlugins(r.plugins)).catch((e) => notify('error', e.message));
   useEffect(() => { load(); }, []);
 
-  const run = (pluginId: string, tool: string, needsWs: boolean) => {
-    if (needsWs && !wsId) {
-      notify('warning', 'Link a project first — this tool works inside a project.');
+  const run = (pluginId: string, tool: string) => {
+    if (!wsId) {
+      notify('warning', 'Open a project first: plugin tools run inside one of your projects (Code tasks, then choose a project).');
       return;
     }
     const needsApproval = !SAFE.has(tool);
@@ -50,7 +50,7 @@ export default function PluginsCard({
                 <div key={t.name} className="list-row">
                   <code className="grow">{t.name}</code>
                   <Badge tone={t.risk.toLowerCase().startsWith('danger') ? 'err' : t.risk.toLowerCase().startsWith('moderate') ? 'warn' : 'neutral'}>{t.risk}</Badge>
-                  <Button size="sm" variant="ghost" icon="play" onClick={() => run(p.id, t.name, t.name !== 'system_info' && t.name !== 'list_processes')}>Run</Button>
+                  <Button size="sm" variant="ghost" icon="play" onClick={() => run(p.id, t.name)}>Run</Button>
                 </div>
               ))}
             </div>

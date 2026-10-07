@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cacheDetails } from '../src/components/cacheDiagnostics.ts';
+import { cacheDetails } from '../src/admin/cacheDiagnostics.ts';
 
 test('legacy automatic cache budgets never become a claimed allocation manager', () => {
   const details = cacheDetails({ configured_context: 8192, budgets: { ram: 'auto', vram: 'auto' } });

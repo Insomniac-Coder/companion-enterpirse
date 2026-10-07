@@ -1,8 +1,8 @@
 import type { GenerationPhase, OutputTiming } from './outputTiming';
 import { signInNeeded } from './account.ts';
-export const API = '';
 
 import type { ToolingProfile, ToolingState } from './tooling';
+import { serverFetch } from './server.ts';
 
 export interface ModelMeta {
   id: string;
@@ -47,7 +47,7 @@ export interface ChatMessage {
 }
 
 async function req(path: string, init?: RequestInit) {
-  const r = await fetch(path, init);
+  const r = await serverFetch(path, init);
   if (r.status === 401) signInNeeded();
   if (!r.ok) {
     // Backend returns {error, hint} (§52); surface both, keep the status.
@@ -138,7 +138,7 @@ export async function modelDetail(id: string): Promise<ModelDetail> {
 }
 
 export async function deleteModel(id: string) {
-  const r = await fetch(`/api/models/${id}`, { method: 'DELETE' });
+  const r = await serverFetch(`/api/models/${id}`, { method: 'DELETE' });
   if (!r.ok) {
     try {
       const j = await r.json();
@@ -313,7 +313,7 @@ export async function listAttachments(conversationId: string): Promise<Attachmen
 }
 
 export async function deleteAttachment(conversationId: string, aid: string) {
-  const r = await fetch(`/api/conversations/${conversationId}/attachments/${aid}`, { method: 'DELETE' });
+  const r = await serverFetch(`/api/conversations/${conversationId}/attachments/${aid}`, { method: 'DELETE' });
   if (!r.ok) throw new Error(`delete failed: ${r.status}`);
   return r.json();
 }
@@ -342,7 +342,7 @@ export interface StreamUsage {
  *  (or their reply outside a conversation), freeing its GPU slot, and keep
  *  whatever was streamed so far. Safe when idle. */
 export async function stopChat(conversationId?: string | null): Promise<{ stopped: boolean; chars_kept: number }> {
-  const r = await fetch('/api/chat/stop', {
+  const r = await serverFetch('/api/chat/stop', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ conversation_id: conversationId || null }),
@@ -372,7 +372,7 @@ export async function streamChat(
   signal: AbortSignal,
   opts?: { reasoning?: boolean; search?: boolean },
 ): Promise<void> {
-  const r = await fetch('/api/chat', {
+  const r = await serverFetch('/api/chat', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -656,7 +656,7 @@ export async function prepareContext(
   onStage: (s: PrepStage) => void,
   signal: AbortSignal,
 ): Promise<{ ready: boolean; model: string }> {
-  const r = await fetch(`/api/conversations/${convId}/prepare`, {
+  const r = await serverFetch(`/api/conversations/${convId}/prepare`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ model_id: modelId }),
@@ -785,7 +785,7 @@ export async function streamAgentEvents(
   onEvent: (e: AgentEvent) => void,
   signal: AbortSignal,
 ): Promise<void> {
-  const r = await fetch(`/api/agent/runs/${runId}/events`, { signal });
+  const r = await serverFetch(`/api/agent/runs/${runId}/events`, { signal });
   // `status` 404: the server no longer has the run (runs live in memory, so a
   // restart forgets them); a view that remembered its id can drop it quietly.
   if (!r.ok || !r.body) throw Object.assign(new Error(`agent stream failed: ${r.status}`), { status: r.status });
@@ -932,7 +932,7 @@ export async function patchSession(id: string, patch: { priority?: string; relat
  * application's log, the model server's output and a note of what was
  * running. Conversations are not in it (they are in the audit records). */
 export async function saveLogsArchive(): Promise<string> {
-  const r = await fetch('/api/logs/archive');
+  const r = await serverFetch('/api/logs/archive');
   if (!r.ok) throw new Error(`Could not collect the logs (${r.status}).`);
   const name = /filename="([^"]+)"/.exec(r.headers.get('content-disposition') ?? '')?.[1] ?? 'companion-logs.zip';
   const a = document.createElement('a');
@@ -1014,7 +1014,7 @@ export async function optimizeModel(id: string, workload = 'chat', policy = 'bal
 }
 
 export async function deleteConversation(id: string) {
-  const r = await fetch(`/api/conversations/${id}`, { method: 'DELETE' });
+  const r = await serverFetch(`/api/conversations/${id}`, { method: 'DELETE' });
   if (!r.ok) throw new Error(`delete failed: ${r.status}`);
   return r.json();
 }

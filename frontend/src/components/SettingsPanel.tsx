@@ -8,7 +8,7 @@ import { pushToast, type Toast } from './Toasts';
 import AccountSection from './AccountSection';
 import type { Me } from '../services/account';
 import { defaultModelOptions, type ModelListState } from './settingsModels';
-import { expertSectionOpen, settingsSearchMatches, updateSetting } from './settingsForm';
+import { changedSettings, expertSectionOpen, settingsSearchMatches, updateSetting } from './settingsForm';
 import { PERMISSION_MODE_DESCRIPTIONS, PERMISSION_MODE_LABELS, PROJECT_BOUNDARY_DESCRIPTION, SEARCH_PERMISSION_DESCRIPTION } from './permissionCopy';
 import { modesWithin } from '../services/workbench';
 import { Button, Lamp } from '../ui/primitives';
@@ -112,7 +112,19 @@ export function RuntimeSummary({ policy, dirty }: { policy: RuntimePolicy; dirty
   </details>;
 }
 
-export default function SettingsPanel({ setToasts, me }: { setToasts: React.Dispatch<React.SetStateAction<Toast[]>>; me?: Me }) {
+/** Where the screen reads and saves: the person's own settings (no scope), or a level the
+ *  dashboard edits, the company's or a group's. */
+export interface SettingsScope {
+  load: () => Promise<any>;
+  /** Saves what differs from the loaded values; returns the values to show after. */
+  save: (changed: Record<string, unknown>, all: any) => Promise<any>;
+  /** Which fields this level may set, and why not; every field when absent. */
+  fields?: () => Promise<SettingFields>;
+  /** What this level is, shown above the fields. */
+  note: string;
+}
+
+export default function SettingsPanel({ setToasts, me, scope }: { setToasts: React.Dispatch<React.SetStateAction<Toast[]>>; me?: Me; scope?: SettingsScope }) {
   const [s, setS] = useState<any>(null);
   const [savedSettings, setSavedSettings] = useState<any>(null);
   const [settingsError, setSettingsError] = useState('');
@@ -180,8 +192,8 @@ export default function SettingsPanel({ setToasts, me }: { setToasts: React.Disp
   useEffect(() => {
     let active = true;
     void refreshModels();
-    getSettingFields().then((next) => { if (active) setFields(next); }).catch(() => {});
-    getSettings().then((settings) => {
+    (scope ? scope.fields : getSettingFields)?.().then((next) => { if (active) setFields(next); }).catch(() => {});
+    (scope?.load ?? getSettings)().then((settings) => {
       if (!active) return;
       setS(settings);
       setSavedSettings(settings);
@@ -239,8 +251,12 @@ export default function SettingsPanel({ setToasts, me }: { setToasts: React.Disp
     setSaving(true);
     const revision = editRevision.current;
     try {
-      const saved = await putSettings(s);
+      const saved = scope ? await scope.save(changedSettings(savedSettings, s), s) : await putSettings(s);
       if (revision === editRevision.current) { setS(saved); setSavedSettings(saved); setDirty(false); }
+      if (scope) {
+        pushToast(setToasts, 'success', 'Saved. People get the new values with their next request; runtime changes apply on the next model load.');
+        return;
+      }
       window.dispatchEvent(new CustomEvent('companion:settings', { detail: saved }));
       document.documentElement.dataset.density = saved.appearance?.density ?? 'comfortable';
       document.documentElement.classList.toggle('reduce-motion', !!saved.appearance?.reduce_motion);
@@ -269,7 +285,8 @@ export default function SettingsPanel({ setToasts, me }: { setToasts: React.Disp
           <div className="settings-search"><Icon name="search" size={15} /><input aria-label="Search settings" placeholder="Search settings" value={query} onChange={(event) => setQuery(event.target.value)} /></div>
           {query.trim() && matchCount === 0 && <p className="settings-empty" role="status">No settings match “{query}”. Try a different term or <button type="button" onClick={() => setQuery('')}>clear search</button>.</p>}
 
-          {me?.sign_in && me.via === 'session' && <AccountSection me={me} setToasts={setToasts} />}
+          {scope && <p className="settings-capability-note">{scope.note}</p>}
+          {!scope && me?.sign_in && me.via === 'session' && <AccountSection me={me} setToasts={setToasts} />}
 
           <section className="settings-section" data-settings-title="Personalization">
             <h2><Icon name="sun" size={16} />Personalization</h2><p className="settings-section-intro">Choose how Companion looks and what appears in your conversations.</p>
@@ -303,6 +320,7 @@ export default function SettingsPanel({ setToasts, me }: { setToasts: React.Disp
             <div className="settings-fields">
               <SettingField label="Search provider" path="search.provider" description={s.search?.provider === 'custom' ? 'The saved custom provider is not implemented. Choose a supported provider to use search.' : undefined}><select value={s.search?.provider ?? 'duckduckgo'} onChange={(event) => set(['search', 'provider'], event.target.value)}><option value="duckduckgo">DuckDuckGo (no key)</option><option value="brave">Brave (API key)</option>{s.search?.provider === 'custom' && <option value="custom">Saved custom provider — unavailable</option>}</select></SettingField>
               {s.search?.provider === 'brave' && <SettingField label="Brave API key" path="search.brave_key"><input type="password" autoComplete="off" value={s.search?.brave_key ?? ''} onChange={(event) => set(['search', 'brave_key'], event.target.value)} /></SettingField>}
+              {scope && <SettingField label="Most permissive mode allowed" path="agent.max_permission_mode" description="Nobody can choose a mode that allows more than this; a mode someone chose before counts as this one."><select value={s.agent?.max_permission_mode ?? 'auto'} onChange={(event) => set(['agent', 'max_permission_mode'], event.target.value)}>{(Object.keys(PERMISSION_MODE_LABELS) as (keyof typeof PERMISSION_MODE_LABELS)[]).map((option) => <option key={option} value={option}>{PERMISSION_MODE_LABELS[option]}</option>)}</select></SettingField>}
               <SettingField label="Agent search permission" path="search.autonomous" description={SEARCH_PERMISSION_DESCRIPTION}><select value={s.search?.autonomous ?? 'ask'} onChange={(event) => set(['search', 'autonomous'], event.target.value)}><option value="ask">Ask unless Auto mode is on</option><option value="allow">Allow agent searches</option><option value="deny">Do not allow agent searches</option></select></SettingField>
             </div>
           </section>

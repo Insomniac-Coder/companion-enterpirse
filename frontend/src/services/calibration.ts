@@ -1,3 +1,4 @@
+import { serverFetch } from './server.ts';
 /** Per-model performance calibration: measured runtime profiles. */
 
 export type ProfileName = 'fastest' | 'balanced' | 'light';
@@ -174,14 +175,14 @@ export function staleReason(status: CalibrationStatus | null): string | null {
 }
 
 export async function getCalibration(modelId: string): Promise<CalibrationStatus> {
-  const response = await fetch(`/api/models/${encodeURIComponent(modelId)}/calibration`);
+  const response = await serverFetch(`/api/models/${encodeURIComponent(modelId)}/calibration`);
   if (!response.ok) throw new Error(`Could not read calibration (${response.status}).`);
   return response.json();
 }
 
 /** Runs a calibration, reporting each stage; resolves with the result. */
 export async function calibrateModel(modelId: string, onStage: (detail: string) => void, signal?: AbortSignal): Promise<Calibration> {
-  const response = await fetch(`/api/models/${encodeURIComponent(modelId)}/calibrate`, { method: 'POST', signal });
+  const response = await serverFetch(`/api/models/${encodeURIComponent(modelId)}/calibrate`, { method: 'POST', signal });
   if (!response.ok || !response.body) throw new Error(`Calibration could not start (${response.status}).`);
   const reader = response.body.getReader();
   const decoder = new TextDecoder();

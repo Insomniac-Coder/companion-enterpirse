@@ -7,7 +7,7 @@ import { build } from 'esbuild';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 
-const sourcePath = fileURLToPath(new URL('../src/components/ModelLibraryItem.tsx', import.meta.url));
+const sourcePath = fileURLToPath(new URL('../src/admin/ModelLibraryItem.tsx', import.meta.url));
 const result = await build({ entryPoints: [sourcePath], bundle: true, write: false, platform: 'node', format: 'cjs', jsx: 'automatic', external: ['react', 'react/*'], loader: { '.css': 'empty' } });
 const loaded = { exports: {} };
 new Function('require', 'module', 'exports', result.outputFiles[0].text)(createRequire(import.meta.url), loaded, loaded.exports);

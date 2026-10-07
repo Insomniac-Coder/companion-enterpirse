@@ -9043,7 +9043,7 @@ async fn session_action(
 const SAVED_SECRET: &str = "(saved)";
 
 /// The settings as a screen may see them: secrets replaced by `SAVED_SECRET`.
-fn without_secrets(mut settings: AppSettings) -> AppSettings {
+pub(crate) fn without_secrets(mut settings: AppSettings) -> AppSettings {
     if !settings.search.brave_key.is_empty() {
         settings.search.brave_key = SAVED_SECRET.into();
     }
@@ -12531,6 +12531,8 @@ Would you like me to fix it?")]));
         let _ = put_settings(State(state.clone()), Extension(crate::auth::Caller::local()), Json(settings)).await.unwrap();
         let shown = get_settings(State(state.clone()), Extension(crate::auth::Caller::local())).await.0;
         assert_eq!(shown.search.brave_key, SAVED_SECRET);
+        let overview = crate::settings_levels::overview(State(state.clone())).await.unwrap().0;
+        assert_eq!(overview["company"]["search"]["brave_key"], SAVED_SECRET, "the dashboard's view of the company hides it too");
         // The screen saves what it was shown: the real key stays.
         let saved = put_settings(State(state.clone()), Extension(crate::auth::Caller::local()), Json(shown)).await.unwrap().0;
         assert_eq!(saved.search.brave_key, SAVED_SECRET);

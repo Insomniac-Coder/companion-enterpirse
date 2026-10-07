@@ -4,9 +4,9 @@ import { cancelLoad, getLoadProgress, getMetrics, type InferenceStatus, type Loa
 import { Button, IconButton, Lamp, Meter, PopDivider, PopItem, PopLabel, Popover } from '../ui/primitives';
 import { Icon } from '../ui/Icon';
 import { isReading, type ResourceSample } from './resourceTelemetry';
-import StartScripts from './StartScripts';
-
-export type MachineActivity = 'idle' | 'generating' | 'agent' | 'waiting';
+import StartScripts from '../components/StartScripts';
+import { machineState, type MachineActivity, type RigState } from '../services/workbench';
+export { machineState, type MachineActivity, type RigState };
 
 type Props = {
   models: ModelMeta[];
@@ -31,18 +31,6 @@ type Props = {
   notify: (kind: 'info' | 'error', text: string) => void;
 };
 
-export type RigState = 'off' | 'ready' | 'caution' | 'live' | 'error';
-
-/** The single machine state the whole UI agrees on (lamp colour, labels). */
-export function machineState(backendUp: boolean | null, loading: boolean, activity: MachineActivity, running: boolean): { state: RigState; label: string } {
-  if (backendUp === false) return { state: 'error', label: 'Runtime offline' };
-  if (loading) return { state: 'caution', label: 'Loading model' };
-  if (activity === 'waiting') return { state: 'caution', label: 'Needs your approval' };
-  if (activity === 'generating') return { state: 'live', label: 'Generating' };
-  if (activity === 'agent') return { state: 'live', label: 'Agent working' };
-  if (running) return { state: 'ready', label: 'Ready' };
-  return { state: 'off', label: 'No model loaded' };
-}
 
 const fmtContext = (tokens: number | null | undefined) => !tokens ? '' : tokens >= 1000 ? `${Math.round(tokens / 102.4) / 10}K` : `${tokens}`;
 const gb = (value: number | null | undefined, digits = 1) => typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '—';

@@ -348,7 +348,7 @@ fn may_manage(caller: &Caller, group: Option<&str>) -> Result<(), ApiError> {
     }
 }
 
-/// Every group's values and every lock (platform admins and auditors).
+/// The company's values (secrets hidden), every group's, and every lock (platform admins and auditors).
 pub async fn overview(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let pool = state.storage.pool();
     let storage_error = |e: sqlx::Error| ApiError::internal(format!("storage error: {e}"));
@@ -361,6 +361,7 @@ pub async fn overview(State(state): State<AppState>) -> Result<Json<Value>, ApiE
         .await
         .map_err(storage_error)?;
     Ok(Json(serde_json::json!({
+        "company": crate::api::without_secrets(state.settings.read().await.clone()),
         "groups": groups.iter().map(|row| serde_json::json!({
             "group_id": row.get::<String, _>("group_id"),
             "name": row.get::<String, _>("name"),

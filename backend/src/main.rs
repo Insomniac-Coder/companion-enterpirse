@@ -163,6 +163,11 @@ async fn main() {
             tracing::error!(
                 "cannot open the database: {e}; startup stopped to protect persistent history. Check COMPANION_DATABASE_URL and that PostgreSQL is running."
             );
+            // The private server was started for this run; nothing else uses it (one a running
+            // Companion uses stays up).
+            if let Some(cluster) = private_database.as_ref().filter(|cluster| cluster.started) {
+                cluster.stop();
+            }
             std::process::exit(1);
         }
     };
@@ -297,8 +302,16 @@ async fn private_database(cfg: &config::AppConfig) -> Result<(String, pgsql::Clu
         &cfg.data_dir.join("logs").join("postgres.log"),
         &[],
     )?;
-    let url = cluster.companion_database().await.map_err(|e| format!("cannot open its database: {e}"))?;
-    Ok((url, cluster))
+    match cluster.companion_database().await {
+        Ok(url) => Ok((url, cluster)),
+        Err(e) => {
+            // Started for nothing: stop it again (one a running Companion uses stays up).
+            if cluster.started {
+                cluster.stop();
+            }
+            Err(format!("cannot open its database: {e}"))
+        }
+    }
 }
 
 /// Why the process is being asked to stop.

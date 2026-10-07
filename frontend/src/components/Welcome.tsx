@@ -1,7 +1,8 @@
 import type { ModelMeta, Workspace } from '../services/api';
 import { Button, Lamp } from '../ui/primitives';
 import { Icon, type IconName } from '../ui/Icon';
-import { useMachineSample, type RigState } from './Rig';
+import { type RigState } from '../services/workbench';
+import { serverUrl } from '../services/server.ts';
 import StartScripts from './StartScripts';
 
 type Starter = { icon: IconName; label: string; description: string; text: string };
@@ -19,7 +20,6 @@ const CODE_STARTERS: Starter[] = [
 ];
 
 const fmtContext = (tokens: number | null | undefined) => !tokens ? null : tokens >= 1000 ? `${Math.round(tokens / 102.4) / 10}K context` : `${tokens} context`;
-const shortGpu = (name: string | null | undefined) => name ? name.replace(/^NVIDIA\s+/i, '').replace(/^GeForce\s+/i, '') : null;
 
 export default function Welcome({
   mode,
@@ -32,8 +32,6 @@ export default function Welcome({
   branch,
   onStarter,
   canLoad,
-  onLoad,
-  onChooseModel,
   onChooseProject,
   onPickProject,
 }: {
@@ -46,14 +44,11 @@ export default function Welcome({
   workspaces: Workspace[];
   branch: string;
   onStarter: (text: string) => void;
-  /** False for a person who is not a platform admin on a server with sign-in. */
+  /** A platform admin: models are loaded from the dashboard. */
   canLoad: boolean;
-  onLoad: () => void;
-  onChooseModel: () => void;
   onChooseProject: () => void;
   onPickProject: (workspace: Workspace) => void;
 }) {
-  const { gpuName } = useMachineSample();
   const starters = mode === 'code' ? CODE_STARTERS : CHAT_STARTERS;
   const model = loaded ?? selected;
   const spec = model ? [model.parameters && model.parameters !== 'unknown' ? model.parameters : null, model.quantization].filter(Boolean).join(' · ') : '';
@@ -117,7 +112,6 @@ export default function Welcome({
             <div className="welcome-readout">
               {spec && <span className="readout"><Icon name="layers" size={14} />{spec}</span>}
               {fmtContext(contextSize) && <span className="readout"><Icon name="gauge" size={14} />{fmtContext(contextSize)}</span>}
-              {shortGpu(gpuName) && <span className="readout"><Icon name="cpu" size={14} />{shortGpu(gpuName)}</span>}
               <span className="readout"><Icon name="lock" size={14} />Nothing leaves this PC</span>
             </div>
             <p className="welcome-lede">Think something through, draft, or make sense of a file.</p>
@@ -125,12 +119,11 @@ export default function Welcome({
         ) : (
           <>
             <div className="welcome-eyebrow eyebrow"><Lamp state="off" /> No model loaded</div>
-            <h1 className="welcome-title">{canLoad ? 'Load a model to begin.' : 'No model is running yet.'}</h1>
+            <h1 className="welcome-title">No model is running yet.</h1>
             {canLoad ? <>
-              <p className="welcome-lede">{selected ? <>Companion runs <strong style={{ color: 'var(--text)' }}>{selected.name}</strong> on your own hardware. Loading moves it into memory; nothing is sent anywhere.</> : 'Add a GGUF model to the models folder, then scan for it on the Models page.'}</p>
+              <p className="welcome-lede">Models are loaded from the dashboard, where you also add and check them.</p>
               <div className="welcome-actions">
-                {selected && <Button variant="primary" size="lg" icon="power" onClick={onLoad}>Load {selected.name}</Button>}
-                <Button variant="ghost" size="lg" icon="layers" onClick={onChooseModel}>{selected ? 'Choose another model' : 'Open Models'}</Button>
+                <Button variant="primary" size="lg" icon="layers" onClick={() => { window.location.href = serverUrl('/admin/#models'); }}>Open the dashboard</Button>
               </div>
             </> : <p className="welcome-lede">A platform admin of this server loads models for everyone. You can start once one is running.</p>}
           </>

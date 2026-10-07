@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Button, Dialog } from '../ui/primitives';
+import { serverUrl } from '../services/server.ts';
 
 // Attachment viewer: image preview with zoom, or the extracted text.
 export default function AttachmentViewer({
@@ -27,7 +28,7 @@ export default function AttachmentViewer({
       {isImage ? (
         <img
           className={`viewer-image${zoom ? ' zoom' : ''}`}
-          src={`/api/conversations/${convId}/attachments/${att.id}/file`}
+          src={serverUrl(`/api/conversations/${convId}/attachments/${att.id}/file`)}
           alt={att.filename}
           onError={() => notify('error', 'Preview unavailable — the file is still on disk.')}
         />

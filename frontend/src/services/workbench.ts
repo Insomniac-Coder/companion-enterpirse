@@ -178,10 +178,23 @@ export function validatedPanelWidth(value: unknown): number {
   return Number.isFinite(width) && width >= 320 ? Math.min(640, width) : 400;
 }
 /** One source for utility navigation and keyboard search. */
+/** The user app's pages beside the conversation. Models, resources, the runtime and tools are the
+ *  dashboard's (src/admin/). */
 export const WORKBENCH_DESTINATIONS = [
-  { id: 'models', label: 'Models' },
-  { id: 'resources', label: 'Resources' },
-  { id: 'system', label: 'Runtime & diagnostics' },
-  { id: 'tools', label: 'Tools & plugins' },
   { id: 'settings', label: 'Settings' },
 ] as const;
+
+export type MachineActivity = 'idle' | 'generating' | 'agent' | 'waiting';
+
+export type RigState = 'off' | 'ready' | 'caution' | 'live' | 'error';
+
+/** The single machine state the whole UI agrees on (lamp colour, labels). */
+export function machineState(backendUp: boolean | null, loading: boolean, activity: MachineActivity, running: boolean): { state: RigState; label: string } {
+  if (backendUp === false) return { state: 'error', label: 'Runtime offline' };
+  if (loading) return { state: 'caution', label: 'Loading model' };
+  if (activity === 'waiting') return { state: 'caution', label: 'Needs your approval' };
+  if (activity === 'generating') return { state: 'live', label: 'Generating' };
+  if (activity === 'agent') return { state: 'live', label: 'Agent working' };
+  if (running) return { state: 'ready', label: 'Ready' };
+  return { state: 'off', label: 'No model loaded' };
+}

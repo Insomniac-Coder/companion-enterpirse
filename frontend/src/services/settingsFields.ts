@@ -1,3 +1,4 @@
+import { serverFetch } from './server.ts';
 // What a person may do with each setting (Phase 1, task 6): the server says which fields are theirs
 // to change, which the company or a group locked, and why.
 
@@ -13,7 +14,7 @@ export interface SettingFieldInfo {
 export type SettingFields = Record<string, SettingFieldInfo>;
 
 export async function getSettingFields(): Promise<SettingFields> {
-  const r = await fetch('/api/settings/fields');
+  const r = await serverFetch('/api/settings/fields');
   if (!r.ok) throw new Error(`request failed: ${r.status}`);
   return r.json();
 }

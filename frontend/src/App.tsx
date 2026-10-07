@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import MessageView from './components/MessageView';
 import PrepareBanner from './components/PrepareBanner';
-import ResourcesPanel from './components/ResourcesPanel';
 import SettingsPanel from './components/SettingsPanel';
 import Toasts, { pushToast, type Toast } from './components/Toasts';
 import { ContextGauge } from './components/ContextBar';
@@ -19,32 +18,29 @@ import ProjectLauncher from './components/ProjectLauncher';
 import AgentChatProgress from './components/AgentChatProgress';
 import CommandPalette, { type QuickAction } from './components/CommandPalette';
 import WorkStatus from './components/WorkStatus';
-import Rig, { machineState, type MachineActivity } from './components/Rig';
 import Welcome from './components/Welcome';
-import ModelsPage from './components/ModelsPage';
-import RuntimePage from './components/RuntimePage';
-import ToolsPage from './components/ToolsPage';
 import { PERMISSION_MODE_DESCRIPTIONS, PERMISSION_MODE_LABELS, PROJECT_BOUNDARY_DESCRIPTION, SEARCH_PERMISSION_DESCRIPTION } from './components/permissionCopy';
 import { VisibleOutputMeter, type GenerationPhase, type OutputTiming } from './services/outputTiming';
-import { ADMIN_ONLY_NOTE, isPlatformAdmin, signOut, type Me } from './services/account';
+import { isPlatformAdmin, signOut, type Me } from './services/account';
+import { serverUrl } from './services/server.ts';
 import { attachmentTooLarge } from './services/settingsFields';
 import { applyAgentContext } from './services/contextUsage';
 import { currentActivitySnapshot, parseActivityStart, visibleWorkActivity } from './services/workElapsed';
 import { groupActivity, groupSessionsByProject, lastSessionKey, projectGroupOpen, projectPick, projectRemoval, type ProjectGroup } from './services/projectSessions';
 import { availablePermissionModes, codeSessionsReadOnly, firstLoadNotice, READ_ONLY_MODE_REASON } from './services/tooling';
 import { initialHealth, modelStoppedDetail, nextHealth, RECHECK_MS, shouldRecheck, type RuntimeHealth } from './services/runtimeHealth';
-import { APPROVE_PLAN_MESSAGE, autoTitle, cappedPermissionMode, matchesShortcut, modesWithin, nextPermissionMode, PERMISSION_MODE_SETTLE_MS, PERMISSION_MODES, PermissionModeSaver, selectAvailableModel, shouldStartAgent, updateMessage, WORKBENCH_DESTINATIONS } from './services/workbench';
+import { APPROVE_PLAN_MESSAGE, autoTitle, cappedPermissionMode, machineState, type MachineActivity, matchesShortcut, modesWithin, nextPermissionMode, PERMISSION_MODE_SETTLE_MS, PERMISSION_MODES, PermissionModeSaver, selectAvailableModel, shouldStartAgent, updateMessage, WORKBENCH_DESTINATIONS } from './services/workbench';
 import { Button, Dialog, IconButton, Kbd, Lamp, Notice, PopDivider, PopItem, PopLabel, Popover, Toggle } from './ui/primitives';
 import { Icon, type IconName } from './ui/Icon';
 import {
-  agentRuns, saveLogsArchive, compactConversation, createConversation, deleteConversation, deleteModel, deleteWorkspace, discardStale, editMessage, forkConversation,
-  getContext, getConversationMetrics, getMessages, getRecovery, getPermissionMode, getSettings, inferenceStart,
-  inferenceStatus, listCommands, listConversations, listDownloads,
+  agentRuns, saveLogsArchive, compactConversation, createConversation, deleteConversation, deleteWorkspace, discardStale, editMessage, forkConversation,
+  getContext, getConversationMetrics, getMessages, getRecovery, getPermissionMode, getSettings,
+  inferenceStatus, listCommands, listConversations,
   listModels, listSessions, listTools, listWorkspaces, patchSession, stopAgent,
-  loadModel, patchConversation, shareConversation,
-  setPermissionMode as updatePermissionMode, startAgent, stopChat, streamChat, unloadModels,
-  systemInfo, uploadAttachment, modelDetail,
-  type AgentEvent, type CommandItem, type ContextInfo, type Conversation, type DownloadInfo,
+  patchConversation, shareConversation,
+  setPermissionMode as updatePermissionMode, startAgent, stopChat, streamChat,
+  uploadAttachment, modelDetail,
+  type AgentEvent, type CommandItem, type ContextInfo, type Conversation,
   type InferenceStatus, type ModelMeta, type PermissionMode, type RecoveryInfo, type SessionInfo,
   type StreamUsage, type PersistedMetric, type ToolDescriptor, type Workspace,
 } from './services/api';
@@ -52,14 +48,10 @@ import {
 type Msg = { id: string; role: 'user' | 'assistant' | 'tool'; text: string; time: string; activities?: AgentEvent[] };
 
 type Theme = 'dark' | 'light' | 'system';
-type PageId = 'models' | 'resources' | 'system' | 'tools' | 'settings';
+type PageId = 'settings';
 type Perf = { tps: number | null; timing?: OutputTiming | null; legacy: boolean; model?: string };
 
 const PAGE_META: Record<PageId, { title: string; description: string; icon: IconName }> = {
-  models: { title: 'Models', description: 'Load, inspect and add GGUF models on this PC', icon: 'layers' },
-  resources: { title: 'Resources', description: 'Live processor, memory and graphics readings for the whole machine', icon: 'activity' },
-  system: { title: 'Runtime & diagnostics', description: 'The inference runtime, health checks and speed', icon: 'gauge' },
-  tools: { title: 'Tools & plugins', description: 'Every action Companion can take and the approval it needs', icon: 'terminal' },
   settings: { title: 'Settings', description: 'Appearance, assistant behaviour, search and performance', icon: 'sliders' },
 };
 
@@ -85,12 +77,13 @@ function shortcutLabel(binding: string) {
 }
 
 export default function App({ me }: { me?: Me }) {
-  // On a server with sign-in, the shared machinery (models, downloads, company settings, system
-  // checks) is a platform admin's (roles.rs). The permission mode is each person's own.
+  // Models, downloads, company settings and system checks are in the dashboard (src/admin/), a
+  // platform admin's; an auditor reads it. The permission mode is each person's own.
   const admin = isPlatformAdmin(me);
+  const dashboard = admin || !!me?.roles?.includes('auditor');
   // The person's attachment limits (company or group), checked here before an upload.
   const [attachLimits, setAttachLimits] = useState<{ max_attach_mb: number; max_image_mb: number } | undefined>(undefined);
-  const destinations = admin ? WORKBENCH_DESTINATIONS : WORKBENCH_DESTINATIONS.filter(({ id }) => id === 'settings');
+  const destinations = WORKBENCH_DESTINATIONS;
   const [tab, setTab] = useState<'chat' | PageId>('chat');
   const [mode, setMode] = useState<'chat' | 'code'>(() => (localStorage.getItem('companion.mode') as any) || 'chat');
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -114,10 +107,8 @@ export default function App({ me }: { me?: Me }) {
   const [busy, setBusy] = useState(false);
   const [chatActivity, setChatActivity] = useState<{ conversationId: string; startedAt: number } | null>(null);
   const [statusLine, setStatusLine] = useState('');
-  const [sys, setSys] = useState<any>(null);
   const [inf, setInf] = useState<InferenceStatus | null>(null);
   const [usage, setUsage] = useState<StreamUsage | null>(null);
-  const [downloads, setDownloads] = useState<DownloadInfo[]>([]);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [ctx, setCtx] = useState<ContextInfo | null>(null);
   const [editing, setEditing] = useState<{ mid: string; draft: string } | null>(null);
@@ -140,7 +131,6 @@ export default function App({ me }: { me?: Me }) {
   const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [showShare, setShowShare] = useState(false);
   const [focusRun, setFocusRun] = useState<string | null>(null);
-  const [guard, setGuard] = useState<{ kind: 'load' | 'start'; id: string; detail: string } | null>(null);
   const [confirmState, setConfirmState] = useState<{ title: string; body: string; action: string; icon?: IconName; onConfirm: () => void } | null>(null);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [collapsed, setCollapsed] = useState(() => typeof window !== 'undefined' && window.matchMedia('(max-width: 860px)').matches);
@@ -162,7 +152,6 @@ export default function App({ me }: { me?: Me }) {
   const [sessionMenuOpen, setSessionMenuOpen] = useState(false);
   const [permOpen, setPermOpen] = useState(false);
   const [registry, setRegistry] = useState<ToolDescriptor[]>([]);
-  const [loadingModel, setLoadingModel] = useState(false);
   const [agentBusy, setAgentBusy] = useState(false);
   const [agentActivity, setAgentActivity] = useState<{ conversationId: string; runId: string; startedAt: number | null } | null>(null);
   const pendingAgentStarts = useRef(new Set<string>());
@@ -283,13 +272,6 @@ export default function App({ me }: { me?: Me }) {
       // stale id in the selector: it would make Load/Start send an id the
       // backend can no longer resolve.
       setModelId((current) => selectAvailableModel(next, current, preferredDefaultModel.current));
-    } catch { /* backend offline */ }
-  }
-
-  async function refreshDownloads() {
-    if (!admin) return;
-    try {
-      setDownloads(same(await listDownloads()));
     } catch { /* backend offline */ }
   }
 
@@ -429,13 +411,11 @@ export default function App({ me }: { me?: Me }) {
 
   useEffect(() => {
     refreshModels();
-    refreshDownloads();
     refreshConvs();
     refreshWorkspaces();
     refreshRegistry();
     refreshSessions();
     getRecovery().then(setRecovery).catch(() => setRecovery(null));
-    const t = setInterval(refreshDownloads, 2000);
     // Every status check's outcome goes through runtimeHealth: a failure is
     // checked again within seconds, and only two in a row say the backend is
     // not answering.
@@ -455,8 +435,7 @@ export default function App({ me }: { me?: Me }) {
     const modelRefresh = setInterval(() => { if (!document.hidden) { void refreshModels(); checkRuntime(); } }, 10000);
     // Session activity drives the live lamps in the list; keep it fresh but cheap.
     const sessionRefresh = setInterval(() => { if (!document.hidden) void refreshSessions(); }, 6000);
-    systemInfo().then((v) => { setSys(v); noteHealth(true); }).catch(() => { setSys(null); noteHealth(false); });
-    inferenceStatus().then(setInf).catch(() => setInf(null));
+    checkRuntime();
     getPermissionMode().then((result) => {
       modeSaver.current.reset(result.mode);
       setPermissionModeState(result.mode);
@@ -464,7 +443,7 @@ export default function App({ me }: { me?: Me }) {
       localStorage.setItem('companion.permissionMode', result.mode);
     }).catch(() => notify('warning', 'Could not read the saved approval policy. Reconnect to the local runtime before changing it.'))
       .finally(() => setPermissionModeBusy(false));
-    return () => { clearInterval(t); clearInterval(modelRefresh); clearInterval(sessionRefresh); if (recheck !== null) clearTimeout(recheck); };
+    return () => { clearInterval(modelRefresh); clearInterval(sessionRefresh); if (recheck !== null) clearTimeout(recheck); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1130,18 +1109,6 @@ export default function App({ me }: { me?: Me }) {
     });
   }
 
-  function confirmDeleteModel(model: ModelMeta) {
-    setConfirmState({
-      title: `Delete ${model.name}?`,
-      body: 'This permanently removes the model file from the models folder. Conversations that used it are kept.',
-      action: 'Delete model',
-      icon: 'trash',
-      onConfirm: () => {
-        deleteModel(model.id).then(() => { notify('success', `Deleted ${model.name}.`); refreshModels(); }).catch((e) => notify('error', e.message));
-      },
-    });
-  }
-
   async function setPriority(p: string) {
     if (!convId) return;
     try {
@@ -1165,151 +1132,6 @@ export default function App({ me }: { me?: Me }) {
     loadedModel &&
     activeConv.last_model !== loadedModel
   );
-
-  /** Load/start with the agent-execution guard. */
-  async function guardedSwitch(kind: 'load' | 'start', id: string, force: boolean) {
-    setLoadingModel(true);
-    try {
-      // A load that runs the model's tool check takes a few seconds longer.
-      const checking = firstLoadNotice(models.find((model) => model.id === id));
-      if (checking) notify('info', checking);
-      // The load reports what the person should know about it (a CPU
-      // fallback, a context larger than the model supports).
-      const started: { notices?: string[]; tooling_notice?: string | null; tooling?: { can_write?: boolean } | null } | undefined = kind === 'load'
-        ? await loadModel(id, force)
-        : await inferenceStart(id, force);
-      await refreshModels();
-      const status = await inferenceStatus();
-      setInf(status);
-      const name = models.find((model) => model.id === id)?.name ?? id;
-      if (!force) notify('success', kind === 'load' ? `${name} is loaded and ready.` : 'Inference started.');
-      const notices = started?.notices ?? [];
-      for (const notice of notices) notify('warning', notice);
-      if (started?.tooling_notice) notify(started.tooling?.can_write === false || !started.tooling ? 'warning' : 'info', started.tooling_notice);
-      if (status.runtime_notice && !notices.includes(status.runtime_notice)) notify('info', status.runtime_notice);
-    } catch (e: any) {
-      if (e?.status === 409 && !force) {
-        setGuard({ kind, id, detail: e.message });
-      } else {
-        notify('error', e.message);
-      }
-    } finally {
-      setLoadingModel(false);
-    }
-  }
-
-  async function unloadSelectedModel() {
-    setLoadingModel(true);
-    try {
-      await unloadModels();
-      await refreshModels();
-      setInf(await inferenceStatus());
-      notify('info', 'Model ejected. GPU memory is free again.');
-    } catch (e: any) {
-      notify('error', e?.message ?? 'Could not unload the model.');
-    } finally {
-      setLoadingModel(false);
-    }
-  }
-
-  async function reloadSelectedModel() {
-    if (!modelId) return;
-    setLoadingModel(true);
-    try {
-      await unloadModels();
-    } catch { /* loading below reports the useful error */ }
-    setLoadingModel(false);
-    await guardedSwitch('load', modelId, false);
-  }
-
-  // Loading, switching and ejecting interrupt whatever the model is doing for
-  // you. Starting a model when none is running is safe in one click; anything
-  // that replaces or removes a running model asks first.
-  function runningModel() {
-    return inf?.running ? models.find((model) => model.loaded) : undefined;
-  }
-
-  function requestLoad(id: string) {
-    if (!admin) {
-      notify('info', `Models are loaded for everyone on this server. ${ADMIN_ONLY_NOTE}`);
-      return;
-    }
-    const current = runningModel();
-    const target = models.find((model) => model.id === id);
-    if (current?.id === id) return;
-    if (current) {
-      setConfirmState({
-        title: `Switch to ${target?.name ?? id}?`,
-        body: `${current.name} will be unloaded first, so it stops answering while ${target?.name ?? 'the new model'} loads. Your conversations stay as they are; the next reply rebuilds its context with the new model.`,
-        action: 'Switch model',
-        icon: 'refresh',
-        onConfirm: () => { setModelId(id); void guardedSwitch('load', id, false); },
-      });
-      return;
-    }
-    setModelId(id);
-    void guardedSwitch('load', id, false);
-  }
-
-  function chooseModel(id: string) {
-    if (runningModel()) requestLoad(id);
-    else setModelId(id);
-  }
-
-  function requestEject() {
-    const current = runningModel();
-    setConfirmState({
-      title: `Eject ${current?.name ?? 'the model'}?`,
-      body: 'This frees its memory. The model has to load again before it can answer your next message.',
-      action: 'Eject model',
-      icon: 'eject',
-      onConfirm: () => void unloadSelectedModel(),
-    });
-  }
-
-  function requestReload() {
-    const current = runningModel();
-    setConfirmState({
-      title: `Reload ${current?.name ?? 'the model'}?`,
-      body: 'It is unavailable for a moment while it loads again. Use this if replies have become stuck or settings changed.',
-      action: 'Reload model',
-      icon: 'refresh',
-      onConfirm: () => void reloadSelectedModel(),
-    });
-  }
-
-  async function guardWait() {
-    if (!guard) return;
-    const g = guard;
-    setGuard(null);
-    notify('info', 'Waiting for the agent to reach a safe point…');
-    for (let i = 0; i < 120; i++) {
-      try {
-        const runs = await agentRuns();
-        const live = runs.filter((r) => !['COMPLETED', 'FAILED', 'CANCELLED'].includes(r.state));
-        if (live.length === 0) break;
-      } catch { /* keep waiting */ }
-      await new Promise((r) => setTimeout(r, 2000));
-    }
-    void guardedSwitch(g.kind, g.id, false);
-  }
-
-  async function guardStopSwitch() {
-    if (!guard) return;
-    const g = guard;
-    setGuard(null);
-    try {
-      const runs = await agentRuns();
-      for (const r of runs) {
-        if (!['COMPLETED', 'FAILED', 'CANCELLED'].includes(r.state)) {
-          await stopAgent(r.id).catch(() => {});
-        }
-      }
-      await guardedSwitch(g.kind, g.id, true);
-    } catch (e: any) {
-      notify('error', e.message);
-    }
-  }
 
   function stopAgentRuns() {
     void agentRuns().then(async (runs) => {
@@ -1349,7 +1171,7 @@ export default function App({ me }: { me?: Me }) {
       : anySessionWaiting ? 'waiting'
         : anySessionLive ? 'agent'
           : 'idle';
-  const machine = machineState(backendUp, loadingModel, machineActivity, !!loadedMeta);
+  const machine = machineState(backendUp, false, machineActivity, !!loadedMeta);
   const lastReplyTps = useMemo(() => {
     const last = [...msgs].reverse().find((message) => message.role === 'assistant' && perfMap[message.id]?.tps != null);
     return last ? perfMap[last.id].tps : null;
@@ -1362,12 +1184,11 @@ export default function App({ me }: { me?: Me }) {
     { id: 'new', group: 'Actions', icon: 'plus', label: mode === 'code' ? 'New task' : 'New chat', detail: mode === 'code' ? 'Start a code session in the current project' : 'Start a fresh conversation', run: () => void newChat() },
     { id: 'project', group: 'Actions', icon: 'folderPlus', label: 'Open a project', detail: 'Choose the files your coding agent can access', run: () => setProjectLauncherOpen(true) },
     { id: 'panel', group: 'Actions', icon: 'panelRight', label: rightOpen ? 'Hide inspector' : 'Show inspector', detail: 'Activity, files and context beside the conversation', run: () => { setTab('chat'); setRightOpen((open) => !open); } },
-    ...(selectedModel && !modelReady ? [{ id: 'load-model', group: 'Actions', icon: 'power' as IconName, label: `Load ${selectedModel.name}`, detail: 'Move the selected model into memory', run: () => requestLoad(selectedModel.id) }] : []),
-    ...(loadedMeta ? [{ id: 'eject-model', group: 'Actions', icon: 'eject' as IconName, label: `Eject ${loadedMeta.name}`, detail: 'Unload the model and free GPU memory', run: () => requestEject() }] : []),
     ...(['dark', 'light', 'system'] as Theme[]).filter((value) => value !== theme).map((value) => ({ id: `theme-${value}`, group: 'Actions', icon: (value === 'dark' ? 'moon' : value === 'light' ? 'sun' : 'monitor') as IconName, label: value === 'system' ? 'Match system theme' : `Use ${value} theme`, detail: `Current theme: ${theme}`, run: () => setTheme(value) })),
     { id: 'mode-chat', group: 'Go to', icon: 'chat', label: 'Chat', detail: 'Conversations', run: () => switchMode('chat') },
     { id: 'mode-code', group: 'Go to', icon: 'code', label: 'Code', detail: 'Project sessions', run: () => switchMode('code') },
     ...destinations.map(({ id, label }) => ({ id, group: 'Go to', icon: PAGE_META[id].icon, label, detail: PAGE_META[id].description, run: () => { setTab(id); setMobileNav(false); } })),
+    ...(dashboard ? [{ id: 'dashboard', group: 'Go to', icon: 'layers' as IconName, label: 'Dashboard', detail: 'Models, people, company settings and the audit records', run: () => { window.location.href = serverUrl('/admin/'); } }] : []),
     ...convs.map((conversation) => ({ id: conversation.id, group: 'Sessions', icon: (conversation.mode === 'code' ? 'code' : 'chat') as IconName, label: conversation.title || 'Untitled', detail: conversation.mode === 'code' ? `Code session${workspaces.find((w) => w.id === conversation.workspace) ? ` · ${workspaces.find((w) => w.id === conversation.workspace)!.name}` : ''}` : 'Conversation', run: () => void selectConv(conversation.id) })),
   ];
 
@@ -1614,6 +1435,12 @@ export default function App({ me }: { me?: Me }) {
               {!rail && <span>{label}</span>}
             </button>
           ))}
+          {dashboard && (
+            <a className="sb-link" href={serverUrl('/admin/')} aria-label="Dashboard" data-tip={rail ? 'Dashboard' : undefined} data-tip-side={rail ? 'right' : undefined}>
+              <Icon name="layers" size={16} />
+              {!rail && <span>Dashboard</span>}
+            </a>
+          )}
           {me?.sign_in && (
             <div className="sb-person" title={me.email || me.name}>
               <span className="sb-person-initial" aria-hidden="true">{(me.name || '?').slice(0, 1).toUpperCase()}</span>
@@ -1623,26 +1450,6 @@ export default function App({ me }: { me?: Me }) {
           )}
         </nav>
 
-        <Rig
-          models={models}
-          modelId={modelId}
-          inf={inf}
-          backendUp={backendUp}
-          loadingModel={loadingModel}
-          activity={machineActivity}
-          liveTps={liveTps}
-          lastTps={lastReplyTps}
-          phaseLabel={busy ? (generationPhase === 'compacting' ? 'Compacting context…' : generationPhase === 'thinking' ? 'Thinking…' : generationPhase === 'responding' ? 'Writing…' : 'Reading your message…') : agentBusy ? 'Agent working…' : undefined}
-          collapsed={rail}
-          onSelect={chooseModel}
-          canManage={admin}
-          onLoad={requestLoad}
-          onUnload={requestEject}
-          onReload={requestReload}
-          onOpenModels={() => { setTab('models'); setMobileNav(false); }}
-          onOpenResources={() => { setTab('resources'); setMobileNav(false); }}
-          notify={(kind, text) => notify(kind, text)}
-        />
       </aside>
 
       {projectToRemove && (
@@ -1784,13 +1591,13 @@ export default function App({ me }: { me?: Me }) {
             Two checks in a row got no answer. If its window was closed or the computer restarted, start it again with <StartScripts />, then reload this page. Your conversations are safe on disk.
           </Notice>
         )}
-        {backendUp === true && inf?.stopped && inf.stopped !== dismissedStop && !loadingModel && (
+        {backendUp === true && inf?.stopped && inf.stopped !== dismissedStop && (
           <Notice
             tone="error"
             className="global-notice"
             title="The model server stopped"
             onDismiss={() => setDismissedStop(inf.stopped ?? null)}
-            actions={modelId ? <Button size="sm" variant="primary" icon="power" onClick={() => void guardedSwitch('load', modelId, false)}>Load it again</Button> : undefined}
+            actions={admin ? <Button size="sm" variant="primary" icon="layers" onClick={() => { window.location.href = serverUrl('/admin/#models'); }}>Open the dashboard</Button> : undefined}
           >
             {modelStoppedDetail(inf.stopped)} Companion itself is still running and your conversations are safe. The model server’s output is in logs/model-server.log in Companion’s data folder.
           </Notice>
@@ -1827,8 +1634,6 @@ export default function App({ me }: { me?: Me }) {
                   branch={branch}
                   onStarter={(text) => { setInput(text); requestAnimationFrame(() => composerRef.current?.focus()); }}
                   canLoad={admin}
-                  onLoad={() => { if (selectedModel) requestLoad(selectedModel.id); }}
-                  onChooseModel={() => setTab('models')}
                   onChooseProject={() => setProjectLauncherOpen(true)}
                   onPickProject={(workspace) => void changeWorkspace(workspace.id, true)}
                 />
@@ -1933,14 +1738,6 @@ export default function App({ me }: { me?: Me }) {
                     lastModelAvailable={models.some((model) => model.id === activeConv.last_model)}
                     onPrepared={() => refreshConvs(activeConv.id)}
                     onDismiss={() => setPrepareDismissed((items) => ({ ...items, [activeConv.id]: true }))}
-                    onSwitchBack={() => {
-                      const previous = activeConv.last_model ?? '';
-                      if (!models.some((model) => model.id === previous)) {
-                        notify('warning', `The previous model '${previous}' is no longer installed. Prepare this session for ${loadedModel} instead.`);
-                        return;
-                      }
-                      requestLoad(previous);
-                    }}
                     notify={(k, t) => (k === 'error' ? notify('error', t) : notify(k === 'success' ? 'success' : 'info', t))}
                   />
                 )}
@@ -1979,7 +1776,7 @@ export default function App({ me }: { me?: Me }) {
                     onKeyDown={composerKey}
                     placeholder={dragOver ? 'Drop to attach' : mode === 'code' ? 'Ask, plan, or describe a change… (Shift+Tab: mode)' : 'Ask anything, or drop a file…'}
                     aria-label="Message composer"
-                    disabled={loadingModel || agentBusy}
+                    disabled={agentBusy}
                   />
                   <div className="composer-bar">
                     <div className="composer-tools">
@@ -2013,13 +1810,12 @@ export default function App({ me }: { me?: Me }) {
                     </div>
                     <div className="composer-end">
                       {/* Status only. Loading or switching models never happens from the composer. */}
-                      {!loadedMeta && !loadingModel && backendUp !== false && !busy && !agentBusy && (
-                        <span className="composer-hint" title="Load a model from the panel at the bottom left">
+                      {!loadedMeta && backendUp !== false && !busy && !agentBusy && (
+                        <span className="composer-hint" title={admin ? 'Load one from the dashboard' : 'A platform admin loads models for everyone'}>
                           <Lamp state="off" />
                           No model loaded
                         </span>
                       )}
-                      {loadingModel && <span className="composer-hint"><Lamp state="caution" pulse />Loading model…</span>}
                       <ContextGauge ctx={ctx} onCompact={() => void doCompact()} compacting={compacting} />
                       {agentBusy ? (
                         <button type="button" className={`send-btn stop${machineActivity === 'waiting' ? ' paused' : ''}`} aria-label="Stop agent" data-tip="Stop agent" data-tip-side="top" onClick={stopAgentRuns}><Icon name="stop" size={16} /></button>
@@ -2030,9 +1826,9 @@ export default function App({ me }: { me?: Me }) {
                           type="button"
                           className={`send-btn${modelReady || input.trim().startsWith('/') ? '' : ' idle'}`}
                           onClick={() => void send()}
-                          disabled={loadingModel || !input.trim()}
+                          disabled={!input.trim()}
                           aria-label="Send message"
-                          data-tip={loadingModel ? 'Model is loading' : modelReady ? 'Send (Enter)' : 'Load a model to send'}
+                          data-tip={modelReady ? 'Send (Enter)' : 'No model is running'}
                           data-tip-side="top"
                         >
                           <Icon name="arrowUp" size={17} strokeWidth={2.2} />
@@ -2063,39 +1859,7 @@ export default function App({ me }: { me?: Me }) {
           </>
         )}
 
-        {tab === 'models' && (
-          <ModelsPage
-            models={models}
-            loadingModel={loadingModel}
-            downloads={downloads}
-            notify={notify}
-            onLoad={requestLoad}
-            onDelete={confirmDeleteModel}
-            refreshModels={refreshModels}
-            refreshDownloads={refreshDownloads}
-          />
-        )}
-
-        {tab === 'resources' && <ResourcesPanel notify={notify} />}
-
-        {tab === 'system' && (
-          <RuntimePage
-            inf={inf}
-            sys={sys}
-            modelId={modelId}
-            modelName={selectedModel?.name}
-            backendUp={backendUp}
-            notify={notify}
-            onStart={() => void guardedSwitch('start', modelId, false)}
-            setInf={setInf}
-            setSys={setSys}
-          />
-        )}
-
-        {tab === 'tools' && <ToolsPage registry={registry} wsId={wsId} notify={notify} onRefresh={() => void refreshRegistry()} />}
-
         {tab === 'settings' && <SettingsPanel setToasts={setToasts} me={me} />}
-        {tab !== 'settings' && tab !== 'chat' && !admin && <div className="page"><div className="page-inner"><p className="settings-capability-note">{ADMIN_ONLY_NOTE}</p></div></div>}
 
         {diffWs && <DiffModal wsId={diffWs} onClose={() => setDiffWs(null)} />}
       </div>
@@ -2125,21 +1889,6 @@ export default function App({ me }: { me?: Me }) {
             onAgentActiveChange={(active) => { if (active && !agentBusy && conversationRef.current === convId) refreshAgentActivity.current(); }}
           />
         </RightPanel>
-      )}
-
-      {guard && (
-        <Dialog
-          role="alertdialog"
-          icon="alert"
-          title="Switch models while the agent is working?"
-          description={guard.detail}
-          onClose={() => setGuard(null)}
-          footer={<>
-            <Button variant="ghost" onClick={() => setGuard(null)}>Cancel</Button>
-            <Button onClick={() => void guardWait()}>Wait for the current step</Button>
-            <Button variant="danger" icon="stop" onClick={() => void guardStopSwitch()}>Stop agent and switch</Button>
-          </>}
-        />
       )}
 
       {confirmState && (

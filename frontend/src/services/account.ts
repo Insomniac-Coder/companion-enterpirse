@@ -1,3 +1,4 @@
+import { serverFetch, serverUrl } from './server.ts';
 // Who is signed in, signing in and out, and API keys (Phase 1, task 3). An install without
 // sign-in (a laptop) answers /api/me with the local person and never asks anyone to sign in.
 
@@ -50,7 +51,7 @@ export function signInNeeded() {
 }
 
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
-  const r = await fetch(path, init);
+  const r = await serverFetch(path, init);
   if (r.status === 401) signInNeeded();
   if (!r.ok) {
     let message = `request failed: ${r.status}`;
@@ -65,7 +66,7 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
 
 /** The person this browser is signed in as, or null when sign-in is needed. Throws when the server cannot be reached. */
 export async function getMe(): Promise<Me | null> {
-  const r = await fetch('/api/me');
+  const r = await serverFetch('/api/me');
   if (r.status === 401) return null;
   if (!r.ok) throw new Error(`request failed: ${r.status}`);
   return r.json();
@@ -73,7 +74,7 @@ export async function getMe(): Promise<Me | null> {
 
 /** Where the browser goes to sign in, coming back to `returnTo` on this server. */
 export function signInUrl(returnTo: string): string {
-  return `/api/auth/login?return_to=${encodeURIComponent(returnTo)}`;
+  return serverUrl(`/api/auth/login?return_to=${encodeURIComponent(returnTo)}`);
 }
 
 export async function signOut(): Promise<void> {

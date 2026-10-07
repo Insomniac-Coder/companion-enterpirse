@@ -40,7 +40,10 @@ fork to drop the model weights (Git LFS); commit ids differ from the Companion's
   2026-10-07: `AppState::permissions_of(user)` / `permission_mode_of(user)` (capped by
   `agent.max_permission_mode`); one reply per `generation::reply_key`. Task 8 (audit records) done
   2026-10-07: `audit.rs`; anything that calls the model, runs a tool or searches must pass an
-  `audit::Who`. Next: task 9 (two apps from one set of screens, Graphite look).
+  `audit::Who`. Task 9 part 1 (2026-10-07): the dashboard (`frontend/admin/index.html`, `src/admin/`)
+  with people, company/group settings with locks, audit records, and the moved models, runtime,
+  resources and tools screens; every request through `services/server.ts`. Next: task 9 part 2, the
+  Graphite look for both apps (`docs/enterprise/ui/README.md`).
 - Everything below this section is the Companion's own handoff, kept as it was at the fork.
 
 # Handoff — start here

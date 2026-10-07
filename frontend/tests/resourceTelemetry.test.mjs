@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chartSegments, formatReading, isReading } from '../src/components/resourceTelemetry.ts';
+import { chartSegments, formatReading, isReading } from '../src/admin/resourceTelemetry.ts';
 import { highlightCode } from '../src/components/syntaxHighlighter.ts';
 
 const sample = (ts, cpu_pct) => ({ ts, cpu_pct, ram_used_gb: null, ram_total_gb: null, gpu_pct: null, vram_used_gb: null, vram_total_gb: null, gpu_temp_c: null, gpu_power_w: null });

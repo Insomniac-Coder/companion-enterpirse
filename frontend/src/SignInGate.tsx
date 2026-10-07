@@ -1,12 +1,12 @@
-import { useEffect, useState } from 'react';
-import App from './App';
+import { useEffect, useState, type ComponentType } from 'react';
 import SignIn from './components/SignIn';
 import { getMe, onSignInNeeded, type Me } from './services/account';
 
 /** Asks the server who this is before the app makes any request. A server with sign-in gets
  * the sign-in page until the browser is signed in, and again when the session ends. An install
- * without sign-in always answers with the local person, so it goes straight to the app. */
-export default function SignInGate() {
+ * without sign-in always answers with the local person, so it goes straight to the app. Both apps
+ * (the user app and the dashboard) start here. */
+export default function SignInGate({ app: App }: { app: ComponentType<{ me?: Me }> }) {
   const [state, setState] = useState<{ status: 'checking' | 'signed-out' | 'ready'; me?: Me; ended?: boolean }>({ status: 'checking' });
   useEffect(() => {
     let alive = true;

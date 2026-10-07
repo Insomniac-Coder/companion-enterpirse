@@ -3,7 +3,7 @@ import { modelDetail, recheckTooling, type ModelDetail, type ModelMeta } from '.
 import { Badge, Button, IconButton, Lamp } from '../ui/primitives';
 import { toolSupportLabel, documentKindsNote } from '../services/toolSupport';
 import { checkLabel, currentTooling, toolingBadge, toolingSummary } from '../services/tooling';
-import RecommendCard from './RecommendCard';
+import RecommendCard from '../components/RecommendCard';
 import CalibrationCard from './CalibrationCard';
 import OptimizeCard from './OptimizeCard';
 

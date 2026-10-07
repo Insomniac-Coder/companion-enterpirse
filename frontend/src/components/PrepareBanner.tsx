@@ -25,7 +25,8 @@ export default function PrepareBanner({
   loadedName?: string;
   lastModelAvailable: boolean;
   onPrepared: () => void;
-  onSwitchBack: () => void;
+  /** Load the session's previous model again; absent where loading happens in the dashboard. */
+  onSwitchBack?: () => void;
   onDismiss: () => void;
   notify: (kind: 'info' | 'success' | 'warning' | 'error', text: string) => void;
 }) {
@@ -66,9 +67,11 @@ export default function PrepareBanner({
       onDismiss={onDismiss}
       actions={<>
         <Button size="sm" variant="ghost" loading={running} onClick={prepare}>{running ? 'Checking…' : 'Check readiness'}</Button>
-        <Button size="sm" disabled={running || !lastModelAvailable} onClick={onSwitchBack} title={!lastModelAvailable ? 'This model is no longer installed' : 'Load the previous model'}>
-          {lastModelAvailable ? 'Switch back' : 'Previous model unavailable'}
-        </Button>
+        {onSwitchBack && (
+          <Button size="sm" disabled={running || !lastModelAvailable} onClick={onSwitchBack} title={!lastModelAvailable ? 'This model is no longer installed' : 'Load the previous model'}>
+            {lastModelAvailable ? 'Switch back' : 'Previous model unavailable'}
+          </Button>
+        )}
       </>}
     >
       {running && latest ? `${latest.stage} — ${latest.detail}` : warnings.length ? warnings.join(' ') : `${loadedName ?? loadedModel} will rebuild this conversation’s context on your next message. Nothing is lost.`}

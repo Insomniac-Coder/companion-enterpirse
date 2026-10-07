@@ -15,7 +15,7 @@ test('new chats and new code tasks are titled from their first message', () => {
 
 test('utility navigation keeps each destination once, with Settings last', () => {
   const ids = WORKBENCH_DESTINATIONS.map(({id}) => id);
-  assert.deepEqual(ids, ['models', 'resources', 'system', 'tools', 'settings']);
+  assert.deepEqual(ids, ['settings'], 'models, resources, the runtime and tools are in the dashboard');
   assert.equal(new Set(ids).size, ids.length);
 });
 

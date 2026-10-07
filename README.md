@@ -242,11 +242,17 @@ another backend).
 
 ### First steps in the app
 
-1. **Models**: select a model and **Load**. The app sizes the context and places the model on your
-   hardware automatically (see below).
+Companion is two apps from one set of screens: **Companion** itself (`/`), where people chat and
+work in projects, and the **dashboard** (`/admin/`, or **Dashboard** in Companion's sidebar), where
+the people running it manage models, the model server, people and roles, company and group settings
+with their locks, and read the audit records. A platform admin sees all of the dashboard, an auditor
+its people, settings and audit pages; others are not let in. On a laptop install you are both.
+
+1. **Dashboard > Models**: select a model and **Load**. The app sizes the context and places the
+   model on the hardware automatically (see below).
 2. **Chat** for conversation and attachments; **Code** for questions about a linked project folder,
    plans and agent tasks.
-3. **Settings > Performance** to choose how hardware is used.
+3. **Dashboard > Company settings > Performance** to choose how the hardware is used.
 
 ## Performance on your hardware
 
@@ -258,7 +264,7 @@ Settings > Performance offers **Auto**, **Fastest**, **Balanced**, **Light** and
   GPU is too small, which is much faster than splitting whole layers. The runtime's own memory fit
   decides, so it is exact for every architecture llama.cpp loads.
 - **Fastest / Balanced / Light** apply a profile measured for that model on your PC: open the model's
-  details on the Models page and choose **Calibrate** (it unloads the current model and takes a minute
+  details on the dashboard's Models page and choose **Calibrate** (it unloads the current model and takes a minute
   or two). Balanced keeps nearly the fastest generation with fewer cores busy; Light leaves the most
   room for other programs.
 - **Manual** sets threads, GPU layers, batch size, cache and waiting behaviour yourself. Combinations
@@ -347,7 +353,7 @@ directories); results carry evidence IDs the model can keep or release as contex
   sent to the model and what it returned, capped at the latest 300 requests, for diagnosing wrong or
   broken answers. The records stay on this PC and can contain file contents the assistant read. On or
   off, each request also leaves an audit record (who, which model, how many tokens), without its text.
-- **Save logs as a zip** (Runtime & diagnostics, or the session menu) collects the program's own logs and
+- **Save logs as a zip** (the dashboard's Runtime and diagnostics page, or the session menu) collects the program's own logs and
   a note of what was running, to share when something failed. Conversations are not in it; conversation
   export was removed on 2026-10-06 (the enterprise audit records hold who asked what).
 
@@ -428,7 +434,8 @@ A platform admin can **lock** a personal or policy field for the whole company, 
 group; the field then shows as locked, with the reason, and nobody below can change it. When a
 person's groups disagree, the group with the lowest priority number wins. On the settings screen,
 people change their own choices; a platform admin's changes to company fields go to the company.
-Until the admin dashboard arrives, group values, locks and company defaults are set through the API:
+The dashboard's **Company settings** page sets the company's values, each group's (and its
+priority) and the locks; the same is open to scripts through the API:
 `GET /api/admin/settings`, `PUT /api/admin/settings/company` with `{"settings": {...}}`,
 `PUT /api/admin/settings/groups/<id>` with `{"settings": {...}, "priority": 10}`, and
 `PUT`/`DELETE /api/admin/settings/locks` with `{"path": "appearance.theme", "group_id": null, "reason": "..."}`.

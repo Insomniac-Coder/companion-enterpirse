@@ -577,6 +577,14 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   `Caller.address`/`device` come from `ConnectInfo` (the server runs with
   `into_make_service_with_connect_info`) and the User-Agent. A failed audit write is logged and
   does not fail the request.
+- Two apps, one set of parts (task 9): `frontend/index.html` is Companion (`src/App.tsx`, the
+  person's own work) and `frontend/admin/index.html` the dashboard (`src/admin/`: people, company and
+  group settings, audit records, and the models, runtime, resources and tools screens that left the
+  user app). Both start in `SignInGate` and share `src/ui`, `src/services` and the settings screen
+  (`SettingsPanel`'s `scope` edits the company's or a group's values, saving only what differs).
+  Every request goes through `services/server.ts` (`serverFetch`, `serverUrl`): the page's own server
+  and cookie in a browser, a saved server and its token in the desktop app (Phase 3). The backend
+  serves `dist/` (so `/admin/` is the dashboard); the dashboard routes its pages by `#hash`.
 - Migrations are built into the binary (`build.rs` rebuilds when one changes) and must keep LF line
   endings (`.gitattributes`; `storage::tests` checks): sqlx refuses a database whose applied
   migration's bytes differ, so a CRLF checkout would not open a database made on Linux.

@@ -52,3 +52,16 @@ for deleting and errors.
 Inter for everything people read (13.5–14 px, slightly tightened); JetBrains Mono for the machine:
 the line above each answer, keys, table headings, counts, code. Both are bundled with the app (no
 network).
+
+## Built (Phase 1 task 9, 2026-10-07)
+
+Both apps use it: the colours are the tokens at the top of `frontend/src/workbench.css` (the old
+accent names stay, so `--tally` is now the blue signal), the fonts are in `frontend/src/fonts` with
+their licence. Built: the dense sidebar (Workspace with counts, Recent with status dots, the person
+with Settings at the bottom), the top bar's crumb, command bar and boundary mark ("Inside the
+company" on a server, "On this PC" on a laptop), the quiet line above every message, messages as
+plain text divided by rules, the composer's model chip, the main button in inverted ink, the amber
+"Waiting for you" approval card. Still to come with the features they belong to: source chips (RAG,
+Phase 6), a model picker per conversation (the model list, Phase 2), approval keys Enter/E/Esc
+(the card has buttons until approvals reach the chat with the desktop app, Phase 3), the amber
+"outside" state (outside providers, Phase 2).

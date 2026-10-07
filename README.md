@@ -527,4 +527,5 @@ required.
 
 The third-party software it builds on keeps its own licenses. The llama.cpp runtime (MIT) is built into
 `runtime/` by the build script and is not stored in this repository. The Rust and npm dependencies are
-fetched at build time. Models you download come with their own terms.
+fetched at build time. Models you download come with their own terms. The Inter and JetBrains Mono
+fonts in `frontend/src/fonts` are under the SIL Open Font License 1.1 (`frontend/src/fonts/OFL.txt`).

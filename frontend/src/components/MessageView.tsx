@@ -161,6 +161,7 @@ export default function MessageView({
   onEdit,
   onRegenerate,
   sessionMode,
+  place,
 }: {
   role: 'user' | 'assistant' | 'tool';
   text: string;
@@ -184,6 +185,8 @@ export default function MessageView({
   onOpenAgentActivity?: (runId: string) => void;
   onEdit?: () => void;
   onRegenerate?: () => void;
+  /** Where the answer was made ("inside" the company, "this PC"), for the line above it. */
+  place?: string;
 }) {
   const { body, sources } = role === 'assistant' ? splitSources(text) : { body: text, sources: [] as { title: string; url: string }[] };
   const isAgentRun = !!activities?.some((event) => event.kind === 'task');
@@ -203,16 +206,17 @@ export default function MessageView({
 
   if (role === 'user') {
     return (
-      <>
-        <div className="msg user">{text}</div>
-        <div className="meta">
+      <div className="msg user">
+        <div className="msg-line">
+          <b>You</b>
           <span className="msg-actions">
             {onEdit && <IconButton icon="pencil" label="Edit message" size="sm" tipSide="top" onClick={onEdit} />}
             <CopyAction text={text} />
           </span>
-          {time && <span>{fmtTime(time)}</span>}
+          {time && <span className="tm">{fmtTime(time)}</span>}
         </div>
-      </>
+        <div className="msg-text">{text}</div>
+      </div>
     );
   }
 
@@ -225,10 +229,21 @@ export default function MessageView({
     );
   }
 
+  // Graphite: one quiet line above every answer says who answered, with which model, what it
+  // looked at, and where it was made.
+  const looked = (agentEvents ?? chatDetails).filter((event) => event.kind === 'tool_result').length;
+  const line = (
+    <div className="msg-line">
+      <b>Companion</b>
+      {byline && <><span className="sep">·</span><span>{byline}</span></>}
+      {looked > 0 && <><span className="sep">·</span><span>{looked} {looked === 1 ? 'tool step' : 'tool steps'}</span></>}
+      {place && <><span className="sep">·</span><span className="ok">{place}</span></>}
+      {time && <span className="tm">{fmtTime(time)}</span>}
+    </div>
+  );
+
   const meta = (
     <div className="meta">
-      {byline && <span className="byline">{byline}</span>}
-      {time && <span>{fmtTime(time)}</span>}
       {showMetrics && <ResponseMetrics tps={tps} live={live} timing={timing} legacy={legacyRate} detailed={detailedMetrics} />}
       <span className="msg-actions">
         {onRegenerate && <IconButton icon="refresh" label="Regenerate reply" size="sm" tipSide="top" onClick={onRegenerate} />}
@@ -240,6 +255,7 @@ export default function MessageView({
   if (agentEvents) {
     return (
       <div className="msg assistant structured-message">
+        {line}
         <ToolTimeline events={agentEvents} />
         <Sources sources={sources} />
         {isAgentRun && agentRunId && onOpenAgentActivity && (
@@ -254,6 +270,7 @@ export default function MessageView({
 
   return (
     <div className={`msg ${role}${streaming ? ' streaming' : ''}`}>
+      {line}
       {chatDetails.length > 0 && <details className="chat-file-activity">
         <summary>View file activity</summary>
         <ToolTimeline events={chatDetails} />

@@ -81,6 +81,9 @@ export default function App({ me }: { me?: Me }) {
   // platform admin's; an auditor reads it. The permission mode is each person's own.
   const admin = isPlatformAdmin(me);
   const dashboard = admin || !!me?.roles?.includes('auditor');
+  // Graphite's boundary mark: a company server keeps data inside the company, a laptop on this PC.
+  const boundary = me?.sign_in ? 'Inside the company' : 'On this PC';
+  const initials = (me?.sign_in && me.name ? me.name : 'You').split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase();
   // The person's attachment limits (company or group), checked here before an upload.
   const [attachLimits, setAttachLimits] = useState<{ max_attach_mb: number; max_image_mb: number } | undefined>(undefined);
   const destinations = WORKBENCH_DESTINATIONS;
@@ -1221,7 +1224,7 @@ export default function App({ me }: { me?: Me }) {
       <div key={c.id} className={`sb-row${isActive ? ' active' : ''}`}>
         <button type="button" className="sb-row-main" onClick={() => void selectConv(c.id)} title={status ? `${c.title} · ${status}` : c.title} aria-current={isActive ? 'true' : undefined}>
           <span className="sb-row-status" aria-hidden="true">
-            {live ? <Lamp state="live" pulse /> : waiting || stale ? <Lamp state="caution" /> : sess?.activity === 'error' ? <Lamp state="error" /> : null}
+            {live ? <Lamp state="live" pulse /> : waiting || stale ? <Lamp state="caution" /> : sess?.activity === 'error' ? <Lamp state="error" /> : <span className="sb-dot" />}
           </span>
           <span className="sb-row-title">{c.title || 'Untitled'}</span>
           {status && <span className="sr-only">, {status}</span>}
@@ -1344,9 +1347,10 @@ export default function App({ me }: { me?: Me }) {
                 <span>Search</span>
                 <Kbd>{shortcutLabel(paletteShortcut)}</Kbd>
               </button>
+              <div className="sb-section">Workspace</div>
               <div className="sb-modes" role="tablist" aria-label="Work mode">
-                <button type="button" role="tab" aria-selected={mode === 'chat'} onClick={() => switchMode('chat')} title="Chat (Ctrl 1)"><Icon name="chat" size={15} />Chat</button>
-                <button type="button" role="tab" aria-selected={mode === 'code'} onClick={() => switchMode('code')} title="Code (Ctrl 2)"><Icon name="code" size={15} />Code</button>
+                <button type="button" role="tab" aria-selected={mode === 'chat'} onClick={() => switchMode('chat')} title="Chats (Ctrl 1)"><Icon name="chat" size={15} />Chats<span className="sb-count">{convs.filter((c) => (c.mode || 'chat') === 'chat').length}</span></button>
+                <button type="button" role="tab" aria-selected={mode === 'code'} onClick={() => switchMode('code')} title="Code tasks (Ctrl 2)"><Icon name="code" size={15} />Code tasks<span className="sb-count">{convs.filter((c) => c.mode === 'code').length}</span></button>
               </div>
               {mode === 'code' && (
                 <div className="project-switch">
@@ -1406,7 +1410,7 @@ export default function App({ me }: { me?: Me }) {
                 {pinnedConvs.map(renderRow)}
               </>
             )}
-            <div className="sb-group-label"><span className="eyebrow">{mode === 'code' ? 'Tasks by project' : 'Chats'}</span>{modeConvs.length > 0 && <span className="readout muted" style={{ fontSize: 11.5 }}>{modeConvs.length}</span>}</div>
+            <div className="sb-group-label"><span className="eyebrow">{mode === 'code' ? 'Tasks by project' : 'Recent'}</span></div>
             {(modeConvs.length > 8 || sessionFilter) && (
               <div className="sb-filter">
                 <Icon name="search" size={13} />
@@ -1420,34 +1424,18 @@ export default function App({ me }: { me?: Me }) {
         )}
 
         <nav className="sb-utility" aria-label="Manage Companion">
-          {destinations.map(({ id, label }) => (
-            <button
-              type="button"
-              key={id}
-              className="sb-link"
-              aria-label={label}
-              aria-current={tab === id ? 'page' : undefined}
-              data-tip={rail ? label : undefined}
-              data-tip-side={rail ? 'right' : undefined}
-              onClick={() => { setTab(id); setMobileNav(false); }}
-            >
-              <Icon name={PAGE_META[id].icon} size={16} />
-              {!rail && <span>{label}</span>}
-            </button>
-          ))}
           {dashboard && (
             <a className="sb-link" href={serverUrl('/admin/')} aria-label="Dashboard" data-tip={rail ? 'Dashboard' : undefined} data-tip-side={rail ? 'right' : undefined}>
               <Icon name="layers" size={16} />
               {!rail && <span>Dashboard</span>}
             </a>
           )}
-          {me?.sign_in && (
-            <div className="sb-person" title={me.email || me.name}>
-              <span className="sb-person-initial" aria-hidden="true">{(me.name || '?').slice(0, 1).toUpperCase()}</span>
-              {!rail && <span className="sb-person-name">{me.name}</span>}
-              <IconButton icon="power" label={`Sign out ${me.name}`} size="sm" tipSide={rail ? 'right' : 'top'} onClick={() => { void signOut().then(() => { window.location.href = '/'; }, () => notify('error', 'Sign-out did not finish. Try again.')); }} />
-            </div>
-          )}
+          <div className="sb-person" title={me?.sign_in ? me.email || me.name : 'This PC\u2019s one person'}>
+            <span className="sb-person-initial" aria-hidden="true">{initials}</span>
+            {!rail && <span className="sb-person-name">{me?.sign_in && me.name ? me.name : 'You'}</span>}
+            <IconButton icon="sliders" label="Settings" size="sm" pressed={tab === 'settings'} tipSide={rail ? 'right' : 'top'} onClick={() => { setTab(tab === 'settings' ? 'chat' : 'settings'); setMobileNav(false); }} />
+            {me?.sign_in && <IconButton icon="power" label={`Sign out ${me.name}`} size="sm" tipSide={rail ? 'right' : 'top'} onClick={() => { void signOut().then(() => { window.location.href = '/'; }, () => notify('error', 'Sign-out did not finish. Try again.')); }} />}
+          </div>
         </nav>
 
       </aside>
@@ -1507,6 +1495,7 @@ export default function App({ me }: { me?: Me }) {
             <Lamp state={machine.state} pulse={machine.state === 'live'} />
           </div>
           <div className="head-title">
+            {tab === 'chat' && <span className="head-crumb" aria-hidden="true">{mode === 'code' ? 'Code tasks' : 'Chats'}<span className="sep">/</span></span>}
             {tab !== 'chat' ? (
               <h1>{PAGE_META[tab].title}</h1>
             ) : renaming?.where === 'head' && renaming.id === convId ? (
@@ -1541,14 +1530,17 @@ export default function App({ me }: { me?: Me }) {
                     {branch && <><span className="sep" aria-hidden="true" /><Icon name="branch" size={13} /><span>{branch}</span></>}
                   </>
                 ) : <span>No project selected</span>
-              ) : (
-                <>
-                  <Icon name="lock" size={12} />
-                  <span>{msgs.length ? `${msgs.length} message${msgs.length === 1 ? '' : 's'} · stays on this PC` : 'Stays on this PC'}</span>
-                </>
-              )}
+              ) : null}
             </div>
           </div>
+          <button type="button" className="cmdbar" onClick={() => setPaletteOpen(true)}>
+            <Icon name="search" size={15} />
+            <span>Search, or run a command</span>
+            <Kbd>{shortcutLabel(paletteShortcut)}</Kbd>
+          </button>
+          <span className="boundary-mark" title={me?.sign_in ? 'Your conversations, files and the model all stay on the company\u2019s own servers.' : 'Your conversations, files and the model all stay on this PC.'}>
+            <Icon name="shieldCheck" size={14} />{boundary}
+          </span>
           {tab === 'chat' && (
             <div className="head-actions">
               {mode === 'code' && activeConv?.workspace && (
@@ -1686,6 +1678,7 @@ export default function App({ me }: { me?: Me }) {
                             showMetrics={showGenerationSpeed}
                             detailedMetrics={showDetailedMetrics}
                             byline={m.role === 'assistant' ? modelName(perfMap[m.id]?.model) : undefined}
+                            place={boundary === 'On this PC' ? 'this PC' : 'inside'}
                             thinking={m.role === 'assistant' ? thinkingMap[m.id] : undefined}
                             agentRunId={m.id}
                             onOpenAgentActivity={(runId) => {
@@ -1810,6 +1803,12 @@ export default function App({ me }: { me?: Me }) {
                     </div>
                     <div className="composer-end">
                       {/* Status only. Loading or switching models never happens from the composer. */}
+                      {loadedMeta && (
+                        <span className="model-chip" title={`${loadedMeta.name} answers here. ${boundary}.`}>
+                          <span className="model-chip-name">{loadedMeta.name}</span>
+                          <em>· {boundary === 'On this PC' ? 'this PC' : 'inside'}</em>
+                        </span>
+                      )}
                       {!loadedMeta && backendUp !== false && !busy && !agentBusy && (
                         <span className="composer-hint" title={admin ? 'Load one from the dashboard' : 'A platform admin loads models for everyone'}>
                           <Lamp state="off" />

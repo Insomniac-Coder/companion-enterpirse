@@ -27,6 +27,7 @@ import ToolsPage from './components/ToolsPage';
 import { PERMISSION_MODE_DESCRIPTIONS, PERMISSION_MODE_LABELS, PROJECT_BOUNDARY_DESCRIPTION, SEARCH_PERMISSION_DESCRIPTION } from './components/permissionCopy';
 import { VisibleOutputMeter, type GenerationPhase, type OutputTiming } from './services/outputTiming';
 import { ADMIN_ONLY_NOTE, isPlatformAdmin, signOut, type Me } from './services/account';
+import { attachmentTooLarge } from './services/settingsFields';
 import { applyAgentContext } from './services/contextUsage';
 import { currentActivitySnapshot, parseActivityStart, visibleWorkActivity } from './services/workElapsed';
 import { groupActivity, groupSessionsByProject, lastSessionKey, projectGroupOpen, projectPick, projectRemoval, type ProjectGroup } from './services/projectSessions';
@@ -87,6 +88,8 @@ export default function App({ me }: { me?: Me }) {
   // On a server with sign-in, the shared machinery (models, downloads, company settings, system
   // checks, the permission mode until it is per person) is a platform admin's (roles.rs).
   const admin = isPlatformAdmin(me);
+  // The person's attachment limits (company or group), checked here before an upload.
+  const [attachLimits, setAttachLimits] = useState<{ max_attach_mb: number; max_image_mb: number } | undefined>(undefined);
   const destinations = admin ? WORKBENCH_DESTINATIONS : WORKBENCH_DESTINATIONS.filter(({ id }) => id === 'settings');
   const [tab, setTab] = useState<'chat' | PageId>('chat');
   const [mode, setMode] = useState<'chat' | 'code'>(() => (localStorage.getItem('companion.mode') as any) || 'chat');
@@ -240,6 +243,7 @@ export default function App({ me }: { me?: Me }) {
       preferredDefaultModel.current = value.general?.default_model ?? '';
       setShowGenerationSpeed(value.diagnostics?.show_generation_speed ?? true);
       setShowDetailedMetrics(value.diagnostics?.show_detailed_metrics ?? false);
+      if (value.files) setAttachLimits(value.files);
       // The context meter reads the compaction threshold from the server, so
       // a changed threshold only showed up after the next agent step.
       const open = conversationRef.current;
@@ -247,6 +251,7 @@ export default function App({ me }: { me?: Me }) {
     };
     window.addEventListener('companion:settings', onSettings);
     getSettings().then((settings) => {
+      setAttachLimits(settings.files);
       if (settings.keyboard?.command_palette) setPaletteShortcut(settings.keyboard.command_palette);
       setShowGenerationSpeed(settings.diagnostics?.show_generation_speed ?? true);
       setShowDetailedMetrics(settings.diagnostics?.show_detailed_metrics ?? false);
@@ -948,6 +953,11 @@ export default function App({ me }: { me?: Me }) {
   async function attach(f: File | undefined) {
     if (!f || !convId) {
       if (!convId) notify('warning', 'Start a chat first, then attach files.');
+      return;
+    }
+    const tooLarge = attachmentTooLarge(f, attachLimits);
+    if (tooLarge) {
+      notify('error', tooLarge);
       return;
     }
     try {

@@ -334,6 +334,7 @@ pub(crate) mod tests {
 
     /// Every route that changes the server for everyone, or shows everyone's activity.
     const PLATFORM_ADMIN_ROUTES: [(&str, &str); 29] = [
+        ("PUT", "/api/admin/settings/company"),
         ("POST", "/api/models/load"),
         ("POST", "/api/models/unload"),
         ("POST", "/api/models/scan"),
@@ -345,7 +346,6 @@ pub(crate) mod tests {
         ("POST", "/api/models/downloads/d/resume"),
         ("POST", "/api/models/downloads/d/cancel"),
         ("DELETE", "/api/models/m"),
-        ("PUT", "/api/settings"),
         ("PUT", "/api/permissions/mode"),
         ("GET", "/api/system/overview"),
         ("GET", "/api/v1/system/overview"),

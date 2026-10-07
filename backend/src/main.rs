@@ -42,6 +42,7 @@ mod runtime_fit;
 mod runtime_selection;
 mod search;
 mod settings;
+mod settings_levels;
 mod shutdown;
 mod speed_rule;
 mod storage;
@@ -173,6 +174,7 @@ async fn main() {
     .await
     .with_install_root(cfg.root.clone())
     .with_auth(auth);
+    logfile::set_masking(state.settings.read().await.privacy.log_redaction);
 
     // Register models found on disk (§9 layout), then seed demo only if empty
     // so the UI Model selector is never blank on first launch (§88).

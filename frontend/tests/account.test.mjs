@@ -43,3 +43,22 @@ test('only a platform admin gets the controls that change the server for everyon
   assert.equal(isPlatformAdmin({ ...person(['platform_admin', 'auditor']), id: 'local', via: 'local', sign_in: false }), true, "the laptop's one person");
   assert.equal(isPlatformAdmin(undefined), true, 'server unreachable: the app as it always was; the server still refuses');
 });
+
+test('a field someone cannot change says who set it, and why', async () => {
+  const { lockNote } = await import('../src/services/settingsFields.ts');
+  const field = (over) => ({ kind: 'personal', locked_by: null, reason: '', editable: true, ...over });
+  assert.equal(lockNote(field({})), null);
+  assert.equal(lockNote(undefined), null, 'no word from the server: nothing to say');
+  assert.equal(lockNote(field({ editable: false, locked_by: 'company', reason: 'Brand colours' })), 'Locked by your company: Brand colours');
+  assert.equal(lockNote(field({ editable: false, locked_by: 'Engineering' })), 'Locked by Engineering');
+  assert.equal(lockNote(field({ editable: false, kind: 'machine' })), 'Set by your company');
+});
+
+test('a file over the person\'s limit is stopped before it is sent', async () => {
+  const { attachmentTooLarge } = await import('../src/services/settingsFields.ts');
+  const limits = { max_attach_mb: 5, max_image_mb: 8 };
+  assert.equal(attachmentTooLarge({ name: 'a.pdf', size: 4_000_000, type: 'application/pdf' }, limits), null);
+  assert.match(attachmentTooLarge({ name: 'a.pdf', size: 6_000_000, type: 'application/pdf' }, limits), /a\.pdf is 6\.0 MB; files can be up to 5 MB/);
+  assert.equal(attachmentTooLarge({ name: 'a.png', size: 6_000_000, type: 'image/png' }, limits), null, 'images have their own limit');
+  assert.equal(attachmentTooLarge({ name: 'a.pdf', size: 60_000_000, type: '' }, undefined), null, 'no limits known: the server decides');
+});

@@ -2842,7 +2842,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         }
     }
     let original_task = transcript[task_turn_index].content.clone();
-    let compaction = CompactionPolicy::from_settings(&state.settings.read().await.memory);
+    let compaction = CompactionPolicy::from_settings(&crate::settings_levels::for_person(&state, &spec.user_id).await.memory);
     let compaction_pct = if compaction.enabled { compaction.threshold_pct } else { 0 };
     let mut work_log: Vec<String> = Vec::new();
     let mut compactions = 0u32;
@@ -3877,7 +3877,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             } else {
                 // Search opt-in is separate from approvals. Auto never prompts
                 // for enabled Search, but an explicit deny still blocks it.
-                let settings = state.settings.read().await.clone();
+                let settings = crate::settings_levels::for_person(&state, &spec.user_id).await;
                 let global_auto = state.permissions.read().await.autonomy
                     == crate::permissions::AutonomyLevel::Autonomous;
                 match settings.search.autonomous.as_str() {
@@ -4797,11 +4797,11 @@ async fn execute_local_tool(
     call: &ToolCall,
     approval: &str,
 ) -> String {
-    let tool_req = crate::tools::ToolRequest {
-        name: call.name.clone(),
-        args: call.args.clone(),
-        approved: true,
-    };
+    let limit = crate::settings_levels::for_person(state, &run.spec.user_id).await.agent.command_timeout_secs;
+    let tool_req = crate::tools::within_time_limit(
+        crate::tools::ToolRequest { name: call.name.clone(), args: call.args.clone(), approved: true },
+        limit,
+    );
     // Commands can run for minutes and searches walk whole trees: blocking
     // work belongs on the blocking pool, not on an async worker that also
     // serves other sessions' streams.
@@ -4860,14 +4860,8 @@ async fn execute_web_search(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let settings = state.settings.read().await.clone();
-    let scfg = crate::search::SearchConfig {
-        provider: settings.search.provider.clone(),
-        brave_key: settings.search.brave_key.clone(),
-        custom_url: settings.search.custom_url.clone(),
-        max_results: settings.search.max_results,
-        timeout_secs: settings.search.timeout_secs,
-    };
+    let settings = crate::settings_levels::for_person(state, &run.spec.user_id).await;
+    let scfg = crate::search::SearchConfig::from_settings(&settings);
     let output = match crate::search::run_search(&query, &scfg).await {
         Ok((results, provider)) => {
             let conv = if run.spec.conversation_id.trim().is_empty() {

@@ -379,6 +379,21 @@ fn missing_path(ws: &WorkspaceManager, rel: &str, error: std::io::Error) -> Tool
 
 /// Execute a validated tool. SAFE reads run immediately; MODERATE/DANGEROUS
 /// require `req.approved == true` (set by the permission UX, §26).
+/// A command or a project check asks to run at most `limit_secs` (the company's or the group's
+/// command time limit): what it asked for, or its default, capped there. A background command
+/// is not timed; it ends with its run.
+pub fn within_time_limit(mut req: ToolRequest, limit_secs: u64) -> ToolRequest {
+    if limit_secs == 0 || !matches!(req.name.as_str(), "execute_command" | "project_check") {
+        return req;
+    }
+    let default = if req.name == "project_check" { crate::project_check::default_timeout().as_secs() } else { crate::terminal::DEFAULT_TIMEOUT_SECS };
+    let asked = req.args.get("timeout_secs").and_then(|value| value.as_u64()).unwrap_or(default);
+    if let Some(args) = req.args.as_object_mut() {
+        args.insert("timeout_secs".into(), asked.min(limit_secs).into());
+    }
+    req
+}
+
 pub fn execute(
     req: &ToolRequest,
     ws: &WorkspaceManager,

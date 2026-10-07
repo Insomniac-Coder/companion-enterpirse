@@ -356,3 +356,9 @@
 .settings-page .account-keys li > .btn { grid-column: 2; grid-row: 1 / span 2; }
 .settings-page .account-keys li.withdrawn { opacity: 0.6; }
 .settings-page .account-key-meta { color: var(--text-3); font-size: 12px; }
+
+/* Settings a person cannot change (Phase 1 task 6): disabled, with why. */
+/* Layout-neutral: the row lays out the controls as if the fieldset were not there. */
+.settings-page fieldset.settings-field-locked { display: contents; }
+.settings-page fieldset.settings-field-locked > * { opacity: 0.6; }
+.settings-page .settings-field-lock { display: flex; align-items: center; gap: 6px; margin-top: 4px; color: var(--text-3); font-size: 12px; }

@@ -552,6 +552,13 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   (`ownership::conversation`, `ownership::workspace`), scope lists to the caller, and stamp new
   records. Storage functions that list or read memory take the person explicitly. Agents and direct
   tool calls work only inside the caller's own saved projects.
+- Settings (`settings_levels.rs`, task 6): `AppState.settings` is the company's; code acting for a
+  person reads `settings_levels::for_person` (company, then their groups by priority, then their own
+  choices, locks applied). Machine fields only ever come from the company. A new field is machine
+  until it is listed as personal or policy. The policy fields are enforced: folders in `create_workspace`
+  and `saved_project_folder`, the network rule in `search::run_search`, attachment limits in
+  `add_attachment` (the route's body limit is the 50 MB ceiling), the command limit through
+  `tools::within_time_limit`, and log masking in `logfile::AppFileWriter`.
 - `LLM → ToolRequest → PermissionManager → Tool → OS`. No direct OS access.
 - `WorkspaceManager::resolve` is the only path joiner; lexical + canonical checks.
 - MODERATE/DANGEROUS tools require `approved=true` (permission UX sets it, §26).

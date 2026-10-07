@@ -23,6 +23,44 @@ pub struct SearchConfig {
     pub custom_url: String,
     pub max_results: usize,
     pub timeout_secs: u64,
+    /// The network rule: ask | selected | disabled (`settings::NetworkSettings`).
+    pub network_policy: String,
+    /// For "selected": the hosts web access may reach (a host also covers its subdomains).
+    pub trusted_hosts: Vec<String>,
+}
+
+impl SearchConfig {
+    /// The search a person's settings allow.
+    pub fn from_settings(settings: &crate::settings::AppSettings) -> SearchConfig {
+        SearchConfig {
+            provider: settings.search.provider.clone(),
+            brave_key: settings.search.brave_key.clone(),
+            custom_url: settings.search.custom_url.clone(),
+            max_results: settings.search.max_results,
+            timeout_secs: settings.search.timeout_secs,
+            network_policy: settings.network.policy.clone(),
+            trusted_hosts: settings.network.trusted_hosts.clone(),
+        }
+    }
+}
+
+/// Whether the network rule lets a request reach `host`.
+pub fn host_allowed(cfg: &SearchConfig, host: &str) -> Result<(), String> {
+    match cfg.network_policy.as_str() {
+        "disabled" => Err("web access is turned off on this server".into()),
+        "selected" => {
+            let host = host.to_ascii_lowercase();
+            let trusted = cfg.trusted_hosts.iter().map(|entry| entry.trim().trim_start_matches("*.").to_ascii_lowercase()).filter(|entry| !entry.is_empty()).any(|entry| {
+                host == entry || host.ends_with(&format!(".{entry}"))
+            });
+            if trusted {
+                Ok(())
+            } else {
+                Err(format!("{host} is not one of the trusted web addresses"))
+            }
+        }
+        _ => Ok(()),
+    }
 }
 
 impl Default for SearchConfig {
@@ -33,6 +71,8 @@ impl Default for SearchConfig {
             custom_url: String::new(),
             max_results: 5,
             timeout_secs: 15,
+            network_policy: "ask".into(),
+            trusted_hosts: Vec::new(),
         }
     }
 }
@@ -200,6 +240,11 @@ pub async fn run_search(
         return Err("query is empty".into());
     }
     let max = cfg.max_results.clamp(1, 10);
+    let host = match cfg.provider.as_str() {
+        "brave" => "api.search.brave.com",
+        _ => "html.duckduckgo.com",
+    };
+    host_allowed(cfg, host)?;
     match cfg.provider.as_str() {
         "brave" => search_brave(q, max, cfg.timeout_secs, &cfg.brave_key)
             .await

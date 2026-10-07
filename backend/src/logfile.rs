@@ -142,10 +142,46 @@ impl RotatingLog {
 /// `companion.log` once `init` has run.
 pub struct AppFileWriter;
 
+/// Whether secrets are masked in the log file (the company's privacy setting; on by default).
+static MASK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_masking(on: bool) {
+    MASK.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A log line with the secrets it might carry replaced by `***`: bearer tokens, Companion API keys,
+/// passwords in connection addresses, and `password=`/`token:`-style values.
+pub fn masked(line: &str) -> std::borrow::Cow<'_, str> {
+    static PATTERNS: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> = std::sync::OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            (r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", "${1}***"),
+            (r"cmp_[0-9a-f]{16,}", "cmp_***"),
+            (r"(?i)\b(sk-|sk-ant-|xox[bp]-|ghp_|AKIA)[A-Za-z0-9_-]{8,}", "${1}***"),
+            (r"(?i)([a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+@", "${1}***@"),
+            (r#"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|client[_-]?secret)(["']?\s*[=:]\s*["']?)[^\s"'&,;]+"#, "${1}${2}***"),
+        ]
+        .into_iter()
+        .map(|(pattern, with)| (regex::Regex::new(pattern).expect("mask pattern"), with))
+        .collect()
+    });
+    let mut text = std::borrow::Cow::Borrowed(line);
+    for (pattern, with) in patterns {
+        if pattern.is_match(&text) {
+            text = std::borrow::Cow::Owned(pattern.replace_all(&text, *with).into_owned());
+        }
+    }
+    text
+}
+
 impl Write for AppFileWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if let Some(log) = app() {
-            log.append(buf);
+            if MASK.load(std::sync::atomic::Ordering::Relaxed) {
+                log.append(masked(&String::from_utf8_lossy(buf)).as_bytes());
+            } else {
+                log.append(buf);
+            }
         }
         Ok(buf.len())
     }

@@ -34,7 +34,9 @@ fork to drop the model weights (Git LFS); commit ids differ from the Companion's
   (list in `roles::tests::PLATFORM_ADMIN_ROUTES`). Interim: settings and permission mode are admin-only on
   a server with sign-in until tasks 6 and 7. Task 5 (owners) done 2026-10-07: `ownership.rs`; a new
   route under a record path is covered by the middleware, but a route that takes a record id in its
-  body must call `ownership::conversation`/`workspace` itself. Next: task 6 (settings in three levels).
+  body must call `ownership::conversation`/`workspace` itself. Task 6 (settings levels + policies) done
+  2026-10-07: `settings_levels.rs`; code acting for a person must read `settings_levels::for_person`,
+  not `AppState.settings` (the company's). Next: task 7 (permissions and replies per person).
 - Everything below this section is the Companion's own handoff, kept as it was at the fork.
 
 # Handoff — start here

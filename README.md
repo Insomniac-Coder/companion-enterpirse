@@ -413,9 +413,36 @@ in the token; their memberships then stay as they were.)
    `POST` or `DELETE /api/admin/users/<id>/roles` with `{"role": "team_admin", "group_id": "<group id>"}`,
    `PATCH /api/admin/groups/<id>` with `{"name": "..."}`.
 
-For now, on a server with sign-in, the settings and the agents' permission mode apply to everyone, so
-only a platform admin changes them; people get their own with later updates. A laptop install has no
-sign-in and its one person has every role, as before.
+### Settings for the company, for groups and for each person
+
+Each setting is one of three kinds:
+
+| Kind | Who sets it | Examples |
+| --- | --- | --- |
+| Personal | the company's default, a group's, then each person's own choice | theme, density, shortcuts, reasoning default, sampling, compaction, search consent |
+| Policy | the company, or a group for its members; never a person | allowed and blocked folders, network rule, attachment limits, command time limit |
+| Machine | the company only (everyone shares one model server) | context size, hardware, runtime, search provider and key, logging |
+
+A platform admin can **lock** a personal or policy field for the whole company, a team admin for their
+group; the field then shows as locked, with the reason, and nobody below can change it. When a
+person's groups disagree, the group with the lowest priority number wins. On the settings screen,
+people change their own choices; a platform admin's changes to company fields go to the company.
+Until the admin dashboard arrives, group values, locks and company defaults are set through the API:
+`GET /api/admin/settings`, `PUT /api/admin/settings/company` with `{"settings": {...}}`,
+`PUT /api/admin/settings/groups/<id>` with `{"settings": {...}, "priority": 10}`, and
+`PUT`/`DELETE /api/admin/settings/locks` with `{"path": "appearance.theme", "group_id": null, "reason": "..."}`.
+
+The policy fields are applied: a project must be inside an allowed folder (when any are listed) and in
+no blocked one, also for projects saved before the rule; the **network rule** is `ask` (web search
+when a person turns it on, the default), `selected` (only the trusted addresses; a host covers its
+subdomains) or `disabled`; attachments are refused over the limit (1-50 MB, files and images apart);
+a command or project check runs at most the **command time limit** (default 30 minutes). With
+**log masking** on (the default), the log file Companion writes, and so the logs zip, has bearer
+tokens, API keys, passwords in connection addresses and `password=`-style values replaced by `***`.
+
+The permission mode is still one for everyone on a server with sign-in, and a platform admin's to
+change; people get their own with a later update. A laptop install has no sign-in and its one person
+has every role, as before.
 
 Everyone sees only their own conversations, projects, saved memories and agent runs; a record of
 someone else's is "not found", for platform admins too (running the server is not reading people's

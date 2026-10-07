@@ -23,7 +23,7 @@ use axum::response::{
     sse::{Event, KeepAlive, Sse},
     IntoResponse, Response,
 };
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Extension, Json, Router};
 use crate::auth::Caller;
 use futures::stream;
@@ -501,6 +501,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/admin/groups", get(admin_or_auditor(crate::roles::list_groups)))
         .route("/api/admin/groups/:id", patch(admin(crate::roles::name_group)))
         .route("/api/admin/users/:id/roles", post(admin(crate::roles::grant_role)).delete(admin(crate::roles::revoke_role)))
+        // Phase 1 task 6: settings in three levels.
+        .route("/api/settings/fields", get(crate::settings_levels::fields))
+        .route("/api/admin/settings", get(admin_or_auditor(crate::settings_levels::overview)))
+        .route("/api/admin/settings/company", put(admin(put_company_settings)))
+        .route("/api/admin/settings/groups/:id", put(crate::settings_levels::put_group))
+        .route("/api/admin/settings/locks", put(crate::settings_levels::put_lock).delete(crate::settings_levels::delete_lock))
         .route("/api/runtime/policy", get(runtime_policy))
         .route("/api/models", get(list_models))
         .route("/api/models/load", post(admin(load_model)))
@@ -530,7 +536,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/conversations/:id/messages/:mid", patch(edit_message))
         .route(
             "/api/conversations/:id/attachments",
-            get(list_attachments).post(add_attachment),
+            get(list_attachments).post(add_attachment).layer(axum::extract::DefaultBodyLimit::max(ATTACHMENT_CEILING_MB * 1_000_000 * 4 / 3 + 64 * 1024)),
         )
         .route(
             "/api/conversations/:id/attachments/:aid",
@@ -575,7 +581,7 @@ pub fn router(state: AppState) -> Router {
                 .patch(patch_conversation),
         )
         .route("/api/sessions", get(list_sessions))
-        .route("/api/settings", get(get_settings).put(admin(put_settings)))
+        .route("/api/settings", get(get_settings).put(put_settings))
         .route(
             "/api/permissions/mode",
             get(get_permission_mode).put(admin(put_permission_mode)),
@@ -3515,7 +3521,7 @@ async fn chat_sse(
         }
     }
 
-    let settings = s.settings.read().await.clone();
+    let settings = crate::settings_levels::for_person(&s, &caller.id).await;
     let sidecar = {
         let mut llama = s.llama.write().await;
         if llama.is_running() {
@@ -3705,13 +3711,7 @@ async fn chat_sse(
         let mut cite_block = String::new();
         if want_search {
             status("Searching the web…");
-            let scfg = crate::search::SearchConfig {
-                provider: settings.search.provider.clone(),
-                brave_key: settings.search.brave_key.clone(),
-                custom_url: settings.search.custom_url.clone(),
-                max_results: settings.search.max_results,
-                timeout_secs: settings.search.timeout_secs,
-            };
+            let scfg = crate::search::SearchConfig::from_settings(&settings);
             match crate::search::run_search(&req.message, &scfg).await {
                 Ok((results, provider)) => {
                     let conv = bg_conv.clone().unwrap_or_else(|| "direct".into());
@@ -4866,7 +4866,7 @@ async fn conversation_context(
         None if limit > 0 => (used as f64 / limit as f64 * 100.0) as u32,
         None => 0,
     };
-    let settings = s.settings.read().await.clone();
+    let settings = crate::settings_levels::for_person(&s, &caller.id).await;
     let memory_settings = settings.memory.clone();
     // The window a request gets is rarely the size that was asked for: the
     // loader shrinks it to fit GPU memory, and the gauge then measures
@@ -5108,12 +5108,19 @@ fn store_attachment(dir: &std::path::Path, name: &str, bytes: &[u8]) -> Result<S
     unreachable!("names run out only after u32::MAX files")
 }
 
+/// The largest attachment any policy may allow, in MB (the request carries it as base64).
+const ATTACHMENT_CEILING_MB: usize = 50;
+
 async fn add_attachment(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Json(req): Json<NewAttachment>,
 ) -> Result<Json<crate::storage::Attachment>, ApiError> {
-    const MAX_ATTACH_BYTES: usize = 5_000_000;
+    // The company's or the group's limits.
+    let limits = crate::settings_levels::for_person(&s, &caller.id).await.files;
+    let max_file = limits.max_attach_mb.clamp(1, ATTACHMENT_CEILING_MB) * 1_000_000;
+    let max_image = limits.max_image_mb.clamp(1, ATTACHMENT_CEILING_MB) * 1_000_000;
     const EXCERPT_CHARS: usize = 20_000;
     let st = &s.storage;
     if matches!(st.get_conversation(&id).await, Ok(None)) {
@@ -5145,12 +5152,12 @@ async fn add_attachment(
             req.content_base64.trim(),
         )
         .map_err(|_| ApiError::bad("bad base64", "The image data is not valid base64."))?;
-        if bytes.len() > MAX_ATTACH_BYTES {
+        if bytes.len() > max_image {
             return Err(ApiError::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!(
-                    "image too large ({} bytes, max {MAX_ATTACH_BYTES})",
-                    bytes.len()
+                    "image too large ({:.1} MB; the limit is {} MB)",
+                    bytes.len() as f64 / 1e6, max_image / 1_000_000
                 ),
                 "Downscale the screenshot before attaching.",
             ));
@@ -5194,12 +5201,12 @@ async fn add_attachment(
             req.content_base64.trim(),
         )
         .map_err(|_| ApiError::bad("bad base64", "The file data is not valid base64."))?;
-        if bytes.len() > MAX_ATTACH_BYTES {
+        if bytes.len() > max_file {
             return Err(ApiError::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!(
-                    "file too large ({} bytes, max {MAX_ATTACH_BYTES})",
-                    bytes.len()
+                    "file too large ({:.1} MB; the limit is {} MB)",
+                    bytes.len() as f64 / 1e6, max_file / 1_000_000
                 ),
                 "Large documents are chunked and retrieved section-wise (§69).",
             ));
@@ -5228,12 +5235,12 @@ async fn add_attachment(
             "Attach a file with readable text content.",
         ));
     }
-    if req.content.len() > MAX_ATTACH_BYTES {
+    if req.content.len() > max_file {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
             format!(
-                "file too large ({} bytes, max {MAX_ATTACH_BYTES})",
-                req.content.len()
+                "file too large ({:.1} MB; the limit is {} MB)",
+                req.content.len() as f64 / 1e6, max_file / 1_000_000
             ),
             "Large documents are chunked and retrieved section-wise in Phase 2 (§69).",
         ));
@@ -5457,14 +5464,8 @@ async fn execute_tool(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let settings = s.settings.read().await.clone();
-        let scfg = crate::search::SearchConfig {
-            provider: settings.search.provider.clone(),
-            brave_key: settings.search.brave_key.clone(),
-            custom_url: settings.search.custom_url.clone(),
-            max_results: settings.search.max_results,
-            timeout_secs: settings.search.timeout_secs,
-        };
+        let settings = crate::settings_levels::for_person(&s, &caller.id).await;
+        let scfg = crate::search::SearchConfig::from_settings(&settings);
         return match crate::search::run_search(&query, &scfg).await {
             Ok((results, provider)) => {
                 let conv = if req.conversation_id.trim().is_empty() {
@@ -5505,11 +5506,12 @@ async fn execute_tool(
             }
         };
     }
-    let tool_req = tools::ToolRequest {
+    let limit = crate::settings_levels::for_person(&s, &caller.id).await.agent.command_timeout_secs;
+    let tool_req = tools::within_time_limit(tools::ToolRequest {
         name: req.tool.clone(),
         args: req.args.clone(),
         approved: true,
-    };
+    }, limit);
     let result = tools::execute(&tool_req, &ws, true);
     let (ok, output, exit_code) = match &result {
         Ok(r) => (r.ok, r.output.clone(), r.exit_code),
@@ -5592,7 +5594,16 @@ async fn saved_project_folder(s: &AppState, user: &str, requested: &str) -> Resu
             "Add the folder as a project first: tools run only inside saved projects.",
         ));
     }
+    // The folder rules may have changed since the project was saved.
+    folder_policy(s, user, &wanted).await?;
     Ok(std::path::PathBuf::from(requested))
+}
+
+/// Projects only in the folders the company's or the group's rules allow.
+async fn folder_policy(s: &AppState, user: &str, folder: &std::path::Path) -> Result<(), ApiError> {
+    let settings = crate::settings_levels::for_person(s, user).await;
+    crate::settings_levels::folder_allowed(&settings, folder)
+        .map_err(|reason| ApiError::new(StatusCode::FORBIDDEN, reason, "Projects can only be in the folders your company allows."))
 }
 
 /// The one permission gate for direct tool calls (the tools endpoint and
@@ -5997,7 +6008,7 @@ async fn run_agent(
     }
     let reasoning = req
         .reasoning
-        .unwrap_or(conversation_reasoning || s.settings.read().await.reasoning.default_on);
+        .unwrap_or(conversation_reasoning || crate::settings_levels::for_person(&s, &caller.id).await.reasoning.default_on);
     let run_id = spawn_agent_run(
         &s,
         caller.id.clone(),
@@ -6586,7 +6597,7 @@ async fn run_slash_command(
                 }
                 _ => "Inspect this repository (structure, build system, key files) and summarize the project. Do not modify anything.".into(),
             };
-            let reasoning = s.settings.read().await.reasoning.default_on;
+            let reasoning = crate::settings_levels::for_person(s, &caller.id).await.reasoning.default_on;
             let run_id = spawn_agent_run(
                 s,
                 caller.id.clone(),
@@ -6635,7 +6646,7 @@ async fn run_slash_command(
                     format!("Run this project command and report the result: {args}")
                 }
             };
-            let reasoning = s.settings.read().await.reasoning.default_on;
+            let reasoning = crate::settings_levels::for_person(s, &caller.id).await.reasoning.default_on;
             let run_id = spawn_agent_run(
                 s,
                 caller.id.clone(),
@@ -6650,7 +6661,7 @@ async fn run_slash_command(
             Ok(O::AgentRun { run_id: run_id.clone(), message: format!("Agent run started ({}) — it will ask before builds/commands. Watch the Agent tab.", &run_id[..8]) })
         }
         "permissions" => Ok(O::Message(s.permissions.read().await.describe())),
-        "config" => Ok(O::Message(config_text(s, args).await)),
+        "config" => Ok(O::Message(config_text(s, caller, args).await)),
         "stop" => {
             let out = s.generations.write().await.cancel_current(&s.storage).await;
             Ok(O::Message(if out.stopped {
@@ -6779,8 +6790,8 @@ async fn context_text(s: &AppState, cid: &str) -> Result<String, ApiError> {
     Ok(format!("Context ~{tok}/{limit} tokens ({pct}%) — {kept}/{total} messages in window, {dropped} dropped. /compact frees space."))
 }
 
-async fn config_text(s: &AppState, section: &str) -> String {
-    let mut v = serde_json::to_value(s.settings.read().await.clone()).unwrap_or_default();
+async fn config_text(s: &AppState, caller: &Caller, section: &str) -> String {
+    let mut v = serde_json::to_value(crate::settings_levels::for_person(s, &caller.id).await).unwrap_or_default();
     // Never print secrets into chat (§50).
     if v.get("search").is_some() {
         v["search"]["brave_key"] = serde_json::json!("***");
@@ -7414,6 +7425,8 @@ async fn create_workspace(
         std::path::PathBuf::from(req.path.trim())
     };
     if req.create && !pb.exists() {
+        // Checked before anything is made on disk.
+        folder_policy(&s, &caller.id, pb.parent().unwrap_or(&pb)).await?;
         std::fs::create_dir_all(&pb).map_err(|error| {
             ApiError::internal(format!("could not create {}: {error}", pb.display()))
         })?;
@@ -7424,6 +7437,7 @@ async fn create_workspace(
             "Choose an existing folder or create a new project.",
         ));
     }
+    folder_policy(&s, &caller.id, &pb).await?;
     let build_system = detect_build_system(&pb);
     let file_count = walk_count(&pb, 2000);
     let w = crate::storage::Workspace {
@@ -7994,6 +8008,7 @@ struct PluginRunReq {
 
 async fn run_plugin_command(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Json(req): Json<PluginRunReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -8035,11 +8050,11 @@ async fn run_plugin_command(
     // whatever its caller said was approved, whatever the permission mode.
     let record_as = format!("plugin:{id}");
     let (_, approval) = gate_tool_call(&s, &record_as, &req.tool, &req.args, &ws_key, req.approved, false).await?;
-    let tool_req = crate::tools::ToolRequest {
-        name: req.tool.clone(),
-        args: req.args.clone(),
-        approved: true,
-    };
+    let limit = crate::settings_levels::for_person(&s, &caller.id).await.agent.command_timeout_secs;
+    let tool_req = crate::tools::within_time_limit(
+        crate::tools::ToolRequest { name: req.tool.clone(), args: req.args.clone(), approved: true },
+        limit,
+    );
     match crate::tools::execute(&tool_req, &ws, true) {
         Ok(r) => {
             record_tool_call(&s, &record_as, &req.tool, &req.args, approval, r.ok, &r.output).await;
@@ -8955,8 +8970,9 @@ fn without_secrets(mut settings: AppSettings) -> AppSettings {
     settings
 }
 
-async fn get_settings(State(s): State<AppState>) -> Json<AppSettings> {
-    Json(without_secrets(s.settings.read().await.clone()))
+/// The caller's settings: the company's, their groups', their own choices.
+async fn get_settings(State(s): State<AppState>, Extension(caller): Extension<Caller>) -> Json<AppSettings> {
+    Json(without_secrets(crate::settings_levels::for_person(&s, &caller.id).await))
 }
 
 #[derive(Deserialize, Default)]
@@ -9090,7 +9106,6 @@ async fn put_permission_mode(
 /// never widens a run's mode or Search scope and creates no session grants
 /// that could leak back into Ask mode.
 pub(crate) async fn resume_auto_approved_runs(s: &AppState) -> usize {
-    let search_denied = s.settings.read().await.search.autonomous == "deny";
     let mut resumed = 0usize;
     let waiting = {
         let registry = s.agents.read().await;
@@ -9107,6 +9122,7 @@ pub(crate) async fn resume_auto_approved_runs(s: &AppState) -> usize {
             continue;
         };
         let risk = crate::tools::risk_of(&pending.tool);
+        let search_denied = crate::settings_levels::for_person(s, &run.spec.user_id).await.search.autonomous == "deny";
         if !run.spec.mode.allows_risk(risk)
             || (pending.tool == "web_search" && (!run.spec.search_enabled || search_denied))
         {
@@ -9142,18 +9158,8 @@ pub(crate) async fn resume_auto_approved_runs(s: &AppState) -> usize {
     resumed
 }
 
-async fn put_settings(
-    State(s): State<AppState>,
-    Json(next): Json<AppSettings>,
-) -> Result<Json<AppSettings>, ApiError> {
-    // Held from the read of the replaced settings to the write, so two saves
-    // cannot each reconcile against a version the other has replaced.
-    let _update = s.settings_update.lock().await;
-    let previous = s.settings.read().await.clone();
-    let mut next = next.reconciled_with(&previous);
-    if next.search.brave_key == SAVED_SECRET {
-        next.search.brave_key = previous.search.brave_key.clone();
-    }
+/// The values a settings object must keep, whoever sets it: the company, a group or a person.
+pub(crate) fn check_settings(next: &AppSettings) -> Result<(), ApiError> {
     if next.inference.context_size == 0 || next.inference.context_size > 1_048_576 {
         return Err(ApiError::bad(
             "context_size must be > 0",
@@ -9246,26 +9252,93 @@ async fn put_settings(
     if next.search.max_results == 0 || next.search.max_results > 10 {
         return Err(ApiError::bad("max_results out of range", "Use 1–10."));
     }
+    if !(1..=ATTACHMENT_CEILING_MB).contains(&next.files.max_attach_mb) || !(1..=ATTACHMENT_CEILING_MB).contains(&next.files.max_image_mb) {
+        return Err(ApiError::bad(
+            "attachment limit out of range",
+            format!("Allow between 1 and {ATTACHMENT_CEILING_MB} MB."),
+        ));
+    }
+    if !["ask", "selected", "disabled"].contains(&next.network.policy.as_str()) {
+        return Err(ApiError::bad("unknown network rule", "Use ask, selected or disabled."));
+    }
+    if next.agent.command_timeout_secs == 0 || next.agent.command_timeout_secs > crate::terminal::MAX_TIMEOUT_SECS {
+        return Err(ApiError::bad(
+            "command time limit out of range",
+            format!("Allow between 1 and {} seconds.", crate::terminal::MAX_TIMEOUT_SECS),
+        ));
+    }
     if !["ask", "allow", "deny"].contains(&next.search.autonomous.as_str()) {
         return Err(ApiError::bad(
             "unknown autonomous search policy",
             "Use ask, allow, or deny (§124).",
         ));
     }
+    Ok(())
+}
+
+/// Save what the caller changed on the settings screen: their own choices, and, for a platform
+/// admin, the company's machine and policy fields (`settings_levels`). A change to something set
+/// for them is refused by name, and nothing is saved.
+async fn put_settings(
+    State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Json(next): Json<AppSettings>,
+) -> Result<Json<AppSettings>, ApiError> {
+    // Held from the read of the replaced settings to the write, so two saves
+    // cannot each reconcile against a version the other has replaced.
+    let _update = s.settings_update.lock().await;
+    let previous = s.settings.read().await.clone();
+    let shown = crate::settings_levels::for_person(&s, &caller.id).await;
+    let mut next = next.reconciled_with(&shown);
+    if next.search.brave_key == SAVED_SECRET {
+        next.search.brave_key = shown.search.brave_key.clone();
+    }
+    check_settings(&next)?;
+    let (company, own) = crate::settings_levels::sort_changes(&s, &caller, &shown, &next).await?;
+    if !company.is_empty() {
+        let next = crate::settings_levels::apply(&previous, &company)?;
+        check_settings(&next)?;
+        save_company_settings(&s, &previous, next).await?;
+    }
+    crate::settings_levels::save_own(&s, &caller.id, &own).await?;
+    Ok(Json(without_secrets(crate::settings_levels::for_person(&s, &caller.id).await)))
+}
+
+#[derive(Deserialize)]
+struct CompanyValues {
+    /// Only the fields to change, nested as in the settings.
+    settings: serde_json::Value,
+}
+
+/// A platform admin sets company values directly, the defaults of personal fields included (until
+/// the dashboard; the settings screen saves an admin's personal fields as their own choices).
+async fn put_company_settings(State(s): State<AppState>, Json(request): Json<CompanyValues>) -> Result<Json<AppSettings>, ApiError> {
+    let _update = s.settings_update.lock().await;
+    let previous = s.settings.read().await.clone();
+    let changes = crate::settings_levels::leaves_of(&request.settings);
+    let next = crate::settings_levels::apply(&previous, &changes)?;
+    check_settings(&next)?;
+    save_company_settings(&s, &previous, next.clone()).await?;
+    Ok(Json(without_secrets(next)))
+}
+
+/// Save the company's settings and act on what changed.
+async fn save_company_settings(s: &AppState, previous: &AppSettings, next: AppSettings) -> Result<(), ApiError> {
     s.storage
         .save_settings(&next).await
         .map_err(|error| ApiError::internal(format!("Could not save settings: {error}")))?;
     s.permissions.write().await.autonomy = crate::permissions::autonomy_for_mode(&next.agent.permission_mode);
+    crate::logfile::set_masking(next.privacy.log_redaction);
     *s.settings.write().await = next.clone();
-    resume_auto_approved_runs(&s).await;
+    resume_auto_approved_runs(s).await;
     // A different context, cache preference or fit mode needs its own fit.
     if previous.inference.context_size != next.inference.context_size
         || previous.runtime_auto != next.runtime_auto
         || previous.runtime != next.runtime
     {
-        spawn_fit_preparation(&s, std::time::Duration::from_secs(3));
+        spawn_fit_preparation(s, std::time::Duration::from_secs(3));
     }
-    Ok(Json(without_secrets(next)))
+    Ok(())
 }
 
 async fn system_info(State(s): State<AppState>) -> Json<serde_json::Value> {
@@ -10455,7 +10528,7 @@ mod tests {
             if via_settings {
                 let mut next = state.settings.read().await.clone();
                 next.agent.autonomous_enabled = true;
-                let _ = put_settings(State(state.clone()), Json(next))
+                let _ = put_settings(State(state.clone()), Extension(crate::auth::Caller::local()), Json(next))
                     .await
                     .unwrap();
             } else {
@@ -10543,7 +10616,7 @@ mod tests {
                 let mut next = state.settings.read().await.clone();
                 next.search.autonomous = policy.into();
                 next.agent.autonomous_enabled = via_settings;
-                let _ = put_settings(State(state.clone()), Json(next))
+                let _ = put_settings(State(state.clone()), Extension(crate::auth::Caller::local()), Json(next))
                     .await
                     .unwrap();
                 if !via_settings {
@@ -10576,7 +10649,7 @@ mod tests {
         let mut invalid = state.settings.read().await.clone();
         invalid.agent.autonomous_enabled = true;
         invalid.inference.context_size = 0;
-        assert!(put_settings(State(state.clone()), Json(invalid))
+        assert!(put_settings(State(state.clone()), Extension(crate::auth::Caller::local()), Json(invalid))
             .await
             .is_err());
         // Still Ask (reads free, edits and commands ask), not Auto.
@@ -10928,7 +11001,7 @@ Would you like me to fix it?")]));
             let mut settings = state.settings.read().await.clone();
             settings.agent.autonomous_enabled = false;
             settings.inference.temperature = 0.35;
-            let _ = put_settings(State(state), Json(settings)).await.unwrap();
+            let _ = put_settings(State(state), Extension(crate::auth::Caller::local()), Json(settings)).await.unwrap();
         }
         {
             let state = AppState::new_with_storage(database.reopened(), root.join("models")).await;
@@ -12213,17 +12286,17 @@ Would you like me to fix it?")]));
         let state = AppState::new_stub();
         let mut settings = state.settings.read().await.clone();
         settings.search.brave_key = "secret-key-123".into();
-        let _ = put_settings(State(state.clone()), Json(settings)).await.unwrap();
-        let shown = get_settings(State(state.clone())).await.0;
+        let _ = put_settings(State(state.clone()), Extension(crate::auth::Caller::local()), Json(settings)).await.unwrap();
+        let shown = get_settings(State(state.clone()), Extension(crate::auth::Caller::local())).await.0;
         assert_eq!(shown.search.brave_key, SAVED_SECRET);
         // The screen saves what it was shown: the real key stays.
-        let saved = put_settings(State(state.clone()), Json(shown)).await.unwrap().0;
+        let saved = put_settings(State(state.clone()), Extension(crate::auth::Caller::local()), Json(shown)).await.unwrap().0;
         assert_eq!(saved.search.brave_key, SAVED_SECRET);
         assert_eq!(state.settings.read().await.search.brave_key, "secret-key-123");
         // Clearing the field removes it.
-        let mut cleared = get_settings(State(state.clone())).await.0;
+        let mut cleared = get_settings(State(state.clone()), Extension(crate::auth::Caller::local())).await.0;
         cleared.search.brave_key.clear();
-        let _ = put_settings(State(state.clone()), Json(cleared)).await.unwrap();
+        let _ = put_settings(State(state.clone()), Extension(crate::auth::Caller::local()), Json(cleared)).await.unwrap();
         assert_eq!(state.settings.read().await.search.brave_key, "");
     }
 

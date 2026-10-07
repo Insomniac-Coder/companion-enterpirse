@@ -52,7 +52,8 @@ pub struct AgentSettings {
 pub struct SecuritySettings {
     pub allowed_dirs: Vec<String>,
     pub blocked_dirs: Vec<String>,
-    pub network: String, // disabled | ask | selected
+    /// Unused: `network.policy` is the network rule (this field predates it).
+    pub network: String,
 }
 
 /// Stage 23 appearance section (§30): theme lives here alongside the
@@ -120,6 +121,20 @@ impl AppSettings {
             self.agent.permission_mode = if self.agent.autonomous_enabled { "auto" } else { "ask" }.into();
         }
         self.agent.autonomous_enabled = self.agent.permission_mode == "auto";
+        if self.version < 1 {
+            // Never read before, so these were defaults, not choices: applying them now would
+            // turn web search off and cut long builds to two minutes.
+            if self.network.policy == "disabled" {
+                self.network.policy = "ask".into();
+            }
+            if self.agent.command_timeout_secs == 120 {
+                self.agent.command_timeout_secs = DEFAULT_COMMAND_LIMIT_SECS;
+            }
+            self.version = SETTINGS_VERSION;
+        }
+        if !["ask", "selected", "disabled"].contains(&self.network.policy.as_str()) {
+            self.network.policy = "ask".into();
+        }
         self
     }
 
@@ -174,7 +189,9 @@ fn default_true() -> bool {
 /// Stage 23 network policy (§56).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkSettings {
-    pub policy: String, // disabled | ask | selected
+    /// ask: web search when a person turns it on; selected: only the trusted hosts; disabled:
+    /// no web access at all.
+    pub policy: String,
     pub trusted_hosts: Vec<String>,
 }
 
@@ -328,7 +345,18 @@ pub struct AppSettings {
     pub advanced: AdvancedSettings,
     #[serde(default = "default_diagnostics_settings")]
     pub diagnostics: DiagnosticsSettings,
+    /// Which meaning the saved values have. 0: saved before the policy fields were applied
+    /// (enterprise Phase 1, task 6), when the network policy and command time limit held
+    /// defaults that nothing read; `normalized` maps those once.
+    #[serde(default)]
+    pub version: u32,
 }
+
+/// The settings' current `version`.
+pub const SETTINGS_VERSION: u32 = 1;
+/// The longest a command may run unless the company or a group sets less: what
+/// `terminal::MAX_TIMEOUT_SECS` allowed before the limit was applied.
+pub const DEFAULT_COMMAND_LIMIT_SECS: u64 = 1800;
 
 fn default_runtime_auto() -> bool {
     true
@@ -377,7 +405,7 @@ fn default_privacy_settings() -> PrivacySettings {
 }
 fn default_network_settings() -> NetworkSettings {
     NetworkSettings {
-        policy: "disabled".into(),
+        policy: "ask".into(),
         trusted_hosts: vec![],
     }
 }
@@ -436,7 +464,7 @@ impl Default for AppSettings {
                 kv_cache_gpu: true,
             },
             agent: AgentSettings {
-                command_timeout_secs: 120,
+                command_timeout_secs: DEFAULT_COMMAND_LIMIT_SECS,
                 autonomous_enabled: false,
                 permission_mode: "ask".into(),
             },
@@ -457,6 +485,7 @@ impl Default for AppSettings {
             network: default_network_settings(),
             advanced: default_advanced_settings(),
             diagnostics: default_diagnostics_settings(),
+            version: SETTINGS_VERSION,
         }
     }
 }

@@ -36,7 +36,9 @@ fork to drop the model weights (Git LFS); commit ids differ from the Companion's
   route under a record path is covered by the middleware, but a route that takes a record id in its
   body must call `ownership::conversation`/`workspace` itself. Task 6 (settings levels + policies) done
   2026-10-07: `settings_levels.rs`; code acting for a person must read `settings_levels::for_person`,
-  not `AppState.settings` (the company's). Next: task 7 (permissions and replies per person).
+  not `AppState.settings` (the company's). Task 7 (permissions and replies per person) done
+  2026-10-07: `AppState::permissions_of(user)` / `permission_mode_of(user)` (capped by
+  `agent.max_permission_mode`); one reply per `generation::reply_key`. Next: task 8 (audit records).
 - Everything below this section is the Companion's own handoff, kept as it was at the fork.
 
 # Handoff — start here

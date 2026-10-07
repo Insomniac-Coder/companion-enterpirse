@@ -440,9 +440,12 @@ a command or project check runs at most the **command time limit** (default 30 m
 **log masking** on (the default), the log file Companion writes, and so the logs zip, has bearer
 tokens, API keys, passwords in connection addresses and `password=`-style values replaced by `***`.
 
-The permission mode is still one for everyone on a server with sign-in, and a platform admin's to
-change; people get their own with a later update. A laptop install has no sign-in and its one person
-has every role, as before.
+Each person has their own **permission mode** (ask, accept edits, plan, auto) and their own "Allow
+for session" grants; switching to Auto releases only your own waiting actions. The company or a group
+sets the most anyone may choose (`agent.max_permission_mode`, default `auto`): modes above it are
+greyed out, and a mode chosen before a lower limit was set counts as that limit. Each conversation
+has its own reply, and Stop stops only yours. A laptop install has no sign-in and its one person has
+every role, as before.
 
 Everyone sees only their own conversations, projects, saved memories and agent runs; a record of
 someone else's is "not found", for platform admins too (running the server is not reading people's

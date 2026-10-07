@@ -46,6 +46,14 @@ pub struct AgentSettings {
     /// switch; a settings file from before the modes reads its mode from it.
     #[serde(default)]
     pub permission_mode: String,
+    /// The most a person's permission mode may allow (plan < ask < accept_edits < auto): a company
+    /// or group policy. A person's mode above it acts as this.
+    #[serde(default = "default_max_permission_mode")]
+    pub max_permission_mode: String,
+}
+
+fn default_max_permission_mode() -> String {
+    "auto".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +129,9 @@ impl AppSettings {
             self.agent.permission_mode = if self.agent.autonomous_enabled { "auto" } else { "ask" }.into();
         }
         self.agent.autonomous_enabled = self.agent.permission_mode == "auto";
+        if !crate::permissions::PERMISSION_MODES.contains(&self.agent.max_permission_mode.as_str()) {
+            self.agent.max_permission_mode = default_max_permission_mode();
+        }
         if self.version < 1 {
             // Never read before, so these were defaults, not choices: applying them now would
             // turn web search off and cut long builds to two minutes.
@@ -467,6 +478,7 @@ impl Default for AppSettings {
                 command_timeout_secs: DEFAULT_COMMAND_LIMIT_SECS,
                 autonomous_enabled: false,
                 permission_mode: "ask".into(),
+                max_permission_mode: default_max_permission_mode(),
             },
             security: SecuritySettings {
                 allowed_dirs: vec![],

@@ -87,7 +87,9 @@ pub struct AppState {
     pub agent_active: Arc<std::sync::atomic::AtomicUsize>,
     pub artifacts_dir: PathBuf,
     pub http: reqwest::Client,
-    pub permissions: Arc<tokio::sync::RwLock<PermissionManager>>,
+    /// Each person's permission state: their "Allow for session" grants, and the autonomy their
+    /// own permission mode gives (`permissions_of`).
+    pub permissions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, PermissionManager>>>,
     pub settings: Arc<tokio::sync::RwLock<AppSettings>>,
     /// Serialize durable settings changes, including the permission shortcut.
     pub(crate) settings_update: Arc<tokio::sync::Mutex<()>>,
@@ -263,7 +265,7 @@ impl AppState {
                 let _ = st.finish_task_context(&run.spec.conversation_id, &run.id, "interrupted").await;
             }
         }
-        let _ = self.generations.write().await.cancel_current(&self.storage).await;
+        let _ = self.generations.write().await.cancel_all(&self.storage).await;
         // Dev servers and watchers the tasks left running would otherwise keep
         // their ports after Companion has gone.
         crate::terminal::stop_all_background();
@@ -312,9 +314,6 @@ impl AppState {
             .parent()
             .map(|p| p.join("artifacts"))
             .unwrap_or_else(|| PathBuf::from("data").join("artifacts"));
-        // Only the explicit global preference is durable. Temporary grants and
-        // one-time approvals belong to the old process and are never restored.
-        let permissions = PermissionManager::new(crate::permissions::autonomy_for_mode(&settings.agent.permission_mode));
         Self {
             models: Arc::new(tokio::sync::RwLock::new(ModelManager::new())),
             inference: Arc::new(tokio::sync::RwLock::new(StubEngine::new())),
@@ -336,7 +335,7 @@ impl AppState {
                 .read_timeout(std::time::Duration::from_secs(120))
                 .build()
                 .expect("http client"),
-            permissions: Arc::new(tokio::sync::RwLock::new(permissions)),
+            permissions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             settings: Arc::new(tokio::sync::RwLock::new(settings)),
             settings_update: Arc::new(tokio::sync::Mutex::new(())),
             runtime_update: Arc::new(tokio::sync::Mutex::new(())),
@@ -366,6 +365,25 @@ impl AppState {
     pub fn with_install_root(mut self, root: PathBuf) -> Self {
         self.install_root = root;
         self
+    }
+
+    /// `user`'s permission mode: their own choice (or their group's or the company's), capped by
+    /// the most their company or group allows.
+    pub async fn permission_mode_of(&self, user: &str) -> String {
+        let settings = crate::settings_levels::for_person(self, user).await;
+        crate::permissions::capped_mode(&settings.agent.permission_mode, &settings.agent.max_permission_mode)
+    }
+
+    /// `user`'s permission state, with the autonomy their mode gives now. Grants and one-time
+    /// approvals belong to this process and are never restored after a restart.
+    pub async fn permissions_of(&self, user: &str) -> tokio::sync::RwLockMappedWriteGuard<'_, PermissionManager> {
+        let autonomy = crate::permissions::autonomy_for_mode(&self.permission_mode_of(user).await);
+        let all = self.permissions.write().await;
+        tokio::sync::RwLockWriteGuard::map(all, |all| {
+            let state = all.entry(user.to_string()).or_insert_with(|| PermissionManager::new(autonomy));
+            state.autonomy = autonomy;
+            state
+        })
     }
 
     pub fn with_auth(mut self, auth: crate::auth::Auth) -> Self {
@@ -584,7 +602,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/settings", get(get_settings).put(put_settings))
         .route(
             "/api/permissions/mode",
-            get(get_permission_mode).put(admin(put_permission_mode)),
+            get(get_permission_mode).put(put_permission_mode),
         )
         .route("/api/system", get(system_info))
         .route("/api/system/pick-folder", post(pick_folder))
@@ -3610,8 +3628,9 @@ async fn chat_sse(
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let partial = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let persisted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // A new turn supersedes any running one: cancel it (partial kept) first.
-    s.generations.write().await.cancel_current(&s.storage).await;
+    // A new turn supersedes this conversation's running reply (partial kept), and only that.
+    let key = crate::generation::reply_key(conv_id.as_deref(), &caller.id);
+    s.generations.write().await.cancel(&s.storage, &key).await;
     // Automatic compaction is decided before this reply and runs before it is
     // generated, never during it: saved history at the threshold share of the
     // room a request gives history would otherwise start losing old messages.
@@ -4304,6 +4323,7 @@ async fn chat_sse(
     s.generations.write().await.insert(ActiveGeneration {
         id: gen_id,
         conversation_id: conv_id,
+        user_id: caller.id.clone(),
         cancel,
         partial,
         persisted,
@@ -4318,8 +4338,24 @@ async fn chat_sse(
 /// closes the HTTP connection; llama-server notices the disconnect, aborts
 /// that decode slot, and the GPU is free for the next request instead of
 /// finishing tokens nobody will read.
-async fn chat_stop(State(s): State<AppState>) -> Json<crate::generation::CancelOutcome> {
-    Json(s.generations.write().await.cancel_current(&s.storage).await)
+/// Which reply to stop: a conversation of the caller's, or their reply outside any conversation.
+#[derive(Deserialize, Default)]
+struct StopRequest {
+    #[serde(default)]
+    conversation_id: Option<String>,
+}
+
+async fn chat_stop(
+    State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    body: Option<Json<StopRequest>>,
+) -> Result<Json<crate::generation::CancelOutcome>, ApiError> {
+    let conversation = body.and_then(|Json(request)| request.conversation_id).filter(|id| !id.trim().is_empty());
+    if let Some(id) = &conversation {
+        crate::ownership::conversation(&s, &caller, id).await?;
+    }
+    let key = crate::generation::reply_key(conversation.as_deref(), &caller.id);
+    Ok(Json(s.generations.write().await.cancel(&s.storage, &key).await))
 }
 
 async fn list_conversations(
@@ -5400,6 +5436,7 @@ async fn execute_tool(
     let ws = crate::workspace::WorkspaceManager::new(ws_root);
     let (via, approval) = gate_tool_call(
         &s,
+        &caller.id,
         &record_target(&req.conversation_id),
         &req.tool,
         &req.args,
@@ -5612,6 +5649,7 @@ async fn folder_policy(s: &AppState, user: &str, folder: &std::path::Path) -> Re
 /// response and in words for the record; a refusal is recorded and returned.
 async fn gate_tool_call(
     s: &AppState,
+    user: &str,
     record_as: &str,
     tool: &str,
     args: &serde_json::Value,
@@ -5622,7 +5660,7 @@ async fn gate_tool_call(
     use crate::permissions::{PermissionDecision, RiskLevel};
     let risk = tools::risk_of(tool);
     let (decision, by_grant, granted_now) = {
-        let mut pm = s.permissions.write().await;
+        let mut pm = s.permissions_of(user).await;
         // Session grants are recorded only alongside an explicit approval.
         let granted_now = grant_session && approved_once && risk == RiskLevel::Moderate;
         if granted_now {
@@ -6660,10 +6698,11 @@ async fn run_slash_command(
             .await?;
             Ok(O::AgentRun { run_id: run_id.clone(), message: format!("Agent run started ({}) — it will ask before builds/commands. Watch the Agent tab.", &run_id[..8]) })
         }
-        "permissions" => Ok(O::Message(s.permissions.read().await.describe())),
+        "permissions" => Ok(O::Message(s.permissions_of(&caller.id).await.describe())),
         "config" => Ok(O::Message(config_text(s, caller, args).await)),
         "stop" => {
-            let out = s.generations.write().await.cancel_current(&s.storage).await;
+            let key = crate::generation::reply_key(conv_id.as_deref(), &caller.id);
+            let out = s.generations.write().await.cancel(&s.storage, &key).await;
             Ok(O::Message(if out.stopped {
                 format!("Stopped generation (kept {} chars).", out.chars_kept)
             } else {
@@ -8049,7 +8088,7 @@ async fn run_plugin_command(
     // The same gate as every other direct tool call: a plugin used to run
     // whatever its caller said was approved, whatever the permission mode.
     let record_as = format!("plugin:{id}");
-    let (_, approval) = gate_tool_call(&s, &record_as, &req.tool, &req.args, &ws_key, req.approved, false).await?;
+    let (_, approval) = gate_tool_call(&s, &caller.id, &record_as, &req.tool, &req.args, &ws_key, req.approved, false).await?;
     let limit = crate::settings_levels::for_person(&s, &caller.id).await.agent.command_timeout_secs;
     let tool_req = crate::tools::within_time_limit(
         crate::tools::ToolRequest { name: req.tool.clone(), args: req.args.clone(), approved: true },
@@ -8668,11 +8707,7 @@ async fn list_sessions(State(s): State<AppState>, Extension(caller): Extension<C
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     let generating: std::collections::HashSet<String> = {
         let mut set = std::collections::HashSet::new();
-        if let Some(cid) = s.generations.read().await.active_conversation() {
-            if !cid.is_empty() {
-                set.insert(cid);
-            }
-        }
+        for cid in s.generations.read().await.active_conversations() { set.insert(cid); }
         for r in s.agents.read().await.summaries() {
             if r.state.is_active() && !r.conversation_id.is_empty()
             {
@@ -8859,11 +8894,7 @@ async fn sessions_recovery(State(s): State<AppState>, Extension(caller): Extensi
         .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     let busy: Vec<String> = {
         let mut b = Vec::new();
-        if let Some(cid) = s.generations.read().await.active_conversation() {
-            if !cid.is_empty() {
-                b.push(cid);
-            }
-        }
+        for cid in s.generations.read().await.active_conversations() { b.push(cid); }
         b
     };
     let stale: Vec<serde_json::Value> = convs
@@ -8902,8 +8933,8 @@ async fn session_action(
     match req.action.as_str() {
         "pause" | "stop" => {
             let mut acted = Vec::new();
-            if s.generations.read().await.active_conversation().as_deref() == Some(id.as_str()) {
-                let out = s.generations.write().await.cancel_current(&s.storage).await;
+            if s.generations.read().await.active_conversations().contains(&id) {
+                let out = s.generations.write().await.cancel(&s.storage, &crate::generation::reply_key(Some(&id), "")).await;
                 if out.stopped {
                     acted.push(format!(
                         "generation stopped ({} chars kept)",
@@ -9069,19 +9100,46 @@ struct PermissionModeRequest {
     mode: String,
 }
 
-async fn get_permission_mode(State(s): State<AppState>) -> Json<serde_json::Value> {
-    let mode = s.settings.read().await.agent.permission_mode.clone();
-    Json(serde_json::json!({ "mode": mode }))
+/// The caller's permission mode, and the most their company or group allows.
+async fn get_permission_mode(State(s): State<AppState>, Extension(caller): Extension<Caller>) -> Json<serde_json::Value> {
+    let settings = crate::settings_levels::for_person(&s, &caller.id).await;
+    Json(serde_json::json!({
+        "mode": crate::permissions::capped_mode(&settings.agent.permission_mode, &settings.agent.max_permission_mode),
+        "max": settings.agent.max_permission_mode,
+    }))
 }
 
+/// Change the caller's permission mode: their own choice on a server, up to the most their
+/// company or group allows; the one mode on a laptop. Their waiting actions the new mode allows
+/// are released.
 async fn put_permission_mode(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Json(req): Json<PermissionModeRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if !crate::permissions::PERMISSION_MODES.contains(&req.mode.as_str()) {
         return Err(ApiError::bad("unknown permission mode", "Use ask, accept_edits, plan or auto."));
     }
-    let autonomy = crate::permissions::autonomy_for_mode(&req.mode);
+    if s.auth.sign_in_required() {
+        let settings = crate::settings_levels::for_person(&s, &caller.id).await;
+        if crate::permissions::mode_rank(&req.mode) > crate::permissions::mode_rank(&settings.agent.max_permission_mode) {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                format!("your company allows up to {}", settings.agent.max_permission_mode),
+                "Choose that mode or a stricter one.",
+            ));
+        }
+        let mut next = settings.clone();
+        next.agent.permission_mode = req.mode.clone();
+        let (company, own) = crate::settings_levels::sort_changes(&s, &caller, &settings, &next).await?;
+        // Only the mode changed, and it is personal: it is the person's choice, unless locked.
+        if !company.is_empty() {
+            return Err(ApiError::new(StatusCode::FORBIDDEN, "the permission mode is set for you", "It is locked."));
+        }
+        crate::settings_levels::save_own(&s, &caller.id, &own).await?;
+        let resumed = resume_auto_approved_runs(&s).await;
+        return Ok(Json(serde_json::json!({ "mode": req.mode, "resumed": resumed })));
+    }
     let _update = s.settings_update.lock().await;
     let mut next = s.settings.read().await.clone();
     next.agent.permission_mode = req.mode.clone();
@@ -9092,7 +9150,6 @@ async fn put_permission_mode(
             ApiError::internal(format!("Could not save permission preference: {error}"))
         })?;
     *s.settings.write().await = next;
-    s.permissions.write().await.autonomy = autonomy;
     let resumed = resume_auto_approved_runs(&s).await;
     Ok(Json(
         serde_json::json!({ "mode": req.mode, "resumed": resumed }),
@@ -9130,11 +9187,11 @@ pub(crate) async fn resume_auto_approved_runs(s: &AppState) -> usize {
         }
         // Web search consent is its own prompt: only Auto releases it, never
         // a session grant (review finding).
-        if pending.tool == "web_search" && s.permissions.read().await.autonomy != crate::permissions::AutonomyLevel::Autonomous {
+        if pending.tool == "web_search" && s.permissions_of(&run.spec.user_id).await.autonomy != crate::permissions::AutonomyLevel::Autonomous {
             continue;
         }
         let allowed = matches!(
-            s.permissions.read().await.decide_call(
+            s.permissions_of(&run.spec.user_id).await.decide_call(
                 &pending.tool,
                 &pending.args,
                 risk,
@@ -9327,7 +9384,6 @@ async fn save_company_settings(s: &AppState, previous: &AppSettings, next: AppSe
     s.storage
         .save_settings(&next).await
         .map_err(|error| ApiError::internal(format!("Could not save settings: {error}")))?;
-    s.permissions.write().await.autonomy = crate::permissions::autonomy_for_mode(&next.agent.permission_mode);
     crate::logfile::set_masking(next.privacy.log_redaction);
     *s.settings.write().await = next.clone();
     resume_auto_approved_runs(s).await;
@@ -9410,11 +9466,7 @@ async fn system_overview(State(s): State<AppState>, Extension(caller): Extension
     let st = &s.storage;
     let convs = st.list_conversations(&caller.id).await.unwrap_or_default();
     let mut active = std::collections::HashSet::new();
-    if let Some(cid) = s.generations.read().await.active_conversation() {
-        if !cid.is_empty() {
-            active.insert(cid);
-        }
-    }
+    for cid in s.generations.read().await.active_conversations() { active.insert(cid); }
     for r in s.agents.read().await.summaries() {
         if r.state.is_active() && !r.conversation_id.is_empty()
         {
@@ -10327,7 +10379,7 @@ async fn model_optimize(
     let device = current_device_profile(&s);
     let active = {
         let mut n = 0;
-        if s.generations.read().await.active_conversation().is_some() {
+        if s.generations.read().await.is_active() {
             n += 1;
         }
         n += s
@@ -10477,6 +10529,20 @@ mod tests {
         std::sync::Arc<crate::agent_runner::LiveRun>,
         tokio::sync::oneshot::Receiver<crate::agent_runner::ApprovalDecision>,
     ) {
+        pending_approval_for(state, tool, mode, search_enabled, "local").await
+    }
+
+    /// A run of `user`'s waiting for approval of `tool`.
+    async fn pending_approval_for(
+        state: &AppState,
+        tool: &str,
+        mode: AgentMode,
+        search_enabled: bool,
+        user: &str,
+    ) -> (
+        std::sync::Arc<crate::agent_runner::LiveRun>,
+        tokio::sync::oneshot::Receiver<crate::agent_runner::ApprovalDecision>,
+    ) {
         let (approval_tx, approval_rx) = tokio::sync::oneshot::channel();
         let (activity_tx, _) = tokio::sync::mpsc::unbounded_channel();
         let run = std::sync::Arc::new(crate::agent_runner::LiveRun {
@@ -10489,7 +10555,7 @@ mod tests {
                 conversation_id: String::new(),
                 search_enabled,
                 reasoning: false,
-                user_id: "local".into(),
+                user_id: user.into(),
             },
             cancel: CancelToken::new(),
             events: std::sync::Mutex::new(vec![crate::agent::AgentEvent::activity(
@@ -10513,6 +10579,97 @@ mod tests {
         (run, approval_rx)
     }
 
+    // --- Phase 1 task 7: permissions and replies are each person's own. ---
+
+    fn person_folder(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("companion-perm-{name}-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn permission_modes_and_session_grants_are_each_persons_own() {
+        use crate::roles::tests::{call, json, person, server, status};
+        let (app, state) = server();
+        let (_, ada) = person(&state, "ada", &[]).await;
+        let (_, bob) = person(&state, "bob", &[]).await;
+        let (_, boss) = person(&state, "boss", &[crate::roles::PLATFORM_ADMIN]).await;
+        // The same server folder, saved by each as their own project: a grant must still be one person's.
+        let shared = person_folder("shared");
+        let (ada_folder, bob_folder) = (shared.clone(), shared);
+        for (who, folder) in [(&ada, &ada_folder), (&bob, &bob_folder)] {
+            assert_eq!(status(&app, call("POST", "/api/workspaces", who, Some(serde_json::json!({ "name": "p", "path": folder })))).await, StatusCode::OK);
+        }
+        let write = |who: &str, folder: &str, extra: serde_json::Value| {
+            let mut body = serde_json::json!({ "workspace": folder, "tool": "write_file", "args": { "path": "n.txt", "content": "x" } });
+            for (key, value) in extra.as_object().unwrap() {
+                body[key] = value.clone();
+            }
+            call("POST", "/api/tools/execute", who, Some(body))
+        };
+        let mode = |who: &str, mode: &str| call("PUT", "/api/permissions/mode", who, Some(serde_json::json!({ "mode": mode })));
+
+        // Both in Ask: a file write waits for approval.
+        assert_eq!(status(&app, write(&ada, &ada_folder, serde_json::json!({}))).await, StatusCode::FORBIDDEN);
+        // Ada accepts edits; Bob is still asked.
+        assert_eq!(status(&app, mode(&ada, "accept_edits")).await, StatusCode::OK);
+        assert_eq!(status(&app, write(&ada, &ada_folder, serde_json::json!({}))).await, StatusCode::OK);
+        assert_eq!(status(&app, write(&bob, &bob_folder, serde_json::json!({}))).await, StatusCode::FORBIDDEN);
+        assert_eq!(json(&app, call("GET", "/api/permissions/mode", &bob, None)).await["mode"], "ask");
+
+        // Bob allows file writes for the session: his grant, not Ada's.
+        assert_eq!(status(&app, write(&bob, &bob_folder, serde_json::json!({ "approved_once": true, "grant_session": true }))).await, StatusCode::OK);
+        assert_eq!(status(&app, write(&bob, &bob_folder, serde_json::json!({}))).await, StatusCode::OK);
+        assert_eq!(status(&app, mode(&ada, "ask")).await, StatusCode::OK);
+        assert_eq!(status(&app, write(&ada, &ada_folder, serde_json::json!({}))).await, StatusCode::FORBIDDEN, "Bob's grant is not hers");
+
+        // The company caps the mode: nobody may choose more, and a choice made before acts as the cap.
+        assert_eq!(status(&app, mode(&bob, "auto")).await, StatusCode::OK);
+        assert_eq!(status(&app, call("PUT", "/api/admin/settings/company", &boss, Some(serde_json::json!({ "settings": { "agent": { "max_permission_mode": "ask" } } })))).await, StatusCode::OK);
+        assert_eq!(status(&app, mode(&ada, "accept_edits")).await, StatusCode::FORBIDDEN);
+        let bobs = json(&app, call("GET", "/api/permissions/mode", &bob, None)).await;
+        assert_eq!((bobs["mode"].as_str(), bobs["max"].as_str()), (Some("ask"), Some("ask")));
+        let _ = std::fs::remove_dir_all(ada_folder);
+    }
+
+    #[tokio::test]
+    async fn one_persons_auto_releases_only_their_own_waiting_actions() {
+        use crate::roles::tests::{call, json, person, server};
+        let (app, state) = server();
+        let (ada_id, ada) = person(&state, "ada", &[]).await;
+        let (bob_id, _) = person(&state, "bob", &[]).await;
+        let (_, mut ada_waiting) = pending_approval_for(&state, "execute_command", AgentMode::Agent, false, &ada_id).await;
+        let (_, mut bob_waiting) = pending_approval_for(&state, "execute_command", AgentMode::Agent, false, &bob_id).await;
+        let switched = json(&app, call("PUT", "/api/permissions/mode", &ada, Some(serde_json::json!({ "mode": "auto" })))).await;
+        assert_eq!(switched["resumed"], 1, "{switched}");
+        assert!(matches!(ada_waiting.try_recv(), Ok(crate::agent_runner::ApprovalDecision::Approved { .. })));
+        assert!(bob_waiting.try_recv().is_err(), "Bob's run still waits for Bob");
+    }
+
+    #[tokio::test]
+    async fn stop_reaches_only_your_own_reply() {
+        use crate::roles::tests::{call, json, person, server, status};
+        let (app, state) = server();
+        let (ada_id, ada) = person(&state, "ada", &[]).await;
+        let (_, bob) = person(&state, "bob", &[]).await;
+        let conversation = json(&app, call("POST", "/api/conversations", &ada, Some(serde_json::json!({ "title": "A", "model_id": "" })))).await["id"].as_str().unwrap().to_string();
+        state.generations.write().await.insert(ActiveGeneration {
+            id: "ada-reply".into(),
+            conversation_id: Some(conversation.clone()),
+            user_id: ada_id,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            partial: Default::default(),
+            persisted: Default::default(),
+            handle: tokio::spawn(std::future::pending()),
+        });
+        let stop = |who: &str, body: Option<serde_json::Value>| call("POST", "/api/chat/stop", who, body);
+        assert_eq!(status(&app, stop(&bob, Some(serde_json::json!({ "conversation_id": conversation })))).await, StatusCode::NOT_FOUND);
+        assert_eq!(json(&app, stop(&bob, None)).await["stopped"], false, "Bob has nothing running");
+        assert_eq!(state.generations.read().await.running(), 1, "Ada's reply carries on");
+        assert_eq!(json(&app, stop(&ada, Some(serde_json::json!({ "conversation_id": conversation })))).await["stopped"], true);
+        assert!(!state.generations.read().await.is_active());
+    }
+
     #[tokio::test]
     async fn both_auto_setting_paths_release_pending_commands_and_deletion_once() {
         for via_settings in [false, true] {
@@ -10533,7 +10690,7 @@ mod tests {
                     .unwrap();
             } else {
                 let result = put_permission_mode(
-                    State(state.clone()),
+                    State(state.clone()), Extension(crate::auth::Caller::local()),
                     Json(PermissionModeRequest {
                         mode: "auto".into(),
                     }),
@@ -10558,7 +10715,7 @@ mod tests {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty)
             ));
             let again = put_permission_mode(
-                State(state.clone()),
+                State(state.clone()), Extension(crate::auth::Caller::local()),
                 Json(PermissionModeRequest {
                     mode: "auto".into(),
                 }),
@@ -10580,13 +10737,13 @@ mod tests {
                     .autonomous_enabled
             );
             let _ = put_permission_mode(
-                State(state.clone()),
+                State(state.clone()), Extension(crate::auth::Caller::local()),
                 Json(PermissionModeRequest { mode: "ask".into() }),
             )
             .await
             .unwrap();
             assert!(matches!(
-                state.permissions.read().await.decide(
+                state.permissions_of("local").await.decide(
                     "execute_command",
                     crate::permissions::RiskLevel::Dangerous,
                     true
@@ -10628,7 +10785,7 @@ mod tests {
                         "Ask must leave the request waiting"
                     );
                     let _ = put_permission_mode(
-                        State(state.clone()),
+                        State(state.clone()), Extension(crate::auth::Caller::local()),
                         Json(PermissionModeRequest {
                             mode: "auto".into(),
                         }),
@@ -10654,7 +10811,7 @@ mod tests {
             .is_err());
         // Still Ask (reads free, edits and commands ask), not Auto.
         assert_eq!(
-            state.permissions.read().await.autonomy,
+            state.permissions_of("local").await.autonomy,
             AutonomyLevel::WorkspaceAgent
         );
         assert!(matches!(
@@ -10670,7 +10827,7 @@ mod tests {
             pending_approval_fixture(&state, "execute_command", AgentMode::Agent, false).await;
         drop(receiver);
         let result = put_permission_mode(
-            State(state),
+            State(state), Extension(crate::auth::Caller::local()),
             Json(PermissionModeRequest {
                 mode: "auto".into(),
             }),
@@ -10704,7 +10861,7 @@ Would you like me to fix it?")]));
         let state = AppState::new_stub();
         let (_, mut search) = pending_approval_fixture(&state, "web_search", AgentMode::Agent, true).await;
         let (_, mut read) = pending_approval_fixture(&state, "read_file", AgentMode::Agent, false).await;
-        let _ = put_permission_mode(State(state.clone()), Json(PermissionModeRequest { mode: "accept_edits".into() }))
+        let _ = put_permission_mode(State(state.clone()), Extension(crate::auth::Caller::local()), Json(PermissionModeRequest { mode: "accept_edits".into() }))
             .await
             .unwrap();
         assert!(matches!(search.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)), "search consent is its own prompt");
@@ -10945,11 +11102,11 @@ Would you like me to fix it?")]));
         {
             let state = AppState::new_with_storage(database.reopened(), root.join("models")).await;
             assert_eq!(
-                get_permission_mode(State(state.clone())).await.0["mode"],
+                get_permission_mode(State(state.clone()), Extension(crate::auth::Caller::local())).await.0["mode"],
                 "ask"
             );
             let _ = put_permission_mode(
-                State(state.clone()),
+                State(state.clone()), Extension(crate::auth::Caller::local()),
                 Json(PermissionModeRequest {
                     mode: "auto".into(),
                 }),
@@ -10957,19 +11114,18 @@ Would you like me to fix it?")]));
             .await
             .unwrap();
             state
-                .permissions
-                .write()
+                .permissions_of("local")
                 .await
                 .grant_session("write_file", "project");
         }
         {
             let state = AppState::new_with_storage(database.reopened(), root.join("models")).await;
             assert_eq!(
-                get_permission_mode(State(state.clone())).await.0["mode"],
+                get_permission_mode(State(state.clone()), Extension(crate::auth::Caller::local())).await.0["mode"],
                 "auto"
             );
             assert!(state.settings.read().await.agent.autonomous_enabled);
-            let policy = state.permissions.read().await;
+            let policy = state.permissions_of("local").await;
             assert!(matches!(
                 policy.decide_in(
                     "write_file",
@@ -11006,7 +11162,7 @@ Would you like me to fix it?")]));
         {
             let state = AppState::new_with_storage(database.reopened(), root.join("models")).await;
             assert_eq!(
-                get_permission_mode(State(state.clone())).await.0["mode"],
+                get_permission_mode(State(state.clone()), Extension(crate::auth::Caller::local())).await.0["mode"],
                 "ask"
             );
             assert_eq!(state.settings.read().await.inference.temperature, 0.35);
@@ -11017,8 +11173,7 @@ Would you like me to fix it?")]));
                 assert!(
                     matches!(
                         state
-                            .permissions
-                            .read()
+                            .permissions_of("local")
                             .await
                             .decide_in(tool, risk, true, Some("project")),
                         crate::permissions::PermissionDecision::RequireApproval { .. }
@@ -11725,6 +11880,7 @@ Would you like me to fix it?")]));
         state.generations.write().await.insert(ActiveGeneration {
             id: "busy-test".into(),
             conversation_id: None,
+                user_id: "local".into(),
             cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             partial: Arc::new(std::sync::Mutex::new(String::new())),
             persisted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -11744,7 +11900,7 @@ Would you like me to fix it?")]));
             .generations
             .write()
             .await
-            .cancel_current(&state.storage)
+            .cancel_all(&state.storage)
             .await;
     }
 
@@ -12851,6 +13007,7 @@ Would you like me to fix it?")]));
             .insert(crate::generation::ActiveGeneration {
                 id: "active-preparation-guard".into(),
                 conversation_id: None,
+                user_id: "local".into(),
                 cancel: cancellation.clone(),
                 partial: Default::default(),
                 persisted: Default::default(),
@@ -12883,7 +13040,7 @@ Would you like me to fix it?")]));
             .generations
             .write()
             .await
-            .cancel_current(&state.storage)
+            .cancel_all(&state.storage)
             .await;
     }
 

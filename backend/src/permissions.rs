@@ -41,6 +41,21 @@ pub enum AutonomyLevel {
 pub const PERMISSION_MODES: [&str; 4] = ["ask", "accept_edits", "plan", "auto"];
 
 /// The autonomy level a permission mode applies. Unknown names read as "ask".
+/// How much a mode allows: plan (read-only) < ask < accept_edits < auto.
+pub fn mode_rank(mode: &str) -> u8 {
+    match mode {
+        "plan" => 0,
+        "accept_edits" => 2,
+        "auto" => 3,
+        _ => 1,
+    }
+}
+
+/// `mode`, or `max` when `mode` allows more than `max` does.
+pub fn capped_mode(mode: &str, max: &str) -> String {
+    if mode_rank(mode) > mode_rank(max) { max.to_string() } else { mode.to_string() }
+}
+
 pub fn autonomy_for_mode(mode: &str) -> AutonomyLevel {
     match mode {
         "auto" => AutonomyLevel::Autonomous,

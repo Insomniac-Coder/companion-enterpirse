@@ -559,6 +559,12 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   and `saved_project_folder`, the network rule in `search::run_search`, attachment limits in
   `add_attachment` (the route's body limit is the 50 MB ceiling), the command limit through
   `tools::within_time_limit`, and log masking in `logfile::AppFileWriter`.
+- Permissions and replies (task 7): `AppState::permissions_of(user)` is each person's own
+  `PermissionManager` (session grants, one-time approvals); `permission_mode_of(user)` is their
+  chosen mode capped by the policy field `agent.max_permission_mode` (`permissions::capped_mode`).
+  `resume_auto_approved_runs` decides each waiting run with its owner's permissions.
+  `GenerationTracker` holds one reply per `reply_key(conversation, person)`; Stop names the
+  conversation and reaches only the caller's reply.
 - `LLM → ToolRequest → PermissionManager → Tool → OS`. No direct OS access.
 - `WorkspaceManager::resolve` is the only path joiner; lexical + canonical checks.
 - MODERATE/DANGEROUS tools require `approved=true` (permission UX sets it, §26).
@@ -568,7 +574,7 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
 - `PermissionManager::decide_call` sees the call's arguments: an edit inside any `.git` folder
   (config, hooks) asks even in Accept edits, because git runs commands named there. The app's own
   git reads pass `-c core.fsmonitor=false --no-ext-diff --no-textconv`.
-- Changing the mode releases waiting actions the new mode allows; a waiting web search is released
+- Changing the mode releases the person's own waiting actions the new mode allows; a waiting web search is released
   only by Auto. Shift+Tab cycles ask → accept edits → plan (never Auto) and saves where it stops;
   saves go one at a time (`PermissionModeSaver`).
 

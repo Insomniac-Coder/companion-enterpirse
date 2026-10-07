@@ -218,7 +218,7 @@ async fn main() {
             std::sync::Arc::new(move || {
                 let g = gens
                     .try_read()
-                    .map(|t| t.current_id().is_some() as usize)
+                    .map(|t| t.running())
                     .unwrap_or(0);
                 g + counter.load(std::sync::atomic::Ordering::Relaxed)
             });

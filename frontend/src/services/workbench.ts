@@ -27,6 +27,20 @@ export function nextPermissionMode(mode: string, available: readonly string[] = 
   return index < 0 ? cycle[0] : cycle[(index + 1) % cycle.length];
 }
 
+/** Plan allows least, then Ask, Accept edits, Auto (the server's `permissions::mode_rank`). */
+const MODE_RANK: Record<string, number> = { plan: 0, ask: 1, accept_edits: 2, auto: 3 };
+const rank = (mode: string) => MODE_RANK[mode] ?? 1;
+
+/** The modes no more permissive than `max`, the most a person's company or group allows. */
+export function modesWithin<M extends string>(modes: readonly M[], max: string): M[] {
+  return modes.filter((mode) => rank(mode) <= rank(max));
+}
+
+/** `mode`, or `max` when `mode` allows more. */
+export function cappedPermissionMode(mode: string, max: string): string {
+  return rank(mode) > rank(max) ? max : mode;
+}
+
 /** How long Shift+Tab waits for the next press before saving where it stopped. */
 export const PERMISSION_MODE_SETTLE_MS = 450;
 

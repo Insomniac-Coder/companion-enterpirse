@@ -33,7 +33,7 @@ import { currentActivitySnapshot, parseActivityStart, visibleWorkActivity } from
 import { groupActivity, groupSessionsByProject, lastSessionKey, projectGroupOpen, projectPick, projectRemoval, type ProjectGroup } from './services/projectSessions';
 import { availablePermissionModes, codeSessionsReadOnly, firstLoadNotice, READ_ONLY_MODE_REASON } from './services/tooling';
 import { initialHealth, modelStoppedDetail, nextHealth, RECHECK_MS, shouldRecheck, type RuntimeHealth } from './services/runtimeHealth';
-import { APPROVE_PLAN_MESSAGE, autoTitle, matchesShortcut, nextPermissionMode, PERMISSION_MODE_SETTLE_MS, PERMISSION_MODES, PermissionModeSaver, selectAvailableModel, shouldStartAgent, updateMessage, WORKBENCH_DESTINATIONS } from './services/workbench';
+import { APPROVE_PLAN_MESSAGE, autoTitle, cappedPermissionMode, matchesShortcut, modesWithin, nextPermissionMode, PERMISSION_MODE_SETTLE_MS, PERMISSION_MODES, PermissionModeSaver, selectAvailableModel, shouldStartAgent, updateMessage, WORKBENCH_DESTINATIONS } from './services/workbench';
 import { Button, Dialog, IconButton, Kbd, Lamp, Notice, PopDivider, PopItem, PopLabel, Popover, Toggle } from './ui/primitives';
 import { Icon, type IconName } from './ui/Icon';
 import {
@@ -86,7 +86,7 @@ function shortcutLabel(binding: string) {
 
 export default function App({ me }: { me?: Me }) {
   // On a server with sign-in, the shared machinery (models, downloads, company settings, system
-  // checks, the permission mode until it is per person) is a platform admin's (roles.rs).
+  // checks) is a platform admin's (roles.rs). The permission mode is each person's own.
   const admin = isPlatformAdmin(me);
   // The person's attachment limits (company or group), checked here before an upload.
   const [attachLimits, setAttachLimits] = useState<{ max_attach_mb: number; max_image_mb: number } | undefined>(undefined);
@@ -170,6 +170,8 @@ export default function App({ me }: { me?: Me }) {
   const [agentPhase, setAgentPhase] = useState('PLANNING');
   // The persisted backend policy is authoritative; browser storage is not a grant.
   const [permissionMode, setPermissionModeState] = useState<PermissionMode>('ask');
+  // The most the person's company or group allows; modes above it are greyed out.
+  const [maxPermissionMode, setMaxPermissionMode] = useState<PermissionMode>('auto');
   // True until the saved mode is read; saves themselves never lock the picker.
   const [permissionModeBusy, setPermissionModeBusy] = useState(true);
   const modeSaver = useRef<PermissionModeSaver<PermissionMode, { mode: PermissionMode; resumed: number }>>(null as never);
@@ -236,7 +238,10 @@ export default function App({ me }: { me?: Me }) {
     window.addEventListener('companion:appearance', onAppearance);
     const onSettings = (event: Event) => {
       const value = (event as CustomEvent).detail;
-      const saved: PermissionMode = (PERMISSION_MODES as readonly string[]).includes(value.agent?.permission_mode) ? value.agent.permission_mode : value.agent?.autonomous_enabled ? 'auto' : 'ask';
+      const max: PermissionMode = (PERMISSION_MODES as readonly string[]).includes(value.agent?.max_permission_mode) ? value.agent.max_permission_mode : 'auto';
+      const chosen = (PERMISSION_MODES as readonly string[]).includes(value.agent?.permission_mode) ? value.agent.permission_mode : value.agent?.autonomous_enabled ? 'auto' : 'ask';
+      const saved = cappedPermissionMode(chosen, max) as PermissionMode;
+      setMaxPermissionMode(max);
       modeSaver.current.reset(saved);
       setPermissionModeState(saved);
       if (value.keyboard?.command_palette) setPaletteShortcut(value.keyboard.command_palette);
@@ -455,6 +460,7 @@ export default function App({ me }: { me?: Me }) {
     getPermissionMode().then((result) => {
       modeSaver.current.reset(result.mode);
       setPermissionModeState(result.mode);
+      setMaxPermissionMode(result.max ?? 'auto');
       localStorage.setItem('companion.permissionMode', result.mode);
     }).catch(() => notify('warning', 'Could not read the saved approval policy. Reconnect to the local runtime before changing it.'))
       .finally(() => setPermissionModeBusy(false));
@@ -464,8 +470,8 @@ export default function App({ me }: { me?: Me }) {
 
   /** Returns whether the mode is now `next`. The picker shows it at once. */
   function changePermissionMode(next: PermissionMode): Promise<boolean> {
-    if (!admin) {
-      notify('info', `The permission mode is set for everyone on this server. ${ADMIN_ONLY_NOTE}`);
+    if (!modesWithin(PERMISSION_MODES, maxPermissionMode).includes(next)) {
+      notify('info', `${PERMISSION_MODE_LABELS[next]} is above what your company allows (${PERMISSION_MODE_LABELS[maxPermissionMode]}).`);
       return Promise.resolve(false);
     }
     setPermissionModeState(next);
@@ -999,7 +1005,7 @@ export default function App({ me }: { me?: Me }) {
     // Shift+Tab cycles the permission mode, as in Claude Code.
     if (mode === 'code' && e.key === 'Tab' && e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
       e.preventDefault();
-      if (admin && !busy && !agentBusy && !permissionModeBusy) {
+      if (!busy && !agentBusy && !permissionModeBusy && availableModes.length > 0) {
         const next = nextPermissionMode(permissionMode, availableModes);
         setPermissionModeState(next);
         modeSaver.current.schedule(next, PERMISSION_MODE_SETTLE_MS);
@@ -1315,7 +1321,7 @@ export default function App({ me }: { me?: Me }) {
 
   function stopGeneration() {
     abort.current?.abort();
-    void stopChat()
+    void stopChat(convId)
       .then((o) => {
         if (o.stopped) notify('info', `Stopped — partial reply kept (${o.chars_kept} characters).`);
       })
@@ -1333,7 +1339,7 @@ export default function App({ me }: { me?: Me }) {
   const headWorkspace = workspaces.find((workspace) => workspace.id === (activeConv?.workspace ?? wsId));
   // A model whose tool check found file text damaged only reads (decision 48).
   const readOnlyModel = codeSessionsReadOnly(loadedMeta);
-  const availableModes = availablePermissionModes(PERMISSION_MODES, loadedMeta);
+  const availableModes = modesWithin(availablePermissionModes(PERMISSION_MODES, loadedMeta), maxPermissionMode);
   const branch = useWorkspaceBranch(mode === 'code' ? headWorkspace?.id : undefined);
   const rail = collapsed && !narrow;
   const anySessionLive = sessions.some((s) => s.id !== convId && (s.activity === 'thinking' || s.activity === 'tool'));
@@ -1987,10 +1993,9 @@ export default function App({ me }: { me?: Me }) {
                       {mode === 'code' && (
                         <span className={`permission-mode ${permissionMode}`} role="group" aria-label="Permission mode (Shift+Tab to cycle)" title={`${PROJECT_BOUNDARY_DESCRIPTION} ${SEARCH_PERMISSION_DESCRIPTION}`}>
                           {PERMISSION_MODES.map((option) => (
-                            <button key={option} type="button" disabled={!admin || permissionModeBusy || busy || agentBusy || !availableModes.includes(option)} className={permissionMode === option ? 'active' : ''} aria-pressed={permissionMode === option} title={availableModes.includes(option) ? PERMISSION_MODE_DESCRIPTIONS[option] : READ_ONLY_MODE_REASON} onClick={() => void changePermissionMode(option)}>{PERMISSION_MODE_LABELS[option]}</button>
+                            <button key={option} type="button" disabled={permissionModeBusy || busy || agentBusy || !availableModes.includes(option)} className={permissionMode === option ? 'active' : ''} aria-pressed={permissionMode === option} title={availableModes.includes(option) ? PERMISSION_MODE_DESCRIPTIONS[option] : modesWithin([option], maxPermissionMode).length ? READ_ONLY_MODE_REASON : `Your company allows up to ${PERMISSION_MODE_LABELS[maxPermissionMode]}.`} onClick={() => void changePermissionMode(option)}>{PERMISSION_MODE_LABELS[option]}</button>
                           ))}
                           {readOnlyModel && <span className="permission-mode-note" title={READ_ONLY_MODE_REASON}>Read-only model</span>}
-                          {!admin && <span className="permission-mode-note" title={`The permission mode is set for everyone on this server. ${ADMIN_ONLY_NOTE}`}>Set by your admin</span>}
                         </span>
                       )}
                       <Toggle

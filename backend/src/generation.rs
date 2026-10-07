@@ -17,6 +17,8 @@ use tokio::task::JoinHandle;
 pub struct ActiveGeneration {
     pub id: String,
     pub conversation_id: Option<String>,
+    /// Whose reply it is: only they stop it.
+    pub user_id: String,
     pub cancel: Arc<AtomicBool>,
     pub partial: Arc<Mutex<String>>,
     pub persisted: Arc<AtomicBool>,
@@ -30,9 +32,20 @@ pub struct CancelOutcome {
     pub chars_kept: usize,
 }
 
+/// One reply per conversation (Phase 1, task 7): a new turn supersedes only
+/// its own conversation's reply, and Stop stops only one person's. A reply
+/// outside any conversation is keyed by its person.
 #[derive(Default)]
 pub struct GenerationTracker {
-    current: Option<ActiveGeneration>,
+    current: std::collections::HashMap<String, ActiveGeneration>,
+}
+
+/// Where a reply is tracked: its conversation, or its person's conversation-less slot.
+pub fn reply_key(conversation_id: Option<&str>, user_id: &str) -> String {
+    match conversation_id.filter(|id| !id.is_empty()) {
+        Some(id) => format!("conversation:{id}"),
+        None => format!("person:{user_id}"),
+    }
 }
 
 impl GenerationTracker {
@@ -40,43 +53,49 @@ impl GenerationTracker {
         Self::default()
     }
 
+    /// Whether any reply is running (the model server is busy for someone).
     pub fn is_active(&self) -> bool {
-        self.current
-            .as_ref()
-            .map(|g| !g.handle.is_finished())
-            .unwrap_or(false)
+        self.current.values().any(|g| !g.handle.is_finished())
     }
 
-    pub fn current_id(&self) -> Option<String> {
-        self.current.as_ref().map(|g| g.id.clone())
+    /// How many replies are running.
+    pub fn running(&self) -> usize {
+        self.current.values().filter(|g| !g.handle.is_finished()).count()
     }
 
-    /// Conversation (if any) with a live generation — ACTIVE residency (§126).
-    pub fn active_conversation(&self) -> Option<String> {
-        self.current
-            .as_ref()
-            .filter(|g| !g.handle.is_finished())
-            .and_then(|g| g.conversation_id.clone())
+    /// Conversations with a live reply — ACTIVE residency (§126).
+    pub fn active_conversations(&self) -> Vec<String> {
+        self.current.values().filter(|g| !g.handle.is_finished()).filter_map(|g| g.conversation_id.clone()).collect()
     }
 
+    /// Track `gen`; the caller has cancelled whatever its conversation had running.
     pub fn insert(&mut self, gen: ActiveGeneration) {
-        self.current = Some(gen);
+        self.current.insert(reply_key(gen.conversation_id.as_deref(), &gen.user_id), gen);
     }
 
     /// Remove the tracked generation if it is the given id (completion cleanup).
     pub fn clear_if(&mut self, id: &str) {
-        if self.current.as_ref().map(|g| g.id.as_str()) == Some(id) {
-            self.current = None;
-        }
+        self.current.retain(|_, g| g.id != id);
     }
 
-    /// Cancel whatever is running: flag + abort + persist partial exactly once.
-    /// Safe to call when idle (returns `stopped: false`).
-    pub async fn cancel_current(
+    /// Stop every reply (Companion closing).
+    pub async fn cancel_all(&mut self, storage: &crate::storage::Storage) -> usize {
+        let keys: Vec<String> = self.current.keys().cloned().collect();
+        let mut stopped = 0;
+        for key in keys {
+            stopped += usize::from(self.cancel(storage, &key).await.stopped);
+        }
+        stopped
+    }
+
+    /// Cancel the reply tracked at `key` (see `reply_key`): flag + abort +
+    /// persist partial exactly once. Safe when there is none (`stopped: false`).
+    pub async fn cancel(
         &mut self,
         storage: &crate::storage::Storage,
+        key: &str,
     ) -> CancelOutcome {
-        let Some(gen) = self.current.take() else {
+        let Some(gen) = self.current.remove(key) else {
             return CancelOutcome {
                 stopped: false,
                 id: None,
@@ -155,7 +174,7 @@ mod tests {
 
         let mut tracker = GenerationTracker::new();
         assert!(!tracker.is_active());
-        let out = tracker.cancel_current(&storage).await;
+        let out = tracker.cancel(&storage, &reply_key(Some("c1"), "local")).await;
         assert!(!out.stopped, "idle cancel must report stopped:false");
 
         // Fake a stuck generation holding partial text.
@@ -166,6 +185,7 @@ mod tests {
         tracker.insert(ActiveGeneration {
             id: "g1".into(),
             conversation_id: Some("c1".into()),
+            user_id: "local".into(),
             cancel: Arc::new(AtomicBool::new(false)),
             partial: partial.clone(),
             persisted: Arc::new(AtomicBool::new(false)),
@@ -173,7 +193,7 @@ mod tests {
         });
         assert!(tracker.is_active());
 
-        let out = tracker.cancel_current(&storage).await;
+        let out = tracker.cancel(&storage, &reply_key(Some("c1"), "local")).await;
         assert!(out.stopped);
         assert_eq!(out.id.as_deref(), Some("g1"));
         assert!(out.chars_kept > 0);
@@ -182,7 +202,7 @@ mod tests {
         assert_eq!(msgs[0].content, "Hello wo", "persist exactly what streamed");
 
         // Second cancel finds nothing and persists nothing more.
-        let out = tracker.cancel_current(&storage).await;
+        let out = tracker.cancel(&storage, &reply_key(Some("c1"), "local")).await;
         assert!(!out.stopped);
         assert_eq!(storage.messages_for("c1").await.unwrap().len(), 1);
     }
@@ -194,13 +214,40 @@ mod tests {
         tracker.insert(ActiveGeneration {
             id: "g2".into(),
             conversation_id: None,
+            user_id: "local".into(),
             cancel: Arc::new(AtomicBool::new(false)),
             partial: Arc::new(Mutex::new("ephemeral".into())),
             persisted: Arc::new(AtomicBool::new(false)),
             handle: tokio::spawn(async {}),
         });
-        let out = tracker.cancel_current(&storage).await;
+        let out = tracker.cancel(&storage, &reply_key(None, "local")).await;
         assert!(out.stopped);
         assert_eq!(out.chars_kept, 0);
+    }
+
+    #[tokio::test]
+    async fn a_reply_is_stopped_alone_not_with_everyone_elses() {
+        let storage = crate::storage::testing::storage();
+        let mut tracker = GenerationTracker::new();
+        let live = |id: &str, conversation: Option<&str>, user: &str| ActiveGeneration {
+            id: id.into(),
+            conversation_id: conversation.map(String::from),
+            user_id: user.into(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            partial: Arc::new(Mutex::new(String::new())),
+            persisted: Arc::new(AtomicBool::new(false)),
+            handle: tokio::spawn(async { tokio::time::sleep(std::time::Duration::from_secs(3600)).await }),
+        };
+        tracker.insert(live("ada-1", Some("ada-conv"), "ada"));
+        tracker.insert(live("bob-1", Some("bob-conv"), "bob"));
+        tracker.insert(live("bob-2", None, "bob"));
+        assert_eq!(tracker.running(), 3);
+        assert!(tracker.cancel(&storage, &reply_key(Some("ada-conv"), "ada")).await.stopped);
+        assert_eq!(tracker.running(), 2, "Bob's replies carry on");
+        let mut live_conversations = tracker.active_conversations();
+        live_conversations.sort();
+        assert_eq!(live_conversations, ["bob-conv"]);
+        assert_eq!(tracker.cancel_all(&storage).await, 2);
+        assert!(!tracker.is_active());
     }
 }

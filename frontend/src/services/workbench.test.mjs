@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { autoTitle, matchesShortcut, nextPermissionMode, PermissionModeSaver, planAwaitingApproval, selectAvailableModel, shouldStartAgent, updateMessage, validatedPanelWidth, WORKBENCH_DESTINATIONS } from './workbench.ts';
+import { autoTitle, cappedPermissionMode, matchesShortcut, modesWithin, nextPermissionMode, PermissionModeSaver, planAwaitingApproval, selectAvailableModel, shouldStartAgent, updateMessage, validatedPanelWidth, WORKBENCH_DESTINATIONS } from './workbench.ts';
 
 test('new chats and new code tasks are titled from their first message', () => {
   assert.equal(autoTitle('New task', 'What does this project do?'), 'What does this project do?');
@@ -127,4 +127,12 @@ test('only the latest completed, unanswered plan run that presented a plan waits
   assert.equal(planAwaitingApproval([{ ...plan, state: 'EXECUTING_TOOL' }], new Set()), null, 'still running');
   assert.equal(planAwaitingApproval([{ ...plan, state: 'FAILED' }], new Set()), null, 'failed');
   assert.equal(planAwaitingApproval([], new Set()), null);
+});
+
+test('the company cap hides the modes that allow more', () => {
+  assert.deepEqual(modesWithin(['ask', 'accept_edits', 'plan', 'auto'], 'ask'), ['ask', 'plan']);
+  assert.deepEqual(modesWithin(['ask', 'accept_edits', 'plan', 'auto'], 'auto'), ['ask', 'accept_edits', 'plan', 'auto']);
+  assert.deepEqual(modesWithin(['ask', 'plan'], 'plan'), ['plan']);
+  assert.equal(cappedPermissionMode('auto', 'accept_edits'), 'accept_edits');
+  assert.equal(cappedPermissionMode('plan', 'ask'), 'plan');
 });

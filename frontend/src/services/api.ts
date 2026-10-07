@@ -338,10 +338,15 @@ export interface StreamUsage {
   command?: { type: string; conversation_id?: string; run_id?: string; text?: string };
 }
 
-/** POST /api/chat/stop: abort the running sidecar request (frees its GPU
- *  slot) and keep whatever was streamed so far. Safe when idle. */
-export async function stopChat(): Promise<{ stopped: boolean; chars_kept: number }> {
-  const r = await fetch('/api/chat/stop', { method: 'POST' });
+/** POST /api/chat/stop: abort this person's running reply in `conversationId`
+ *  (or their reply outside a conversation), freeing its GPU slot, and keep
+ *  whatever was streamed so far. Safe when idle. */
+export async function stopChat(conversationId?: string | null): Promise<{ stopped: boolean; chars_kept: number }> {
+  const r = await fetch('/api/chat/stop', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ conversation_id: conversationId || null }),
+  });
   return r.json();
 }
 
@@ -579,7 +584,8 @@ export async function getRuntimePolicy(modelId?: string): Promise<RuntimePolicy>
  *  ask before edits, accept edits, plan (read-only), auto. */
 export type PermissionMode = 'ask' | 'accept_edits' | 'plan' | 'auto';
 
-export async function getPermissionMode(): Promise<{ mode: PermissionMode }> {
+/** `max`: the most the person's company or group allows. */
+export async function getPermissionMode(): Promise<{ mode: PermissionMode; max: PermissionMode }> {
   return req('/api/permissions/mode');
 }
 

@@ -3762,7 +3762,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         // Drop the policy read lock before awaiting a user decision. Otherwise
         // switching Ask → Auto cannot acquire the write lock to release it.
         let (decision, by_grant) = {
-            let policy = state.permissions.read().await;
+            let policy = state.permissions_of(&spec.user_id).await;
             (
                 policy.decide_call(&call.name, &call.args, risk, true, Some(&ws_key)),
                 policy.allowed_by_grant(&call.name, &call.args, &ws_key),
@@ -3791,8 +3791,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                     Some(ApprovalDecision::Approved { session }) => {
                         if session && risk == RiskLevel::Moderate {
                             state
-                                .permissions
-                                .write()
+                                .permissions_of(&spec.user_id)
                                 .await
                                 .grant_session(&crate::permissions::grant_key(&call.name, &call.args), &ws_key);
                         }
@@ -3878,7 +3877,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                 // Search opt-in is separate from approvals. Auto never prompts
                 // for enabled Search, but an explicit deny still blocks it.
                 let settings = crate::settings_levels::for_person(&state, &spec.user_id).await;
-                let global_auto = state.permissions.read().await.autonomy
+                let global_auto = state.permissions_of(&spec.user_id).await.autonomy
                     == crate::permissions::AutonomyLevel::Autonomous;
                 match settings.search.autonomous.as_str() {
                     "deny" => "(web search is disabled by policy for autonomous runs)".to_string(),
@@ -5482,9 +5481,9 @@ CONTENT>>>
         // The test caller holds settings_update just as the real setters do.
         let mut settings = state.settings.read().await.clone();
         settings.agent.autonomous_enabled = true;
+        settings.agent.permission_mode = "auto".into();
         state.storage.save_settings(&settings).await.unwrap();
         *state.settings.write().await = settings;
-        state.permissions.write().await.autonomy = crate::permissions::AutonomyLevel::Autonomous;
     }
 
     #[tokio::test]
@@ -5589,7 +5588,7 @@ CONTENT>>>
         assert!(matches!(result, Some(ApprovalDecision::Denied)));
         // Still Ask (reads free, edits and commands ask), not Auto.
         assert_eq!(
-            state.permissions.read().await.autonomy,
+            state.permissions_of("local").await.autonomy,
             crate::permissions::AutonomyLevel::WorkspaceAgent
         );
     }

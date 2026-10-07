@@ -33,7 +33,8 @@ pub enum Kind {
     Machine,
 }
 
-const PERSONAL: [&str; 20] = [
+const PERSONAL: [&str; 21] = [
+    "agent.permission_mode",
     "general.theme",
     "general.default_model",
     "general.language",
@@ -56,7 +57,8 @@ const PERSONAL: [&str; 20] = [
     "workspace.default_dir",
 ];
 
-const POLICY: [&str; 9] = [
+const POLICY: [&str; 10] = [
+    "agent.max_permission_mode",
     "security.allowed_dirs",
     "security.blocked_dirs",
     "network.policy",

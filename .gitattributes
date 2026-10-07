@@ -4,3 +4,6 @@
 # Batch files keep CRLF: cmd.exe misreads some constructs in LF batch files.
 *.bat text eol=crlf
 *.cmd text eol=crlf
+# Migrations keep LF in every checkout: sqlx refuses to start on a database whose applied migration's
+# bytes differ, so a database made by a Windows build would not open with a Linux one.
+*.sql text eol=lf

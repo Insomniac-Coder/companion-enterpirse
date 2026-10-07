@@ -577,6 +577,9 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   `Caller.address`/`device` come from `ConnectInfo` (the server runs with
   `into_make_service_with_connect_info`) and the User-Agent. A failed audit write is logged and
   does not fail the request.
+- Migrations are built into the binary (`build.rs` rebuilds when one changes) and must keep LF line
+  endings (`.gitattributes`; `storage::tests` checks): sqlx refuses a database whose applied
+  migration's bytes differ, so a CRLF checkout would not open a database made on Linux.
 - `LLM → ToolRequest → PermissionManager → Tool → OS`. No direct OS access.
 - `WorkspaceManager::resolve` is the only path joiner; lexical + canonical checks.
 - MODERATE/DANGEROUS tools require `approved=true` (permission UX sets it, §26).

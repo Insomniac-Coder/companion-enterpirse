@@ -1407,6 +1407,15 @@ mod model_request_tests {
 mod tests {
     use super::*;
 
+    #[test]
+    fn migrations_are_built_in_with_the_same_bytes_on_every_system() {
+        // A carriage return would make the checksum differ between a Windows and a Linux checkout,
+        // and sqlx refuses a database whose applied migration changed (`.gitattributes`: eol=lf).
+        for migration in MIGRATOR.iter() {
+            assert!(!migration.sql.as_str().contains('\r'), "migration {} has a carriage return", migration.version);
+        }
+    }
+
     fn conversation_named(id: &str) -> Conversation {
         Conversation {
             id: id.into(),

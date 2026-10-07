@@ -14,10 +14,16 @@ import { Icon, type IconName } from '../ui/Icon';
 type SetPreference = (path: string[], value: unknown) => void;
 type RuntimePolicy = Awaited<ReturnType<typeof getRuntimePolicy>>;
 
+/** A number as people write it: the server keeps some values as 32-bit floats, so 0.3 comes back
+ *  as 0.30000001192092896. */
+export function shownNumber(value: unknown): number | string {
+  return typeof value === 'number' && !Number.isInteger(value) ? Number(value.toPrecision(6)) : (value as number | undefined) ?? '';
+}
+
 export function Num({ obj, k, set, id }: { obj: any; k: string; set: (value: number) => void; id?: string }) {
   return <input type="number" id={id} aria-label={id ? undefined : k.replace(/_/g, ' ')}
     step={['temperature', 'top_p', 'repeat_penalty'].includes(k) ? 'any' : 1}
-    value={obj?.[k] ?? ''} onChange={(event) => set(Number(event.target.value))} />;
+    value={shownNumber(obj?.[k])} onChange={(event) => set(Number(event.target.value))} />;
 }
 
 /** What this person may do with each field (the server's word); none on a screen without it. */

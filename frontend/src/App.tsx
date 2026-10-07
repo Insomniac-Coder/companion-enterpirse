@@ -1792,7 +1792,7 @@ export default function App({ me }: { me?: Me }) {
                           <Popover open={modelMenuOpen} onClose={() => setModelMenuOpen(false)} label="Models" side="top" align="end">
                             <PopLabel>Models available</PopLabel>
                             {models.map((model) => (
-                              <PopItem key={model.id} checked={model.id === modelId} hint={model.context_length ? `${Math.round(model.context_length / 1024)}K` : undefined} onClick={() => { setModelId(model.id); setModelMenuOpen(false); }}>
+                              <PopItem key={model.id} checked={model.id === modelId} onClick={() => { setModelId(model.id); setModelMenuOpen(false); }}>
                                 {model.name}
                               </PopItem>
                             ))}

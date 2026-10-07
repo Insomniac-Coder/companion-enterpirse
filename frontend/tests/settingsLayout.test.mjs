@@ -12,7 +12,7 @@ const sourcePath = fileURLToPath(new URL('../src/components/SettingsPanel.tsx', 
 const result = await build({ entryPoints: [sourcePath], bundle: true, write: false, platform: 'node', format: 'cjs', jsx: 'automatic', external: ['react', 'react/*'], loader: { '.css': 'empty' } });
 const loaded = { exports: {} };
 new Function('require', 'module', 'exports', result.outputFiles[0].text)(createRequire(import.meta.url), loaded, loaded.exports);
-const { SettingField, HardwareOverrides, RuntimeSummary } = loaded.exports;
+const { SettingField, HardwareOverrides, RuntimeSummary, shownNumber } = loaded.exports;
 const personalPath = fileURLToPath(new URL('../src/components/PersonalSettings.tsx', import.meta.url));
 const personalBuilt = await build({ entryPoints: [personalPath], bundle: true, write: false, platform: 'node', format: 'cjs', jsx: 'automatic', external: ['react', 'react/*'], loader: { '.css': 'empty' } });
 const personal = { exports: {} };
@@ -120,4 +120,11 @@ test('inactive preferences are not exposed as editable settings', () => {
     assert.ok(source.includes(`'${key}'`), `${key} has a control`);
   }
   assert.match(source, /saved custom provider is not implemented/);
+});
+
+test('numbers read as people wrote them, not as 32-bit float noise', () => {
+  assert.equal(shownNumber(0.30000001192092896), 0.3);
+  assert.equal(shownNumber(1.100000023841858), 1.1);
+  assert.equal(shownNumber(32768), 32768);
+  assert.equal(shownNumber(undefined), '');
 });

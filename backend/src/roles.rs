@@ -110,18 +110,23 @@ fn forbidden(what: &str) -> Response {
 
 /// Guards a handler that changes the server for everyone.
 pub async fn platform_admin_only(request: Request, next: Next) -> Response {
-    match request.extensions().get::<Caller>() {
+    let mut response = match request.extensions().get::<Caller>() {
         Some(caller) if caller.has(PLATFORM_ADMIN) => next.run(request).await,
         _ => forbidden("a platform admin"),
-    }
+    };
+    // A change through an admin route, allowed or refused, goes into the audit records.
+    response.extensions_mut().insert(crate::audit::AdminRoute);
+    response
 }
 
 /// Guards a read-only view of people and groups.
 pub async fn admin_or_auditor(request: Request, next: Next) -> Response {
-    match request.extensions().get::<Caller>() {
+    let mut response = match request.extensions().get::<Caller>() {
         Some(caller) if caller.has(PLATFORM_ADMIN) || caller.has(AUDITOR) => next.run(request).await,
         _ => forbidden("a platform admin or an auditor"),
-    }
+    };
+    response.extensions_mut().insert(crate::audit::AdminRoute);
+    response
 }
 
 fn storage_error(error: sqlx::Error) -> ApiError {

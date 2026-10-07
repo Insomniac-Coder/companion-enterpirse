@@ -10,6 +10,7 @@ mod agent;
 mod agent_progress;
 mod agent_runner;
 mod api;
+mod audit;
 mod auth;
 mod calibration;
 mod cdp;
@@ -262,7 +263,8 @@ async fn main() {
         "local companion listening on http://{} (API + UI)",
         cfg.addr
     );
-    axum::serve(listener, app)
+    // The client's address goes into the audit records (`audit::origin`).
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(shutdown_signal(state, private_database.clone()))
         .await
         .expect("serve");

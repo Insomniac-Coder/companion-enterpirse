@@ -345,7 +345,8 @@ directories); results carry evidence IDs the model can keep or release as contex
   `backend/` writes the whole database to `data/backups/<time>.dump` (restore it with `pg_restore`).
 - **Settings > Privacy & boundaries > Keep a record of model requests** (on by default) stores what was
   sent to the model and what it returned, capped at the latest 300 requests, for diagnosing wrong or
-  broken answers. The records stay on this PC and can contain file contents the assistant read.
+  broken answers. The records stay on this PC and can contain file contents the assistant read. On or
+  off, each request also leaves an audit record (who, which model, how many tokens), without its text.
 - **Save logs as a zip** (Runtime & diagnostics, or the session menu) collects the program's own logs and
   a note of what was running, to share when something failed. Conversations are not in it; conversation
   export was removed on 2026-10-06 (the enterprise audit records hold who asked what).
@@ -393,8 +394,8 @@ Everyone who signs in is a user. On top of that:
 | Role | What it is for |
 | --- | --- |
 | Platform admin | runs the server for everyone: models, downloads, settings, system checks, plugins, the logs |
-| Team admin | looks after one group (its settings come with a later update) |
-| Auditor | reads who has which role and group (and, later, the audit records) |
+| Team admin | looks after one group: its settings and locks |
+| Auditor | reads who has which role and group, the settings, and the audit records |
 
 **Groups** come from the company directory: in the Entra app registration, **Token configuration >
 Add groups claim** (security groups). Companion reads them at each sign-in. The token carries group ids,
@@ -446,6 +447,20 @@ sets the most anyone may choose (`agent.max_permission_mode`, default `auto`): m
 greyed out, and a mode chosen before a lower limit was set counts as that limit. Each conversation
 has its own reply, and Stop stops only yours. A laptop install has no sign-in and its one person has
 every role, as before.
+
+### Audit records
+
+Companion keeps an audit record of every model request, tool call, web search, approval, admin or
+settings change, sign-in and sign-out, and API key made or withdrawn. Each says who (and whether
+through the browser, an API key or one of their agent runs), when, from which address and browser or
+app, what (the conversation or route; a tool's arguments, a search query or an admin change's body,
+with passwords and keys masked and cut to 1,000 characters), which model and how many tokens, and how
+it was allowed (the permission mode, a session grant, the person's approval, the admin role). Message
+text is not kept in them. Records can only be added: the database refuses to change or remove one.
+A platform admin or an auditor reads them, newest first, at `GET /api/admin/audit?limit=100`
+(`&before=<seq>` for older ones). The viewer with filters, how long records are kept, and the
+fingerprint chain that shows a changed or deleted record come later (Phase 7). Behind a load
+balancer the address is the balancer's for now.
 
 Everyone sees only their own conversations, projects, saved memories and agent runs; a record of
 someone else's is "not found", for platform admins too (running the server is not reading people's

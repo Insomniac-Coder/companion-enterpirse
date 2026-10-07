@@ -159,7 +159,7 @@ pub fn masked(line: &str) -> std::borrow::Cow<'_, str> {
             (r"cmp_[0-9a-f]{16,}", "cmp_***"),
             (r"(?i)\b(sk-|sk-ant-|xox[bp]-|ghp_|AKIA)[A-Za-z0-9_-]{8,}", "${1}***"),
             (r"(?i)([a-z][a-z0-9+.-]*://[^\s:/@]+:)[^\s@/]+@", "${1}***@"),
-            (r#"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|client[_-]?secret)(["']?\s*[=:]\s*["']?)[^\s"'&,;]+"#, "${1}${2}***"),
+            (r#"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|brave[_-]?key|client[_-]?secret)(["']?\s*[=:]\s*["']?)[^\s"'&,;]+"#, "${1}${2}***"),
         ]
         .into_iter()
         .map(|(pattern, with)| (regex::Regex::new(pattern).expect("mask pattern"), with))

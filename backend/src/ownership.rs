@@ -84,7 +84,7 @@ async fn check(state: &AppState, caller: &Caller, record: Named) -> Result<(), A
             conversation(state, caller, &artifact.conversation_id).await.map(drop).map_err(|_| not_found("artifact"))
         }
         Named::Run(id) => match state.agents.read().await.get(&id) {
-            Some(run) if run.spec.user_id == caller.id => Ok(()),
+            Some(run) if run.spec.who.user_id == caller.id => Ok(()),
             _ => Err(not_found("run")),
         },
     }

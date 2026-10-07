@@ -682,6 +682,7 @@ mod tests {
         assert_eq!(masked("postgres://companion:hunter2@127.0.0.1:5432/companion"), "postgres://companion:***@127.0.0.1:5432/companion");
         assert_eq!(masked("password=hunter2 user=ada"), "password=*** user=ada");
         assert_eq!(masked(r#"{"client_secret": "s3cr3t"}"#), r#"{"client_secret": "***"}"#);
+        assert_eq!(masked(r#"{"brave_key":"BSA123"}"#), r#"{"brave_key":"***"}"#);
         assert_eq!(masked("nothing secret here"), "nothing secret here");
     }
 

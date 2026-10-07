@@ -38,7 +38,9 @@ fork to drop the model weights (Git LFS); commit ids differ from the Companion's
   2026-10-07: `settings_levels.rs`; code acting for a person must read `settings_levels::for_person`,
   not `AppState.settings` (the company's). Task 7 (permissions and replies per person) done
   2026-10-07: `AppState::permissions_of(user)` / `permission_mode_of(user)` (capped by
-  `agent.max_permission_mode`); one reply per `generation::reply_key`. Next: task 8 (audit records).
+  `agent.max_permission_mode`); one reply per `generation::reply_key`. Task 8 (audit records) done
+  2026-10-07: `audit.rs`; anything that calls the model, runs a tool or searches must pass an
+  `audit::Who`. Next: task 9 (two apps from one set of screens, Graphite look).
 - Everything below this section is the Companion's own handoff, kept as it was at the fork.
 
 # Handoff — start here

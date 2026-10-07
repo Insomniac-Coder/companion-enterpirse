@@ -196,16 +196,34 @@ fn attachment_turn(
 /// after the response, on their own task, and never fail the request.
 pub(crate) fn request_recorder(
     state: &AppState,
+    who: &crate::audit::Who,
     conversation_id: &str,
     owner_id: &str,
     kind: &'static str,
 ) -> crate::llamaserver::RequestRecorder {
     let state = state.clone();
+    let who = who.clone();
     let conversation_id = conversation_id.to_string();
     let owner_id = owner_id.to_string();
     let seq = Arc::new(std::sync::atomic::AtomicU32::new(0));
     Arc::new(move |request: crate::llamaserver::RecordedRequest| {
         let state = state.clone();
+        let who = who.clone();
+        // Every request is audited; Privacy > "Keep a record" decides only whether its text is kept.
+        let audit = crate::audit::Record {
+            action: "model_request",
+            target: if conversation_id.is_empty() { owner_id.clone() } else { conversation_id.clone() },
+            prompt_tokens: request.prompt_tokens.into(),
+            generated_tokens: request.generated_tokens.into(),
+            outcome: request.outcome.into(),
+            detail: serde_json::json!({
+                "kind": kind,
+                "for": owner_id,
+                "finish_reason": request.finish_reason,
+                "failure": request.failure.as_deref().map(crate::audit::excerpt),
+            }),
+            ..Default::default()
+        };
         let record = crate::storage::ModelRequestRecord {
             id: uuid::Uuid::new_v4().to_string(),
             conversation_id: conversation_id.clone(),
@@ -223,6 +241,9 @@ pub(crate) fn request_recorder(
             created_at: now_rfc3339(),
         };
         tokio::spawn(async move {
+            let mut audit = audit;
+            audit.model = state.models.read().await.current().map(|model| model.id.clone()).unwrap_or_default();
+            crate::audit::write(&state, &who, audit).await;
             if !state.settings.read().await.privacy.record_model_requests {
                 return;
             }
@@ -525,6 +546,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/admin/settings/company", put(admin(put_company_settings)))
         .route("/api/admin/settings/groups/:id", put(crate::settings_levels::put_group))
         .route("/api/admin/settings/locks", put(crate::settings_levels::put_lock).delete(crate::settings_levels::delete_lock))
+        // Phase 1 task 8: audit records.
+        .route("/api/admin/audit", get(admin_or_auditor(crate::audit::list)))
         .route("/api/runtime/policy", get(runtime_policy))
         .route("/api/models", get(list_models))
         .route("/api/models/load", post(admin(load_model)))
@@ -690,6 +713,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/system/benchmark", post(admin(benchmark)))
         // Innermost first: a path naming a record must name one of the caller's (ownership.rs),
         // after they are known; CORS answers preflight requests before anyone is asked who they are.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), crate::audit::changes))
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::ownership::owned_paths))
         .layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::authenticate))
         .layer(cors)
@@ -1074,7 +1098,7 @@ async fn run_tool_check(
 ) -> Result<crate::tooling::ToolingProfile, String> {
     let client = SidecarClient::new(base_url.to_string())
         .map_err(|error| error.to_string())?
-        .with_recorder(request_recorder(s, "", &format!("tool-check-{}", model.id), "tool_check"));
+        .with_recorder(request_recorder(s, &crate::audit::Who::system("tool check"), "", &format!("tool-check-{}", model.id), "tool_check"));
     let profile = crate::tooling::check(&client, cfg, runtime, template, cfg.template_caps).await?;
     let dir = crate::tooling::profile_dir(&cfg.model_path);
     if let Err(error) = crate::tooling::write_profile(&dir, &profile) {
@@ -3067,6 +3091,7 @@ fn chat_tool_output(output: &str) -> String {
 
 async fn run_chat_tool_round(
     s: &AppState,
+    who: &crate::audit::Who,
     conv: &Option<String>,
     chat_ws: &Option<(String, String, std::path::PathBuf)>,
     offer: &ChatToolOffer,
@@ -3248,7 +3273,7 @@ async fn run_chat_tool_round(
             approved: false,
             approval: "chat (read-only tools)".into(),
             created_at: chrono::Utc::now().to_rfc3339(),
-        }).await;
+        }, who).await;
     }
     turns.push(ChatTurn::text("assistant", round_text));
     let next_step = if call.name == "search_text" && ok {
@@ -3652,6 +3677,7 @@ async fn chat_sse(
         .unwrap_or_default();
     sys_prompt.push_str(&resumed_note);
     let bg_state = s.clone();
+    let bg_who = crate::audit::Who::of(&caller);
     let bg_conv = conv_id.clone();
     let bg_sys = sys_prompt;
     let code_activity = sys_mode == "code";
@@ -3694,7 +3720,7 @@ async fn chat_sse(
                 settings.memory.compaction_keep_turns,
             )
             .await;
-            match compact_conversation_keeping(&bg_state, &cid, keep).await {
+            match compact_conversation_keeping(&bg_state, &bg_who, &cid, keep).await {
                 Ok(stats) if stats.status == "compacted" => {
                     match assemble_request_context(&bg_state, Some(&cid), None, cfg.n_ctx).await {
                         Ok(fresh) => {
@@ -3742,7 +3768,7 @@ async fn chat_sse(
                         provider: provider.clone(),
                         result_count: results.len(),
                         created_at: chrono::Utc::now().to_rfc3339(),
-                    }).await;
+                    }, &bg_who).await;
                     if results.is_empty() {
                         web_block = "\n\n[Web search returned no results. Answer from local knowledge and say so.]".into();
                         status("No web results — answering locally");
@@ -3919,6 +3945,7 @@ async fn chat_sse(
         let client = match SidecarClient::new(base_url) {
             Ok(c) => Some(c.with_recorder(request_recorder(
                 &bg_state,
+                &bg_who,
                 bg_conv.as_deref().unwrap_or_default(),
                 &bg_id,
                 "chat",
@@ -4057,6 +4084,7 @@ async fn chat_sse(
                         let worked = if tool_uses < CHAT_TOOL_ROUNDS {
                             run_chat_tool_round(
                                 &bg_state,
+                                &bg_who,
                                 &bg_conv,
                                 &chat_ws,
                                 &tool_offer,
@@ -5434,9 +5462,10 @@ async fn execute_tool(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| req.workspace.clone());
     let ws = crate::workspace::WorkspaceManager::new(ws_root);
+    let who = crate::audit::Who::of(&caller);
     let (via, approval) = gate_tool_call(
         &s,
-        &caller.id,
+        &who,
         &record_target(&req.conversation_id),
         &req.tool,
         &req.args,
@@ -5463,13 +5492,13 @@ async fn execute_tool(
         .await
         {
             Ok(r) => {
-                audit(&s, &req, approval, true, &r.output).await;
+                audit(&s, &who, &req, approval, true, &r.output).await;
                 Ok(Json(
                     serde_json::json!({"ok": true, "output": r.output, "exit_code": Option::<i32>::None, "approved_via": "once"}),
                 ))
             }
             Err(e) => {
-                audit(&s, &req, approval, false, &e.to_string()).await;
+                audit(&s, &who, &req, approval, false, &e.to_string()).await;
                 Err(ApiError::bad(
                     e.to_string(),
                     "Fix the filename/spec and retry.",
@@ -5483,6 +5512,7 @@ async fn execute_tool(
         if !req.approved_once {
             audit(
                 &s,
+                &who,
                 &req,
                 "refused: Search is off for this request",
                 false,
@@ -5518,7 +5548,7 @@ async fn execute_tool(
                     provider: provider.clone(),
                     result_count: results.len(),
                     created_at: chrono::Utc::now().to_rfc3339(),
-                }).await;
+                }, &who).await;
                 let out = serde_json::json!({"provider": provider, "results": results});
                 let _ = st.record_tool_execution(&crate::storage::ToolExecution {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -5529,13 +5559,13 @@ async fn execute_tool(
                     approved: true,
                     approval: approval.into(),
                     created_at: chrono::Utc::now().to_rfc3339(),
-                }).await;
+                }, &who).await;
                 Ok(Json(
                     serde_json::json!({"ok": true, "output": out, "exit_code": Option::<i32>::None, "approved_via": "once"}),
                 ))
             }
             Err(e) => {
-                audit(&s, &req, approval, false, &e).await;
+                audit(&s, &who, &req, approval, false, &e).await;
                 Err(ApiError::bad(
                     format!("Internet search failed: {e}"),
                     "Retry, or continue without web — the local model still works (§125).",
@@ -5554,7 +5584,7 @@ async fn execute_tool(
         Ok(r) => (r.ok, r.output.clone(), r.exit_code),
         Err(e) => (false, e.to_string(), None),
     };
-    audit(&s, &req, approval, ok, &output).await;
+    audit(&s, &who, &req, approval, ok, &output).await;
     match result {
         Ok(_) => Ok(Json(serde_json::json!({
             "ok": ok, "output": output, "exit_code": exit_code,
@@ -5571,8 +5601,8 @@ async fn execute_tool(
     }
 }
 
-async fn audit(s: &AppState, req: &ExecuteToolReq, approval: &str, ok: bool, result: &str) {
-    record_tool_call(s, &record_target(&req.conversation_id), &req.tool, &req.args, approval, ok, result).await;
+async fn audit(s: &AppState, who: &crate::audit::Who, req: &ExecuteToolReq, approval: &str, ok: bool, result: &str) {
+    record_tool_call(s, who, &record_target(&req.conversation_id), &req.tool, &req.args, approval, ok, result).await;
 }
 
 /// Where a direct tool call is recorded: its conversation, or "direct".
@@ -5586,6 +5616,7 @@ fn record_target(conversation_id: &str) -> String {
 /// One record per tool call, saying how it was allowed (or why it was not).
 async fn record_tool_call(
     s: &AppState,
+    who: &crate::audit::Who,
     conversation_id: &str,
     tool: &str,
     args: &serde_json::Value,
@@ -5603,7 +5634,7 @@ async fn record_tool_call(
         approved: ok,
         approval: approval.into(),
         created_at: chrono::Utc::now().to_rfc3339(),
-    }).await;
+    }, who).await;
 }
 
 /// The folder a direct tool call may work in: a saved project, or a folder
@@ -5649,7 +5680,7 @@ async fn folder_policy(s: &AppState, user: &str, folder: &std::path::Path) -> Re
 /// response and in words for the record; a refusal is recorded and returned.
 async fn gate_tool_call(
     s: &AppState,
-    user: &str,
+    who: &crate::audit::Who,
     record_as: &str,
     tool: &str,
     args: &serde_json::Value,
@@ -5660,7 +5691,7 @@ async fn gate_tool_call(
     use crate::permissions::{PermissionDecision, RiskLevel};
     let risk = tools::risk_of(tool);
     let (decision, by_grant, granted_now) = {
-        let mut pm = s.permissions_of(user).await;
+        let mut pm = s.permissions_of(&who.user_id).await;
         // Session grants are recorded only alongside an explicit approval.
         let granted_now = grant_session && approved_once && risk == RiskLevel::Moderate;
         if granted_now {
@@ -5678,7 +5709,7 @@ async fn gate_tool_call(
         PermissionDecision::Allow => Ok(("auto", "allowed by the permission mode")),
         PermissionDecision::RequireApproval { .. } if approved_once => Ok(("once", "approved by the user")),
         PermissionDecision::RequireApproval { reason } => {
-            record_tool_call(s, record_as, tool, args, "refused: needs approval", false, &format!("denied, approval required: {reason}")).await;
+            record_tool_call(s, who, record_as, tool, args, "refused: needs approval", false, &format!("denied, approval required: {reason}")).await;
             Err(ApiError::new(
                 StatusCode::FORBIDDEN,
                 format!("'{tool}' needs approval: {reason}"),
@@ -5686,7 +5717,7 @@ async fn gate_tool_call(
             ))
         }
         PermissionDecision::Deny { reason } => {
-            record_tool_call(s, record_as, tool, args, "refused by the permission mode", false, &format!("denied: {reason}")).await;
+            record_tool_call(s, who, record_as, tool, args, "refused by the permission mode", false, &format!("denied: {reason}")).await;
             Err(ApiError::new(
                 StatusCode::FORBIDDEN,
                 format!("'{tool}' is not allowed: {reason}"),
@@ -6049,7 +6080,7 @@ async fn run_agent(
         .unwrap_or(conversation_reasoning || crate::settings_levels::for_person(&s, &caller.id).await.reasoning.default_on);
     let run_id = spawn_agent_run(
         &s,
-        caller.id.clone(),
+        crate::audit::Who::of(&caller),
         ws_root,
         task,
         mode,
@@ -6065,7 +6096,7 @@ async fn run_agent(
 
 async fn spawn_agent_run(
     s: &AppState,
-    user_id: String,
+    who: crate::audit::Who,
     ws_root: std::path::PathBuf,
     task: String,
     mode: AgentMode,
@@ -6095,7 +6126,7 @@ async fn spawn_agent_run(
             conversation_id,
             search_enabled: search,
             reasoning,
-            user_id,
+            who,
         },
         cancel: CancelToken::new(),
         events: std::sync::Mutex::new(vec![]),
@@ -6199,37 +6230,58 @@ struct AgentResume {
 
 async fn agent_resume(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Json(req): Json<AgentResume>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use crate::agent_runner::ApprovalDecision;
-    let reg = s.agents.read().await;
-    let run = match reg.get(&id) {
-        Some(r) => r,
-        None => return Err(ApiError::not_found("unknown agent run")),
-    };
-    let mut tx_guard = run.pending_tx.lock().expect("lock");
-    match tx_guard.take() {
-        Some(tx) => {
-            let decision = if req.approved {
-                ApprovalDecision::Approved {
-                    session: req.grant_session,
-                }
-            } else {
-                ApprovalDecision::Denied
-            };
-            // Denied DANGEROUS tools can never become session grants: the loop
-            // only grants MODERATE ones alongside an approval.
-            let _ = tx.send(decision);
-            Ok(Json(
-                serde_json::json!({"resumed": id, "approved": req.approved}),
-            ))
+    let tool = {
+        let reg = s.agents.read().await;
+        let run = match reg.get(&id) {
+            Some(r) => r,
+            None => return Err(ApiError::not_found("unknown agent run")),
+        };
+        let tool = run.pending.lock().expect("lock").as_ref().map(|pending| pending.tool.clone()).unwrap_or_default();
+        let mut tx_guard = run.pending_tx.lock().expect("lock");
+        match tx_guard.take() {
+            Some(tx) => {
+                let decision = if req.approved {
+                    ApprovalDecision::Approved {
+                        session: req.grant_session,
+                    }
+                } else {
+                    ApprovalDecision::Denied
+                };
+                // Denied DANGEROUS tools can never become session grants: the loop
+                // only grants MODERATE ones alongside an approval.
+                let _ = tx.send(decision);
+                tool
+            }
+            None => {
+                return Err(ApiError::bad(
+                    "run is not waiting for approval",
+                    "The run either continues on its own or already finished.",
+                ))
+            }
         }
-        None => Err(ApiError::bad(
-            "run is not waiting for approval",
-            "The run either continues on its own or already finished.",
-        )),
-    }
+    };
+    let decision = match (req.approved, req.grant_session) {
+        (true, true) => "approved for the session",
+        (true, false) => "approved once",
+        (false, _) => "denied",
+    };
+    let record = crate::audit::Record {
+        action: "approval",
+        target: format!("run {id}"),
+        allowed_by: "the person's own decision".into(),
+        outcome: decision.into(),
+        detail: serde_json::json!({ "tool": tool }),
+        ..Default::default()
+    };
+    crate::audit::write(&s, &crate::audit::Who::of(&caller), record).await;
+    Ok(Json(
+        serde_json::json!({"resumed": id, "approved": req.approved}),
+    ))
 }
 
 async fn agent_stop(
@@ -6574,7 +6626,7 @@ async fn run_slash_command(
         "compact" => {
             let cid = conv_id
                 .ok_or_else(|| ApiError::bad("no conversation", "Run /compact inside a chat."))?;
-            Ok(O::Message(compact_conversation(s, &cid).await?.text))
+            Ok(O::Message(compact_conversation(s, &crate::audit::Who::of(caller), &cid).await?.text))
         }
         "search" => {
             if args.is_empty() {
@@ -6638,7 +6690,7 @@ async fn run_slash_command(
             let reasoning = crate::settings_levels::for_person(s, &caller.id).await.reasoning.default_on;
             let run_id = spawn_agent_run(
                 s,
-                caller.id.clone(),
+                crate::audit::Who::of(&caller),
                 ws,
                 task,
                 if name == "plan" { AgentMode::Plan } else { AgentMode::CodeAssist },
@@ -6687,7 +6739,7 @@ async fn run_slash_command(
             let reasoning = crate::settings_levels::for_person(s, &caller.id).await.reasoning.default_on;
             let run_id = spawn_agent_run(
                 s,
-                caller.id.clone(),
+                crate::audit::Who::of(&caller),
                 ws,
                 task,
                 AgentMode::Agent,
@@ -6887,15 +6939,9 @@ async fn load_model_by_id(s: &AppState, id: &str) -> Result<(String, Vec<String>
 
 /// Summarize a prefix into a derived inference view. Never delete or rewrite
 /// the canonical transcript: it remains available to history, exports and forks.
-async fn compact_conversation(s: &AppState, cid: &str) -> Result<CompactStats, ApiError> {
-    let keep_recent = s
-        .settings
-        .read()
-        .await
-        .memory
-        .compaction_keep_turns
-        .clamp(2, 200);
-    compact_conversation_keeping(s, cid, keep_recent).await
+async fn compact_conversation(s: &AppState, who: &crate::audit::Who, cid: &str) -> Result<CompactStats, ApiError> {
+    let keep_recent = crate::settings_levels::for_person(s, &who.user_id).await.memory.compaction_keep_turns.clamp(2, 200);
+    compact_conversation_keeping(s, who, cid, keep_recent).await
 }
 
 const CONVERSATION_COMPACTION_PROMPT: &str = "Update the running summary of a conversation between a user and an assistant so that it can replace the messages it covers. Keep the user's goals, constraints and preferences, decisions made, facts and figures, names of files and commands with their results, and every open question or unfinished task. Drop greetings and repetition. Write plain sentences or bullets, at most 250 words, and output only the updated summary.";
@@ -6995,6 +7041,7 @@ async fn fold_conversation_summary(
 /// are never modified; the summary is a derived view of their prefix.
 async fn compact_conversation_keeping(
     s: &AppState,
+    who: &crate::audit::Who,
     cid: &str,
     keep_recent: usize,
 ) -> Result<CompactStats, ApiError> {
@@ -7053,7 +7100,7 @@ async fn compact_conversation_keeping(
     };
     let client = SidecarClient::new(base_url)
         .map_err(|e| ApiError::internal(e.to_string()))?
-        .with_recorder(request_recorder(s, cid, &format!("compaction-{}", uuid::Uuid::new_v4()), "compaction"));
+        .with_recorder(request_recorder(s, who, cid, &format!("compaction-{}", uuid::Uuid::new_v4()), "compaction"));
     let previous = previous_summary
         .map(|text| {
             if text.starts_with(COMPACTION_HEADER) {
@@ -8088,7 +8135,8 @@ async fn run_plugin_command(
     // The same gate as every other direct tool call: a plugin used to run
     // whatever its caller said was approved, whatever the permission mode.
     let record_as = format!("plugin:{id}");
-    let (_, approval) = gate_tool_call(&s, &caller.id, &record_as, &req.tool, &req.args, &ws_key, req.approved, false).await?;
+    let who = crate::audit::Who::of(&caller);
+    let (_, approval) = gate_tool_call(&s, &who, &record_as, &req.tool, &req.args, &ws_key, req.approved, false).await?;
     let limit = crate::settings_levels::for_person(&s, &caller.id).await.agent.command_timeout_secs;
     let tool_req = crate::tools::within_time_limit(
         crate::tools::ToolRequest { name: req.tool.clone(), args: req.args.clone(), approved: true },
@@ -8096,13 +8144,13 @@ async fn run_plugin_command(
     );
     match crate::tools::execute(&tool_req, &ws, true) {
         Ok(r) => {
-            record_tool_call(&s, &record_as, &req.tool, &req.args, approval, r.ok, &r.output).await;
+            record_tool_call(&s, &who, &record_as, &req.tool, &req.args, approval, r.ok, &r.output).await;
             Ok(Json(
                 serde_json::json!({"ok": r.ok, "output": r.output, "exit_code": r.exit_code}),
             ))
         }
         Err(e) => {
-            record_tool_call(&s, &record_as, &req.tool, &req.args, approval, false, &e.to_string()).await;
+            record_tool_call(&s, &who, &record_as, &req.tool, &req.args, approval, false, &e.to_string()).await;
             Err(ApiError::bad(
                 format!("{e}"),
                 "Check tool arguments and retry.",
@@ -8923,6 +8971,7 @@ struct SessionAction {
 /// Stage 27 row actions (§139): pause/stop live work, or reduce usage.
 async fn session_action(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
     Json(req): Json<SessionAction>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -8976,7 +9025,7 @@ async fn session_action(
                     "Start inference first, then reduce (runs /compact).",
                 ));
             }
-            let stats = compact_conversation(&s, &id).await?;
+            let stats = compact_conversation(&s, &crate::audit::Who::of(&caller), &id).await?;
             Ok(Json(
                 serde_json::json!({"action": "reduce", "result": stats.status, "detail": stats.text}),
             ))
@@ -9179,7 +9228,7 @@ pub(crate) async fn resume_auto_approved_runs(s: &AppState) -> usize {
             continue;
         };
         let risk = crate::tools::risk_of(&pending.tool);
-        let search_denied = crate::settings_levels::for_person(s, &run.spec.user_id).await.search.autonomous == "deny";
+        let search_denied = crate::settings_levels::for_person(s, &run.spec.who.user_id).await.search.autonomous == "deny";
         if !run.spec.mode.allows_risk(risk)
             || (pending.tool == "web_search" && (!run.spec.search_enabled || search_denied))
         {
@@ -9187,11 +9236,11 @@ pub(crate) async fn resume_auto_approved_runs(s: &AppState) -> usize {
         }
         // Web search consent is its own prompt: only Auto releases it, never
         // a session grant (review finding).
-        if pending.tool == "web_search" && s.permissions_of(&run.spec.user_id).await.autonomy != crate::permissions::AutonomyLevel::Autonomous {
+        if pending.tool == "web_search" && s.permissions_of(&run.spec.who.user_id).await.autonomy != crate::permissions::AutonomyLevel::Autonomous {
             continue;
         }
         let allowed = matches!(
-            s.permissions_of(&run.spec.user_id).await.decide_call(
+            s.permissions_of(&run.spec.who.user_id).await.decide_call(
                 &pending.tool,
                 &pending.args,
                 risk,
@@ -9203,12 +9252,23 @@ pub(crate) async fn resume_auto_approved_runs(s: &AppState) -> usize {
         if !allowed {
             continue;
         }
-        if let Some(tx) = run.pending_tx.lock().expect("lock").take() {
+        // Taken first: the lock must not be held while the audit record is written.
+        let waiting = run.pending_tx.lock().expect("lock").take();
+        if let Some(tx) = waiting {
             if tx
                 .send(crate::agent_runner::ApprovalDecision::Approved { session: false })
                 .is_ok()
             {
                 resumed += 1;
+                let record = crate::audit::Record {
+                    action: "approval",
+                    target: format!("run {}", run.id),
+                    allowed_by: "a change of the person's permission mode".into(),
+                    outcome: "approved once".into(),
+                    detail: serde_json::json!({ "tool": pending.tool }),
+                    ..Default::default()
+                };
+                crate::audit::write(s, &run.spec.who, record).await;
             }
         }
     }
@@ -9791,9 +9851,10 @@ struct CompactStats {
 
 async fn compact_endpoint(
     State(s): State<AppState>,
+    Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
 ) -> Result<Json<CompactStats>, ApiError> {
-    compact_conversation(&s, &id).await.map(Json)
+    compact_conversation(&s, &crate::audit::Who::of(&caller), &id).await.map(Json)
 }
 
 // ---- Stage 28 budget + OCR ----
@@ -10555,7 +10616,7 @@ mod tests {
                 conversation_id: String::new(),
                 search_enabled,
                 reasoning: false,
-                user_id: user.into(),
+                who: crate::audit::Who { user_id: user.into(), ..Default::default() },
             },
             cancel: CancelToken::new(),
             events: std::sync::Mutex::new(vec![crate::agent::AgentEvent::activity(
@@ -10644,6 +10705,31 @@ mod tests {
         assert_eq!(switched["resumed"], 1, "{switched}");
         assert!(matches!(ada_waiting.try_recv(), Ok(crate::agent_runner::ApprovalDecision::Approved { .. })));
         assert!(bob_waiting.try_recv().is_err(), "Bob's run still waits for Bob");
+        let approvals: Vec<(String, String, serde_json::Value)> = sqlx::query_as("SELECT user_id, allowed_by, detail FROM audit_records WHERE action = 'approval'")
+            .fetch_all(state.storage.pool())
+            .await
+            .unwrap();
+        assert_eq!(approvals.len(), 1, "{approvals:?}");
+        assert_eq!((approvals[0].0.as_str(), approvals[0].1.as_str()), (ada_id.as_str(), "a change of the person's permission mode"));
+        assert_eq!(approvals[0].2["tool"], "execute_command");
+    }
+
+    #[tokio::test]
+    async fn approving_or_denying_a_waiting_action_is_recorded() {
+        use crate::roles::tests::{call, person, server, status};
+        let (app, state) = server();
+        let (ada_id, ada) = person(&state, "ada", &[]).await;
+        let (run, mut waiting) = pending_approval_for(&state, "execute_command", AgentMode::Agent, false, &ada_id).await;
+        let resume = call("POST", &format!("/api/agent/runs/{}/resume", run.id), &ada, Some(serde_json::json!({ "approved": false })));
+        assert_eq!(status(&app, resume).await, StatusCode::OK);
+        assert!(matches!(waiting.try_recv(), Ok(crate::agent_runner::ApprovalDecision::Denied)));
+        let (who, target, outcome, detail): (String, String, String, serde_json::Value) =
+            sqlx::query_as("SELECT user_id, target, outcome, detail FROM audit_records WHERE action = 'approval'")
+                .fetch_one(state.storage.pool())
+                .await
+                .unwrap();
+        assert_eq!((who, target, outcome), (ada_id, format!("run {}", run.id), "denied".to_string()));
+        assert_eq!(detail["tool"], "execute_command");
     }
 
     #[tokio::test]
@@ -14063,6 +14149,7 @@ Would you like me to fix it?")]));
             println!("Exploration round {round}: {response}");
             if !run_chat_tool_round(
                 &state,
+                &crate::audit::Who::default(),
                 &None,
                 &workspace,
                 &ChatToolOffer::for_request(true, false),
@@ -14130,6 +14217,7 @@ Would you like me to fix it?")]));
             assert!(
                 run_chat_tool_round(
                     &state,
+                    &crate::audit::Who::default(),
                     &None,
                     &workspace,
                     &ChatToolOffer::for_request(true, false),
@@ -14153,7 +14241,7 @@ Would you like me to fix it?")]));
         }
         assert!(CHAT_TOOL_ROUNDS >= 24);
         assert_eq!(turns.len(), 12);
-        assert!(run_chat_tool_round(&state, &None, &workspace, &ChatToolOffer::for_request(true, false),
+        assert!(run_chat_tool_round(&state,&crate::audit::Who::default(), &None, &workspace, &ChatToolOffer::for_request(true, false),
             "```tool\n{\"name\":\"manage_context\",\"args\":{\"keep\":[\"chunk-5\"],\"release\":[\"chunk-1\"]}}\n```",
             &mut turns, &mut memory, &sender, "chunk-reply", 7).await);
         assert!(turns[1].content.contains("Body released"));
@@ -14230,6 +14318,7 @@ Would you like me to fix it?")]));
         assert!(
             run_chat_tool_round(
                 &state,
+                &crate::audit::Who::default(),
                 &None,
                 &workspace,
                 &ChatToolOffer::for_request(true, false),
@@ -14253,7 +14342,7 @@ Would you like me to fix it?")]));
             .as_ref()
             .unwrap()
             .contains("verified file content"));
-        assert!(run_chat_tool_round(&state, &None, &workspace, &ChatToolOffer::for_request(true, false),
+        assert!(run_chat_tool_round(&state,&crate::audit::Who::default(), &None, &workspace, &ChatToolOffer::for_request(true, false),
             "```tool\n{\"name\":\"write_file\",\"args\":{\"path\":\"blocked.txt\",\"content\":\"never write\"}}\n```",
             &mut turns, &mut memory, &sender, "inspection-reply", 2).await);
         assert!(!root.join("blocked.txt").exists());

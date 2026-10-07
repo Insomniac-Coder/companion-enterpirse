@@ -2413,8 +2413,9 @@ pub struct AgentSpec {
     pub search_enabled: bool,
     /// Native thinking allowed for this run's action requests.
     pub reasoning: bool,
-    /// The person who started the run: only they see or steer it.
-    pub user_id: String,
+    /// The person who started the run, and from where: only they see or steer it, and the
+    /// run's audit records name them (`via` "agent").
+    pub who: crate::audit::Who,
 }
 
 #[derive(Debug)]
@@ -2577,7 +2578,7 @@ impl AgentRegistry {
                     conversation_id: r.spec.conversation_id.clone(),
                     mode: r.spec.mode,
                     plan_ready: evs.last().is_some_and(presents_plan),
-                    user_id: r.spec.user_id.clone(),
+                    user_id: r.spec.who.user_id.clone(),
                 }
             })
             .collect()
@@ -2651,6 +2652,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
     let client = match SidecarClient::new(base_url) {
         Ok(c) => c.with_recorder(crate::api::request_recorder(
             &state,
+            &run.spec.who.agent(),
             &run.spec.conversation_id,
             &run.id,
             "agent",
@@ -2756,7 +2758,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             .flatten()
             .map(|conversation| conversation.workspace)
             .unwrap_or_default();
-        if let Ok(memory) = st.memory_context(&spec.user_id, &spec.conversation_id, &workspace).await {
+        if let Ok(memory) = st.memory_context(&spec.who.user_id, &spec.conversation_id, &workspace).await {
             transcript[0].content.push_str(&memory.text);
         }
         let mut history = st
@@ -2842,7 +2844,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         }
     }
     let original_task = transcript[task_turn_index].content.clone();
-    let compaction = CompactionPolicy::from_settings(&crate::settings_levels::for_person(&state, &spec.user_id).await.memory);
+    let compaction = CompactionPolicy::from_settings(&crate::settings_levels::for_person(&state, &spec.who.user_id).await.memory);
     let compaction_pct = if compaction.enabled { compaction.threshold_pct } else { 0 };
     let mut work_log: Vec<String> = Vec::new();
     let mut compactions = 0u32;
@@ -3762,7 +3764,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
         // Drop the policy read lock before awaiting a user decision. Otherwise
         // switching Ask → Auto cannot acquire the write lock to release it.
         let (decision, by_grant) = {
-            let policy = state.permissions_of(&spec.user_id).await;
+            let policy = state.permissions_of(&spec.who.user_id).await;
             (
                 policy.decide_call(&call.name, &call.args, risk, true, Some(&ws_key)),
                 policy.allowed_by_grant(&call.name, &call.args, &ws_key),
@@ -3774,6 +3776,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             PermissionDecision::Allow if by_grant => "allowed by a session grant",
             PermissionDecision::Allow => "allowed by the permission mode",
             PermissionDecision::Deny { reason } => {
+                audit_tool(&state, &run, &call, "refused by the permission mode", &format!("denied: {reason}")).await;
                 answer_call(
                     &mut transcript,
                     answering.as_ref(),
@@ -3791,7 +3794,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                     Some(ApprovalDecision::Approved { session }) => {
                         if session && risk == RiskLevel::Moderate {
                             state
-                                .permissions_of(&spec.user_id)
+                                .permissions_of(&spec.who.user_id)
                                 .await
                                 .grant_session(&crate::permissions::grant_key(&call.name, &call.args), &ws_key);
                         }
@@ -3802,6 +3805,7 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
                         }
                     }
                     Some(ApprovalDecision::Denied) | None => {
+                        audit_tool(&state, &run, &call, "refused by the person", "denied").await;
                         answer_call(
                             &mut transcript,
                             answering.as_ref(),
@@ -3876,8 +3880,8 @@ pub async fn run_loop(state: crate::api::AppState, run: Arc<LiveRun>) -> AgentSt
             } else {
                 // Search opt-in is separate from approvals. Auto never prompts
                 // for enabled Search, but an explicit deny still blocks it.
-                let settings = crate::settings_levels::for_person(&state, &spec.user_id).await;
-                let global_auto = state.permissions_of(&spec.user_id).await.autonomy
+                let settings = crate::settings_levels::for_person(&state, &spec.who.user_id).await;
+                let global_auto = state.permissions_of(&spec.who.user_id).await.autonomy
                     == crate::permissions::AutonomyLevel::Autonomous;
                 match settings.search.autonomous.as_str() {
                     "deny" => "(web search is disabled by policy for autonomous runs)".to_string(),
@@ -4796,7 +4800,7 @@ async fn execute_local_tool(
     call: &ToolCall,
     approval: &str,
 ) -> String {
-    let limit = crate::settings_levels::for_person(state, &run.spec.user_id).await.agent.command_timeout_secs;
+    let limit = crate::settings_levels::for_person(state, &run.spec.who.user_id).await.agent.command_timeout_secs;
     let tool_req = crate::tools::within_time_limit(
         crate::tools::ToolRequest { name: call.name.clone(), args: call.args.clone(), approved: true },
         limit,
@@ -4859,7 +4863,7 @@ async fn execute_web_search(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let settings = crate::settings_levels::for_person(state, &run.spec.user_id).await;
+    let settings = crate::settings_levels::for_person(state, &run.spec.who.user_id).await;
     let scfg = crate::search::SearchConfig::from_settings(&settings);
     let output = match crate::search::run_search(&query, &scfg).await {
         Ok((results, provider)) => {
@@ -4876,7 +4880,7 @@ async fn execute_web_search(
                 provider: provider.clone(),
                 result_count: results.len(),
                 created_at: chrono::Utc::now().to_rfc3339(),
-            }).await;
+            }, &run.spec.who.agent()).await;
             let mut text = format!("Web results via {provider}:\n");
             for (i, r) in results.iter().enumerate() {
                 text.push_str(&format!(
@@ -4896,7 +4900,7 @@ async fn execute_web_search(
                 approved: true,
                 approval: approval.into(),
                 created_at: chrono::Utc::now().to_rfc3339(),
-            }).await;
+            }, &run.spec.who.agent()).await;
             text
         }
         Err(e) => format!(
@@ -5116,10 +5120,10 @@ async fn audit_tool(state: &crate::api::AppState, run: &LiveRun, call: &ToolCall
         tool: call.name.clone(),
         args: call.args.to_string().chars().take(4000).collect(),
         result: output.chars().take(4000).collect(),
-        approved: true,
+        approved: !approval.starts_with("refused"),
         approval: approval.into(),
         created_at: chrono::Utc::now().to_rfc3339(),
-    }).await;
+    }, &run.spec.who.agent()).await;
 }
 
 /// A cancelled run's last word: the user's doing, or Companion closing.
@@ -5427,7 +5431,7 @@ CONTENT>>>
                     conversation_id: String::new(),
                     search_enabled: false,
                     reasoning: false,
-                    user_id: "local".into(),
+                    who: crate::audit::Who { user_id: "local".into(), ..Default::default() },
                 },
                 cancel: CancelToken::new(),
                 events: Mutex::new(vec![AgentEvent::new(state, "fixture".into(), 1)]),
@@ -5463,7 +5467,7 @@ CONTENT>>>
                 conversation_id: String::new(),
                 search_enabled: false,
                 reasoning: false,
-                user_id: "local".into(),
+                who: crate::audit::Who { user_id: "local".into(), ..Default::default() },
             },
             cancel: CancelToken::new(),
             events: Mutex::new(vec![]),

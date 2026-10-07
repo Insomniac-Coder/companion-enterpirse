@@ -565,6 +565,18 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   `resume_auto_approved_runs` decides each waiting run with its owner's permissions.
   `GenerationTracker` holds one reply per `reply_key(conversation, person)`; Stop names the
   conversation and reaches only the caller's reply.
+- Audit records (`audit.rs`, task 8): `audit_records` only grows (`migrations/0006_audit.sql`: a
+  trigger refuses UPDATE, DELETE and TRUNCATE). The writers take an `audit::Who`, so a new caller
+  cannot skip the record: every model request through `api::request_recorder`, every tool and
+  search record through `Storage::record_tool_execution`/`record_search_run` (one transaction with
+  its audit row). Agent runs act as `Who::agent()` of the person who started them, a model's tool
+  check as `Who::system`. `audit::changes` records non-GET calls to admin routes (the role guards
+  mark the response with `AdminRoute`, so a new admin route is covered), anything under
+  `/api/admin/`, `/api/settings`, `/api/permissions/mode`, sign-out and API keys. Sign-ins are
+  recorded in `auth::callback`, approvals in `agent_resume` and `resume_auto_approved_runs`.
+  `Caller.address`/`device` come from `ConnectInfo` (the server runs with
+  `into_make_service_with_connect_info`) and the User-Agent. A failed audit write is logged and
+  does not fail the request.
 - `LLM → ToolRequest → PermissionManager → Tool → OS`. No direct OS access.
 - `WorkspaceManager::resolve` is the only path joiner; lexical + canonical checks.
 - MODERATE/DANGEROUS tools require `approved=true` (permission UX sets it, §26).

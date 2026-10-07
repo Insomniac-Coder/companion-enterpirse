@@ -136,6 +136,12 @@ pub struct Caller {
     pub roles: Vec<String>,
     /// The groups this person is team admin of.
     pub team_admin_of: Vec<String>,
+    /// Where this request came from, for the audit records: the connection's address, and the
+    /// browser's or app's name.
+    #[serde(skip)]
+    pub address: String,
+    #[serde(skip)]
+    pub device: String,
 }
 
 impl Caller {
@@ -149,6 +155,8 @@ impl Caller {
             via: "local",
             roles: vec![crate::roles::AUDITOR.into(), crate::roles::PLATFORM_ADMIN.into()],
             team_admin_of: Vec::new(),
+            address: String::new(),
+            device: String::new(),
         }
     }
 
@@ -223,7 +231,7 @@ async fn with_roles(pool: &sqlx::PgPool, row: Option<sqlx::postgres::PgRow>, via
     };
     let id: String = row.get("id");
     let (roles, team_admin_of) = crate::roles::grants(pool, &id).await?;
-    Ok(Some(Caller { name: row.get("name"), email: row.get("email"), id, via, roles, team_admin_of }))
+    Ok(Some(Caller { name: row.get("name"), email: row.get("email"), id, via, roles, team_admin_of, address: String::new(), device: String::new() }))
 }
 
 /// Every /api/ request but the `OPEN` ones must come from someone.
@@ -233,7 +241,8 @@ pub async fn authenticate(State(state): State<AppState>, mut request: Request, n
         return next.run(request).await;
     }
     match caller(&state, request.headers()).await {
-        Ok(Some(caller)) => {
+        Ok(Some(mut caller)) => {
+            (caller.address, caller.device) = crate::audit::origin(request.extensions().get(), request.headers());
             request.extensions_mut().insert(caller);
             next.run(request).await
         }
@@ -340,12 +349,25 @@ pub struct CallbackQuery {
 }
 
 /// The identity provider sends the person back here: check everything it says, then sign in.
-pub async fn callback(State(state): State<AppState>, headers: HeaderMap, Query(query): Query<CallbackQuery>) -> Response {
+pub async fn callback(
+    State(state): State<AppState>,
+    connection: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+    Query(query): Query<CallbackQuery>,
+) -> Response {
     let Some(open_id) = state.auth.open_id.clone() else {
         return Redirect::to("/").into_response();
     };
-    let mut response = match finish_sign_in(&state, &open_id, &headers, query).await {
-        Ok((token, return_to)) => {
+    let (address, device) = crate::audit::origin(connection.as_ref(), &headers);
+    let finished = finish_sign_in(&state, &open_id, &headers, query).await;
+    let (user_id, outcome, detail) = match &finished {
+        Ok((_, _, user_id)) => (user_id.clone(), "signed in", serde_json::json!({})),
+        Err(reason) => (String::new(), "refused", serde_json::json!({ "reason": reason })),
+    };
+    let who = crate::audit::Who { user_id, via: "session".into(), address, device };
+    crate::audit::write(&state, &who, crate::audit::Record { action: "sign_in", outcome: outcome.into(), detail, ..Default::default() }).await;
+    let mut response = match finished {
+        Ok((token, return_to, _)) => {
             let mut response = Redirect::to(&return_to).into_response();
             let session = format!("{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}", SESSION_HOURS * 3600, secure(&open_id));
             if let Ok(value) = session.parse() {
@@ -365,7 +387,8 @@ pub async fn callback(State(state): State<AppState>, headers: HeaderMap, Query(q
     response
 }
 
-async fn finish_sign_in(state: &AppState, open_id: &OpenId, headers: &HeaderMap, query: CallbackQuery) -> Result<(String, String), String> {
+/// The new session's token, where to go next, and who signed in.
+async fn finish_sign_in(state: &AppState, open_id: &OpenId, headers: &HeaderMap, query: CallbackQuery) -> Result<(String, String, String), String> {
     if let Some(error) = query.error {
         // Only the provider's short code is shown: the link's own words could say anything.
         tracing::warn!(%error, description = query.error_description.unwrap_or_default(), "the identity provider refused a sign-in");
@@ -453,7 +476,7 @@ async fn finish_sign_in(state: &AppState, open_id: &OpenId, headers: &HeaderMap,
     };
     let user_id = saved.await.map_err(|e| format!("cannot save the sign-in: {e}"))?;
     tracing::info!(user = %user_id, "signed in");
-    Ok((token, return_to))
+    Ok((token, return_to, user_id))
 }
 
 fn sign_in_failed(reason: &str) -> Response {
@@ -896,7 +919,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_sign_in_gives_a_session_that_ends_at_sign_out() {
-        let (app, provider, _) = companion_with_sign_in().await;
+        let (app, provider, state) = companion_with_sign_in().await;
         assert_eq!(send(&app, get("/api/conversations")).await.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(send(&app, get("/api/health")).await.status(), StatusCode::OK, "health answers anyone");
 
@@ -925,6 +948,16 @@ mod tests {
         assert!(set_cookie(&send(&app, out).await).unwrap().contains("Max-Age=0"));
         assert_eq!(send(&app, with_header(get("/api/me"), "cookie", &session)).await.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(send(&app, with_header(get("/api/me"), "cookie", &other)).await.status(), StatusCode::OK, "only that browser signed out");
+
+        // Each sign-in, the refused second use of a link, and the sign-out are audit records.
+        let ada = me["id"].as_str().unwrap();
+        let records: Vec<(String, String, String)> = sqlx::query_as("SELECT action, user_id, outcome FROM audit_records ORDER BY seq")
+            .fetch_all(state.storage.pool())
+            .await
+            .unwrap();
+        let expected = [("sign_in", ada, "signed in"), ("sign_in", "", "refused"), ("sign_in", ada, "signed in"), ("sign_out", ada, "200")];
+        let got: Vec<(&str, &str, &str)> = records.iter().map(|(a, u, o)| (a.as_str(), u.as_str(), o.as_str())).collect();
+        assert_eq!(got, expected);
     }
 
     #[tokio::test]
@@ -1073,6 +1106,18 @@ mod tests {
         let (other, _, _) = sign_in(&app, &provider, "eve", Spoil::Nothing).await;
         let eve = session_of(&set_cookie(&other).unwrap());
         assert_eq!(body_json(send(&app, with_header(get("/api/me/api-keys"), "cookie", &eve)).await).await, serde_json::json!([]));
+
+        // Making and withdrawing keys is recorded; the key itself is not.
+        let records: Vec<(String, String, String)> = sqlx::query_as("SELECT target, outcome, detail::TEXT FROM audit_records WHERE action = 'api_key' ORDER BY seq")
+            .fetch_all(state.storage.pool())
+            .await
+            .unwrap();
+        let routes: Vec<(&str, &str)> = records.iter().map(|(t, o, _)| (t.as_str(), o.as_str())).collect();
+        let withdrawn = format!("DELETE /api/me/api-keys/{}", made["id"].as_str().unwrap());
+        assert_eq!(routes, [("POST /api/me/api-keys", "400"), ("POST /api/me/api-keys", "200"), (withdrawn.as_str(), "200")]);
+        assert!(records[1].2.contains("Build server"));
+        let everything: Vec<String> = sqlx::query_scalar("SELECT detail::TEXT FROM audit_records").fetch_all(state.storage.pool()).await.unwrap();
+        assert!(everything.iter().all(|row| !row.contains(&key[4..])), "the key is in no audit record");
     }
 
     #[tokio::test]

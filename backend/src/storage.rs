@@ -734,13 +734,24 @@ impl Storage {
         Ok(done.rows_affected() > 0)
     }
 
-    pub async fn record_tool_execution(&self, t: &ToolExecution) -> DbResult<()> {
+    /// The tool record, and its audit record (`who` asked for it) in the same transaction.
+    pub async fn record_tool_execution(&self, t: &ToolExecution, who: &crate::audit::Who) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO tool_executions(id,conversation_id,tool,args,result,approved,approval,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)")
             .bind(&t.id).bind(&t.conversation_id).bind(&t.tool).bind(&t.args).bind(&t.result)
             .bind(t.approved).bind(&t.approval).bind(&t.created_at)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        Ok(())
+        let record = crate::audit::Record {
+            action: "tool_call",
+            target: t.conversation_id.clone(),
+            allowed_by: t.approval.clone(),
+            outcome: if t.approval.starts_with("refused") { "refused" } else { "ran" }.into(),
+            detail: serde_json::json!({ "tool": t.tool, "args": crate::audit::excerpt(&t.args) }),
+            ..Default::default()
+        };
+        crate::audit::insert(&mut *tx, who, &record).await?;
+        tx.commit().await
     }
 
     pub async fn tool_executions_for(&self, conv: &str, limit: usize) -> DbResult<Vec<ToolExecution>> {
@@ -833,13 +844,23 @@ impl Storage {
 
     // ---- Stage 11 search audit ----
 
-    pub async fn record_search_run(&self, run: &SearchRun) -> DbResult<()> {
+    /// The search record, and its audit record (`who` asked for it) in the same transaction.
+    pub async fn record_search_run(&self, run: &SearchRun, who: &crate::audit::Who) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO search_runs(id,conversation_id,query,provider,result_count,created_at) VALUES($1,$2,$3,$4,$5,$6)")
             .bind(&run.id).bind(&run.conversation_id).bind(&run.query).bind(&run.provider)
             .bind(run.result_count as i64).bind(&run.created_at)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        Ok(())
+        let record = crate::audit::Record {
+            action: "web_search",
+            target: run.conversation_id.clone(),
+            outcome: format!("{} results", run.result_count),
+            detail: serde_json::json!({ "provider": run.provider, "query": crate::audit::excerpt(&run.query) }),
+            ..Default::default()
+        };
+        crate::audit::insert(&mut *tx, who, &record).await?;
+        tx.commit().await
     }
 
     // ---- Stage 26 memory entries ----
@@ -1765,7 +1786,7 @@ mod tests {
             approved: true,
             approval: "allowed by the permission mode".into(),
             created_at: "2026-01-01T00:00:06Z".into(),
-        })
+        }, &crate::audit::Who::default())
         .await
         .unwrap();
         let execs = s.tool_executions_for("ce", 10).await.unwrap();

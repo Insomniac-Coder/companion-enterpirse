@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { autoTitle, cappedPermissionMode, matchesShortcut, modesWithin, nextPermissionMode, PermissionModeSaver, planAwaitingApproval, selectAvailableModel, shouldStartAgent, updateMessage, validatedPanelWidth, WORKBENCH_DESTINATIONS } from './workbench.ts';
+import { autoTitle, cappedPermissionMode, matchesShortcut, modesWithin, nextPermissionMode, PermissionModeSaver, planAwaitingApproval, selectAvailableModel, shouldStartAgent, updateMessage, validatedPanelWidth } from './workbench.ts';
 
 test('new chats and new code tasks are titled from their first message', () => {
   assert.equal(autoTitle('New task', 'What does this project do?'), 'What does this project do?');
@@ -11,12 +11,6 @@ test('new chats and new code tasks are titled from their first message', () => {
   const long = autoTitle('New task', 'Create a to-do list web app in a new folder named todo: a single index.html');
   assert.equal(long, 'Create a to-do list web app in a new folder…');
   assert.ok(long.length <= 49);
-});
-
-test('utility navigation keeps each destination once, with Settings last', () => {
-  const ids = WORKBENCH_DESTINATIONS.map(({id}) => id);
-  assert.deepEqual(ids, ['tools', 'settings'], 'models, resources and the runtime are in the dashboard; tools are people\'s own');
-  assert.equal(new Set(ids).size, ids.length);
 });
 
 test('startup honors the installed default without replacing a loaded or manually selected model', () => {

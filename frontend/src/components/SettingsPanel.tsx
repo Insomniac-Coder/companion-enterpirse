@@ -5,41 +5,31 @@ import { Children, cloneElement, createContext, isValidElement, useContext, useE
 import { getSettingFields, lockNote, type SettingFields } from '../services/settingsFields';
 import { getSettings, putSettings, listModels, scanModels, getRuntimePolicy, type ModelMeta } from '../services/api';
 import { pushToast, type Toast } from './Toasts';
-import AccountSection from './AccountSection';
-import type { Me } from '../services/account';
 import { defaultModelOptions, type ModelListState } from './settingsModels';
-import { changedSettings, expertSectionOpen, settingsSearchMatches, updateSetting } from './settingsForm';
-import { PERMISSION_MODE_DESCRIPTIONS, PERMISSION_MODE_LABELS, PROJECT_BOUNDARY_DESCRIPTION, SEARCH_PERMISSION_DESCRIPTION } from './permissionCopy';
-import { modesWithin } from '../services/workbench';
+import { changedSettings, updateSetting } from './settingsForm';
+import { PERMISSION_MODE_LABELS } from './permissionCopy';
 import { Button, Lamp } from '../ui/primitives';
 import { Icon, type IconName } from '../ui/Icon';
 
 type SetPreference = (path: string[], value: unknown) => void;
 type RuntimePolicy = Awaited<ReturnType<typeof getRuntimePolicy>>;
 
-const SECTION_ICONS: Record<string, IconName> = {
-  Account: 'lock',
-  Personalization: 'sun',
-  Assistant: 'sparkle',
-  'Web search': 'globe',
-  Performance: 'gauge',
-  'Privacy & boundaries': 'shield',
-  'Expert tuning': 'sliders',
-};
-
-function Num({ obj, k, set, id }: { obj: any; k: string; set: (value: number) => void; id?: string }) {
+export function Num({ obj, k, set, id }: { obj: any; k: string; set: (value: number) => void; id?: string }) {
   return <input type="number" id={id} aria-label={id ? undefined : k.replace(/_/g, ' ')}
     step={['temperature', 'top_p', 'repeat_penalty'].includes(k) ? 'any' : 1}
     value={obj?.[k] ?? ''} onChange={(event) => set(Number(event.target.value))} />;
 }
 
 /** What this person may do with each field (the server's word); none on a screen without it. */
-const FieldsContext = createContext<SettingFields | null>(null);
+export const FieldsContext = createContext<SettingFields | null>(null);
+/** On the dashboard: the lock control shown beside each field (`path`). */
+export const LockContext = createContext<((path: string) => ReactNode) | null>(null);
 
 /** Labels, controls, supplementary actions and help remain one indivisible row. A field this
  * person cannot change (`path` locked, or the company's) is disabled and says why. */
 export function SettingField({ label, children, description, path }: { label: string; children: ReactNode; description?: ReactNode; path?: string }) {
   const fields = useContext(FieldsContext);
+  const lock = useContext(LockContext);
   const note = lockNote(path ? fields?.[path] : undefined);
   const id = useId();
   const items = Children.toArray(children);
@@ -49,7 +39,7 @@ export function SettingField({ label, children, description, path }: { label: st
   if (control) items[0] = cloneElement(first as ReactElement<{ id?: string; 'aria-describedby'?: string }>, { id, ...(description ? { 'aria-describedby': `${id}-description` } : {}) });
   return <div className={`settings-field${checkbox ? ' settings-field--toggle' : ''}`}>
     {control ? <label className="settings-field-label" htmlFor={id}>{label}</label> : <span className="settings-field-label">{label}</span>}
-    <div className="settings-field-control">{note ? <fieldset className="settings-field-locked" disabled>{items}</fieldset> : items}</div>
+    <div className="settings-field-control">{note ? <fieldset className="settings-field-locked" disabled>{items}</fieldset> : items}{lock && path ? lock(path) : null}</div>
     {note && <div className="settings-field-lock"><Icon name="lock" size={12} />{note}</div>}
     {description && <div className="settings-field-description" id={`${id}-description`}>{description}</div>}
   </div>;
@@ -112,7 +102,7 @@ export function RuntimeSummary({ policy, dirty }: { policy: RuntimePolicy; dirty
   </details>;
 }
 
-/** Where the screen reads and saves: the person's own settings (no scope), or a level the
+/** Where a screen reads and saves: the person's own settings (no scope), or a level the
  *  dashboard edits, the company's or a group's. */
 export interface SettingsScope {
   load: () => Promise<any>;
@@ -120,270 +110,214 @@ export interface SettingsScope {
   save: (changed: Record<string, unknown>, all: any) => Promise<any>;
   /** Which fields this level may set, and why not; every field when absent. */
   fields?: () => Promise<SettingFields>;
-  /** What this level is, shown above the fields. */
-  note: string;
 }
 
-export default function SettingsPanel({ setToasts, me, scope }: { setToasts: React.Dispatch<React.SetStateAction<Toast[]>>; me?: Me; scope?: SettingsScope }) {
+/** The settings a screen edits: a draft over what was loaded, saved through `scope` (or as the
+ *  person's own). A screen keyed by its scope starts a fresh draft when the scope changes. */
+export function useSettingsDraft(scope: SettingsScope | undefined, onError: (message: string) => void) {
   const [s, setS] = useState<any>(null);
-  const [savedSettings, setSavedSettings] = useState<any>(null);
-  const [settingsError, setSettingsError] = useState('');
-  const [query, setQuery] = useState('');
+  const [saved, setSaved] = useState<any>(null);
+  const [error, setError] = useState('');
+  const [fields, setFields] = useState<SettingFields | null>(null);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [expertOpen, setExpertOpen] = useState(false);
-  const [expertMatches, setExpertMatches] = useState(false);
-  const [matchCount, setMatchCount] = useState(0);
-  const [sections, setSections] = useState<{ id: string; name: string }[]>([]);
-  const [current, setCurrent] = useState('');
-  const [models, setModels] = useState<ModelMeta[]>([]);
-  const [calibrationStatus, setCalibrationStatus] = useState<CalibrationStatus | null>(null);
-  const defaultModelId: string = s?.general?.default_model ?? '';
-  useEffect(() => {
-    if (!defaultModelId) { setCalibrationStatus(null); return; }
-    let current = true;
-    getCalibration(defaultModelId).then((next) => { if (current) setCalibrationStatus(next); }).catch(() => { if (current) setCalibrationStatus(null); });
-    return () => { current = false; };
-  }, [defaultModelId]);
-  const [modelListState, setModelListState] = useState<ModelListState>('loading');
-  const [modelListNotice, setModelListNotice] = useState('');
-  const [policy, setPolicy] = useState<RuntimePolicy | null>(null);
-  const [policyLoading, setPolicyLoading] = useState(true);
-  const [policyError, setPolicyError] = useState('');
-  const modelRequest = useRef(0);
-  const policyRequest = useRef(0);
-  const editRevision = useRef(0);
-  const page = useRef<HTMLDivElement>(null);
-  const expert = useRef<HTMLDetailsElement>(null);
-
-  const refreshPolicy = async (modelId?: string) => {
-    const request = ++policyRequest.current;
-    setPolicyLoading(true);
-    setPolicyError('');
-    try {
-      const next = await getRuntimePolicy(modelId || undefined);
-      if (request === policyRequest.current) setPolicy(next);
-    } catch (error) {
-      if (request === policyRequest.current) setPolicyError(error instanceof Error ? error.message : 'Runtime configuration is unavailable.');
-    } finally {
-      if (request === policyRequest.current) setPolicyLoading(false);
-    }
-  };
-
-  const refreshModels = async (rescan = false) => {
-    const request = ++modelRequest.current;
-    setModelListState('loading');
-    setModelListNotice('');
-    try {
-      const scan = rescan ? await scanModels() : null;
-      const detected = await listModels();
-      if (request !== modelRequest.current) return;
-      setModels(detected);
-      setModelListState('ready');
-      setModelListNotice(scan?.warnings.join(' ') ?? '');
-    } catch (error) {
-      if (request !== modelRequest.current) return;
-      setModelListState('error');
-      setModelListNotice(error instanceof Error ? error.message : 'The model list could not be loaded.');
-    }
-  };
-
-  const [fields, setFields] = useState<SettingFields | null>(null);
+  const revision = useRef(0);
   useEffect(() => {
     let active = true;
-    void refreshModels();
     (scope ? scope.fields : getSettingFields)?.().then((next) => { if (active) setFields(next); }).catch(() => {});
-    (scope?.load ?? getSettings)().then((settings) => {
-      if (!active) return;
-      setS(settings);
-      setSavedSettings(settings);
-      void refreshPolicy(settings.general?.default_model);
-    }).catch((error) => { if (active) setSettingsError(error.message); });
-    return () => { active = false; modelRequest.current++; policyRequest.current++; };
+    (scope?.load ?? getSettings)().then((value) => { if (active) { setS(value); setSaved(value); } }).catch((e) => { if (active) setError(e.message); });
+    return () => { active = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  useEffect(() => {
-    const cards = Array.from(page.current?.querySelectorAll<HTMLElement>(':scope > [data-settings-title]') ?? []);
-    const index: { id: string; name: string }[] = [];
-    let matches = 0;
-    cards.forEach((card) => {
-      const name = card.dataset.settingsTitle!;
-      const id = `setting-${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
-      card.id = id;
-      card.hidden = !settingsSearchMatches(card.textContent ?? '', query);
-      if (!card.hidden) matches++;
-      index.push({ id, name });
-    });
-    setSections(index);
-    setMatchCount(matches);
-    setExpertMatches(expertSectionOpen(false, expert.current?.textContent ?? '', query));
-  }, [s, query, models, modelListState, modelListNotice, policy, policyError, dirty]);
-
-  // Track which section is in view so the index shows where you are.
-  useEffect(() => {
-    const root = page.current?.closest('.page');
-    if (!root || !sections.length) return;
-    const onScroll = () => {
-      const cards = sections.map((section) => document.getElementById(section.id)).filter((card): card is HTMLElement => !!card && !card.hidden);
-      const top = root.getBoundingClientRect().top + 80;
-      let active = cards[0]?.id ?? '';
-      for (const card of cards) if (card.getBoundingClientRect().top <= top) active = card.id;
-      setCurrent(active);
-    };
-    onScroll();
-    root.addEventListener('scroll', onScroll, { passive: true });
-    return () => root.removeEventListener('scroll', onScroll);
-  }, [sections]);
-
   useEffect(() => {
     const warn = (event: BeforeUnloadEvent) => { if (dirty) { event.preventDefault(); event.returnValue = ''; } };
     window.addEventListener('beforeunload', warn);
     return () => window.removeEventListener('beforeunload', warn);
   }, [dirty]);
-
-  if (!s) return <div className="page"><div className="page-inner"><div className="panel empty-state" role="status">{settingsError ? <><Icon name="alertCircle" size={26} /><strong>Settings unavailable</strong><p>{settingsError}</p></> : <><Lamp state="caution" pulse /><p>Loading settings…</p></>}</div></div></div>;
-
-  const set: SetPreference = (path, value) => { editRevision.current++; setDirty(true); setS((previous: any) => updateSetting(previous, path, value)); };
-  const discard = () => { editRevision.current++; setS(savedSettings); setDirty(false); };
-  const conflict = cacheConflict(s, performanceMode(s));
-  const save = async () => {
-    if (saving || conflict) return;
+  const set: SetPreference = (path, value) => { revision.current++; setDirty(true); setS((previous: any) => updateSetting(previous, path, value)); };
+  const discard = () => { revision.current++; setS(saved); setDirty(false); };
+  /** The saved values, or null when saving failed (the reason went to `onError`). */
+  const save = async (): Promise<any | null> => {
+    if (saving) return null;
     setSaving(true);
-    const revision = editRevision.current;
+    const at = revision.current;
     try {
-      const saved = scope ? await scope.save(changedSettings(savedSettings, s), s) : await putSettings(s);
-      if (revision === editRevision.current) { setS(saved); setSavedSettings(saved); setDirty(false); }
-      if (scope) {
-        pushToast(setToasts, 'success', 'Saved. People get the new values with their next request; runtime changes apply on the next model load.');
-        return;
-      }
-      window.dispatchEvent(new CustomEvent('companion:settings', { detail: saved }));
-      document.documentElement.dataset.density = saved.appearance?.density ?? 'comfortable';
-      document.documentElement.classList.toggle('reduce-motion', !!saved.appearance?.reduce_motion);
-      if (saved.appearance?.theme) {
-        localStorage.setItem('companion.theme', saved.appearance.theme);
-        window.dispatchEvent(new CustomEvent('companion:appearance', { detail: saved.appearance }));
-        document.documentElement.dataset.theme = saved.appearance.theme === 'system' ? (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark') : saved.appearance.theme;
-      }
-      void refreshPolicy(saved.general?.default_model);
-      pushToast(setToasts, 'success', 'Settings saved. Runtime and sampling changes apply on the next model load.');
-    } catch (error) { pushToast(setToasts, 'error', error instanceof Error ? error.message : 'Settings could not be saved.'); }
-    finally { setSaving(false); }
+      const next = scope ? await scope.save(changedSettings(saved, s), s) : await putSettings(s);
+      if (at === revision.current) { setS(next); setSaved(next); setDirty(false); }
+      return next;
+    } catch (e) {
+      onError(e instanceof Error ? e.message : 'Settings could not be saved.');
+      return null;
+    } finally {
+      setSaving(false);
+    }
   };
+  return { s, set, dirty, saving, error, fields, save, discard };
+}
 
-  return <FieldsContext.Provider value={fields}><div className="page">
+export function SaveBar({ saving, blocked, onSave, onDiscard }: { saving: boolean; blocked?: string | null; onSave: () => void; onDiscard: () => void }) {
+  return (
+    <div className="save-bar" role="status">
+      <Lamp state="caution" />
+      <span>{blocked ?? 'Unsaved changes'}</span>
+      <Button variant="ghost" size="sm" disabled={saving} onClick={onDiscard}>Discard</Button>
+      <Button size="sm" loading={saving} disabled={!!blocked} title={blocked ?? undefined} onClick={onSave}>Save changes</Button>
+    </div>
+  );
+}
+
+/** A list of folders or addresses, one per line; empty lines are dropped when the field is left. */
+function Lines({ value, set, placeholder }: { value: string[] | undefined; set: (next: string[]) => void; placeholder: string }) {
+  const [text, setText] = useState((value ?? []).join('\n'));
+  useEffect(() => { setText((value ?? []).join('\n')); }, [value?.join('\n')]);
+  return <textarea rows={3} placeholder={placeholder} value={text} onChange={(event) => setText(event.target.value)} onBlur={() => set(text.split('\n').map((line) => line.trim()).filter(Boolean))} />;
+}
+
+/** The dashboard's settings: the parts of Companion the people running it decide. */
+export type ServiceSection = 'models' | 'search' | 'rules' | 'privacy';
+
+export const SERVICE_SECTION_TITLES: Record<ServiceSection, string> = {
+  models: 'Model server',
+  search: 'Web search',
+  rules: 'Rules',
+  privacy: 'Privacy and logging',
+};
+
+export default function ServiceSettings({ sections, scope, setToasts, readOnly, note }: {
+  sections: ServiceSection[];
+  scope: SettingsScope;
+  setToasts: React.Dispatch<React.SetStateAction<Toast[]>>;
+  /** An auditor reads; nothing can be changed. */
+  readOnly?: boolean;
+  /** What this level is, shown above the fields. */
+  note?: ReactNode;
+}) {
+  const draft = useSettingsDraft(scope, (message) => pushToast(setToasts, 'error', message));
+  const { s, set } = draft;
+  const [models, setModels] = useState<ModelMeta[]>([]);
+  const [modelListState, setModelListState] = useState<ModelListState>('loading');
+  const [modelListNotice, setModelListNotice] = useState('');
+  const [calibrationStatus, setCalibrationStatus] = useState<CalibrationStatus | null>(null);
+  const [policy, setPolicy] = useState<RuntimePolicy | null>(null);
+  const [policyError, setPolicyError] = useState('');
+  const withModels = sections.includes('models');
+  const defaultModelId: string = s?.general?.default_model ?? '';
+
+  const refreshModels = async (rescan = false) => {
+    setModelListState('loading');
+    setModelListNotice('');
+    try {
+      const scan = rescan ? await scanModels() : null;
+      setModels(await listModels());
+      setModelListState('ready');
+      setModelListNotice(scan?.warnings.join(' ') ?? '');
+    } catch (error) {
+      setModelListState('error');
+      setModelListNotice(error instanceof Error ? error.message : 'The model list could not be loaded.');
+    }
+  };
+  const refreshPolicy = (modelId?: string) => getRuntimePolicy(modelId || undefined)
+    .then((next) => { setPolicy(next); setPolicyError(''); })
+    .catch((error) => setPolicyError(error instanceof Error ? error.message : 'Runtime configuration is unavailable.'));
+  useEffect(() => { if (withModels) void refreshModels(); }, [withModels]);
+  useEffect(() => { if (withModels && s) void refreshPolicy(defaultModelId); }, [withModels, !!s, defaultModelId]);
+  useEffect(() => {
+    if (!withModels || !defaultModelId) { setCalibrationStatus(null); return; }
+    let current = true;
+    getCalibration(defaultModelId).then((next) => { if (current) setCalibrationStatus(next); }).catch(() => { if (current) setCalibrationStatus(null); });
+    return () => { current = false; };
+  }, [withModels, defaultModelId]);
+
+  if (!s) return <div className="page"><div className="page-inner"><div className="panel empty-state" role="status">{draft.error ? <><Icon name="alertCircle" size={26} /><strong>Settings unavailable</strong><p>{draft.error}</p></> : <><Lamp state="caution" pulse /><p>Loading settings…</p></>}</div></div></div>;
+
+  const conflict = withModels ? cacheConflict(s, performanceMode(s)) : null;
+  const save = async () => {
+    if (conflict) return;
+    const next = await draft.save();
+    if (!next) return;
+    if (withModels) void refreshPolicy(next.general?.default_model);
+    pushToast(setToasts, 'success', 'Saved. People get the new values with their next request; model server changes apply on the next model load.');
+  };
+  const modes = Object.keys(PERMISSION_MODE_LABELS) as (keyof typeof PERMISSION_MODE_LABELS)[];
+
+  return <FieldsContext.Provider value={draft.fields}><div className="page">
     <div className="page-inner">
-      <div className="settings-layout">
-        <nav className="settings-nav" aria-label="Settings categories">
-          {sections.map((section) => (
-            <a key={section.id} href={`#${section.id}`} aria-current={current === section.id ? 'true' : undefined} onClick={(event) => { event.preventDefault(); setQuery(''); if (section.name === 'Expert tuning') setExpertOpen(true); requestAnimationFrame(() => document.getElementById(section.id)?.scrollIntoView({ block: 'start', behavior: 'smooth' })); }}>
-              <Icon name={SECTION_ICONS[section.name] ?? 'dot'} size={15} />{section.name}
-            </a>
-          ))}
-        </nav>
-        <div className="settings-page" ref={page}>
-          <div className="settings-search"><Icon name="search" size={15} /><input aria-label="Search settings" placeholder="Search settings" value={query} onChange={(event) => setQuery(event.target.value)} /></div>
-          {query.trim() && matchCount === 0 && <p className="settings-empty" role="status">No settings match “{query}”. Try a different term or <button type="button" onClick={() => setQuery('')}>clear search</button>.</p>}
-
-          {scope && <p className="settings-capability-note">{scope.note}</p>}
-          {!scope && me?.sign_in && me.via === 'session' && <AccountSection me={me} setToasts={setToasts} />}
-
-          <section className="settings-section" data-settings-title="Personalization">
-            <h2><Icon name="sun" size={16} />Personalization</h2><p className="settings-section-intro">Choose how Companion looks and what appears in your conversations.</p>
-            <div className="settings-fields">
-              <SettingField label="Default model" path="general.default_model" description={<><span>Preferred selection on startup; does not automatically load or switch a running model. Choose a model, then Save changes.</span><span className="settings-model-status" role={modelListState === 'error' ? 'alert' : 'status'}>{modelListState === 'loading' ? 'Looking for local models…' : modelListState === 'error' ? `Could not refresh models. ${modelListNotice}` : modelListNotice || (models.length === 0 ? 'No models detected. Add a model in Models, then refresh.' : s.general?.default_model && !models.some((model) => model.id === s.general.default_model) ? 'Your saved default is unavailable. Refresh after adding it, or choose another model.' : '')}</span></>}>
-                <select value={s.general?.default_model ?? ''} disabled={modelListState === 'loading' && models.length === 0} onChange={(event) => set(['general', 'default_model'], event.target.value)}>{defaultModelOptions(models, s.general?.default_model ?? '', modelListState).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
-                <button className="btn secondary" type="button" disabled={modelListState === 'loading'} onClick={() => void refreshModels(true)} aria-label={modelListState === 'error' ? 'Retry model discovery' : 'Refresh detected models'}>{modelListState === 'loading' ? 'Refreshing…' : modelListState === 'error' ? 'Retry' : 'Refresh'}</button>
-              </SettingField>
-              <SettingField label="Theme" path="appearance.theme"><select value={s.appearance?.theme ?? s.general?.theme ?? 'dark'} onChange={(event) => set(['appearance', 'theme'], event.target.value)}><option value="dark">Dark</option><option value="light">Light</option><option value="system">Match system</option></select></SettingField>
-              <SettingField label="Density" path="appearance.density"><select value={s.appearance?.density ?? 'comfortable'} onChange={(event) => set(['appearance', 'density'], event.target.value)}><option value="comfortable">Comfortable</option><option value="compact">Compact</option></select></SettingField>
-              <SettingField label="Reduce motion" path="appearance.reduce_motion"><input type="checkbox" className="switch" checked={!!s.appearance?.reduce_motion} onChange={(event) => set(['appearance', 'reduce_motion'], event.target.checked)} /></SettingField>
-              <SettingField label="Show generation speed" path="diagnostics.show_generation_speed"><input type="checkbox" className="switch" checked={s.diagnostics?.show_generation_speed ?? true} onChange={(event) => set(['diagnostics', 'show_generation_speed'], event.target.checked)} /></SettingField>
-              <SettingField label="Show detailed response metrics" path="diagnostics.show_detailed_metrics"><input type="checkbox" className="switch" checked={s.diagnostics?.show_detailed_metrics ?? false} onChange={(event) => set(['diagnostics', 'show_detailed_metrics'], event.target.checked)} /></SettingField>
-              <SettingField label="Command palette shortcut" path="keyboard.command_palette" description="Other shortcuts: Ctrl+1 Chat, Ctrl+2 Code, Esc close, Enter send, Shift+Enter new line."><input value={s.keyboard?.command_palette ?? 'ctrl+k'} onChange={(event) => set(['keyboard', 'command_palette'], event.target.value)} /></SettingField>
-            </div>
-          </section>
-
-          <section className="settings-section" data-settings-title="Assistant">
-            <h2><Icon name="sparkle" size={16} />Assistant</h2><p className="settings-section-intro">Set your preferred reasoning and file-editing behavior.</p>
-            <div className="settings-fields">
-              <SettingField label="Permission mode" path="agent.permission_mode" description={`${PERMISSION_MODE_DESCRIPTIONS[(s.agent?.permission_mode ?? (s.agent?.autonomous_enabled ? 'auto' : 'ask')) as keyof typeof PERMISSION_MODE_DESCRIPTIONS] ?? PERMISSION_MODE_DESCRIPTIONS.ask} ${PROJECT_BOUNDARY_DESCRIPTION} Shift+Tab in a code session cycles it.`}><select value={s.agent?.permission_mode ?? (s.agent?.autonomous_enabled ? 'auto' : 'ask')} onChange={(event) => { set(['agent', 'permission_mode'], event.target.value); set(['agent', 'autonomous_enabled'], event.target.value === 'auto'); }}>{(Object.keys(PERMISSION_MODE_LABELS) as (keyof typeof PERMISSION_MODE_LABELS)[]).map((option) => <option key={option} value={option} disabled={!modesWithin([option], s.agent?.max_permission_mode ?? 'auto').length}>{PERMISSION_MODE_LABELS[option]}</option>)}</select></SettingField>
-              <SettingField label="Reasoning on by default" path="reasoning.default_on" description="Allows longer responses; native thinking behavior depends on the model."><input type="checkbox" className="switch" checked={!!s.reasoning?.default_on} onChange={(event) => set(['reasoning', 'default_on'], event.target.checked)} /></SettingField>
-              <SettingField label="Reasoning budget" path="reasoning.budget"><select value={s.reasoning?.budget ?? 'automatic'} onChange={(event) => set(['reasoning', 'budget'], event.target.value)}><option value="automatic">Automatic</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></SettingField>
-              <SettingField label="Automatic compaction" path="memory.auto_compact" description="When the context fills up, older messages and agent steps are summarized so nothing is silently dropped. An agent run pauses between steps while this happens and then resumes; a chat reply starts once it is done. Original messages stay saved."><select value={s.memory?.auto_compact === 'off' ? 'off' : 'automatic'} onChange={(event) => set(['memory', 'auto_compact'], event.target.value)}><option value="automatic">Automatic</option><option value="off">Off</option></select></SettingField>
-              <SettingField label="Compact at (% of usable context)" path="memory.compact_at_pct" description="50–98. Usable context is the model's window minus the room kept for its next reply."><Num obj={{ compact_at_pct: s.memory?.compact_at_pct ?? 90 }} k="compact_at_pct" set={(value) => set(['memory', 'compact_at_pct'], value)} /></SettingField>
-            </div>
-          </section>
-
-          <section className="settings-section" data-settings-title="Web search">
-            <h2><Icon name="globe" size={16} />Web search</h2><p className="settings-section-intro">Search requests leave this PC. Enable search for each conversation request when you need it.</p>
-            <div className="settings-fields">
-              <SettingField label="Search provider" path="search.provider" description={s.search?.provider === 'custom' ? 'The saved custom provider is not implemented. Choose a supported provider to use search.' : undefined}><select value={s.search?.provider ?? 'duckduckgo'} onChange={(event) => set(['search', 'provider'], event.target.value)}><option value="duckduckgo">DuckDuckGo (no key)</option><option value="brave">Brave (API key)</option>{s.search?.provider === 'custom' && <option value="custom">Saved custom provider — unavailable</option>}</select></SettingField>
-              {s.search?.provider === 'brave' && <SettingField label="Brave API key" path="search.brave_key"><input type="password" autoComplete="off" value={s.search?.brave_key ?? ''} onChange={(event) => set(['search', 'brave_key'], event.target.value)} /></SettingField>}
-              {scope && <SettingField label="Most permissive mode allowed" path="agent.max_permission_mode" description="Nobody can choose a mode that allows more than this; a mode someone chose before counts as this one."><select value={s.agent?.max_permission_mode ?? 'auto'} onChange={(event) => set(['agent', 'max_permission_mode'], event.target.value)}>{(Object.keys(PERMISSION_MODE_LABELS) as (keyof typeof PERMISSION_MODE_LABELS)[]).map((option) => <option key={option} value={option}>{PERMISSION_MODE_LABELS[option]}</option>)}</select></SettingField>}
-              <SettingField label="Agent search permission" path="search.autonomous" description={SEARCH_PERMISSION_DESCRIPTION}><select value={s.search?.autonomous ?? 'ask'} onChange={(event) => set(['search', 'autonomous'], event.target.value)}><option value="ask">Ask unless Auto mode is on</option><option value="allow">Allow agent searches</option><option value="deny">Do not allow agent searches</option></select></SettingField>
-            </div>
-          </section>
-
-          <section className="settings-section settings-performance" data-settings-title="Performance">
-            <h2><Icon name="gauge" size={16} />Performance</h2><p className="settings-section-intro">Let Companion choose compatible runtime settings when you load a model.</p>
-            <div className="settings-fields">
-              <SettingField label="Performance mode" path="runtime.mode" description={<PerformanceModeNote settings={s} status={calibrationStatus} />}>
-                <div className="settings-mode-options" role="radiogroup" aria-label="Performance mode">
-                  {MODES.map((option) => (
-                    <label key={option.value} className={`settings-mode-option${performanceMode(s) === option.value ? ' selected' : ''}`}>
-                      <input type="radio" name="performance-mode" value={option.value} checked={performanceMode(s) === option.value} onChange={() => { set(['runtime', 'mode'], option.value); set(['runtime_auto'], option.value !== 'manual'); }} />
-                      <strong>{option.label}</strong>
-                      <span>{option.description}</span>
-                    </label>
-                  ))}
-                </div>
-              </SettingField>
-              <SettingField label="Speculative decoding" path="runtime.speculative" description="Auto drafts tokens that already appear in the context and verifies them in one step. The model still chooses every word; checking several words at once can very rarely pick a different one of two almost equally likely words. Replies that repeat the context (code edits, file rewrites, tool calls) finish faster, and when nothing repeats it costs no measurable speed. Applies on the next model load."><select value={s.runtime?.speculative ?? 'auto'} onChange={(event) => set(['runtime', 'speculative'], event.target.value)}><option value="auto">Auto (draft from context)</option><option value="off">Off</option></select></SettingField>
-              <SettingField label="KV cache precision" path="runtime.kv_cache" description={<><span>f16 is the compatibility default. q8_0 halves cache memory, which allows a larger context on the same GPU; it measured no slower with Flash Attention on. Applies on the next model load.</span>{quantizedCacheUnavailable(s, performanceMode(s)) && <span className="settings-context-warning" role={cacheConflict(s, performanceMode(s)) ? 'alert' : 'status'}>{cacheConflict(s, performanceMode(s)) ?? QUANTIZED_CACHE_UNAVAILABLE_NOTE}</span>}</>}><select value={s.runtime?.kv_cache ?? 'f16'} onChange={(event) => set(['runtime', 'kv_cache'], event.target.value)}><option value="f16">f16 (default)</option><option value="q8_0" disabled={quantizedCacheUnavailable(s, performanceMode(s))}>q8_0 (half the cache memory{quantizedCacheUnavailable(s, performanceMode(s)) ? '; needs Flash Attention' : ''})</option></select></SettingField>
-            </div>
-            <HardwareOverrides settings={s} set={set} />
-            <div className="settings-runtime-summary"><strong>A fresh cache for each model load</strong><p>The runtime handles cache layout for the model architecture. Loading a model starts a fresh runtime cache; your saved conversations remain on disk.</p></div>
-            {policyLoading && <p className="settings-capability-note" role="status">Checking runtime configuration…</p>}
-            {policyError && <p className="settings-policy-error" role="alert">Could not read runtime configuration. <button className="btn secondary sm" type="button" onClick={() => void refreshPolicy(s.general?.default_model)}>Retry</button></p>}
-            {policy && !policyLoading && !policyError && <RuntimeSummary policy={policy} dirty={dirty} />}
-          </section>
-
-          <section className="settings-section" data-settings-title="Privacy & boundaries">
-            <h2><Icon name="shield" size={16} />Privacy &amp; boundaries</h2>
-            <ul className="settings-boundaries"><li>{PROJECT_BOUNDARY_DESCRIPTION}</li>{(Object.keys(PERMISSION_MODE_LABELS) as (keyof typeof PERMISSION_MODE_LABELS)[]).map((option) => <li key={option}>{PERMISSION_MODE_LABELS[option]}: {PERMISSION_MODE_DESCRIPTIONS[option]}</li>)}<li>{SEARCH_PERMISSION_DESCRIPTION}</li></ul>
-            <p className="settings-capability-note" style={{ marginBottom: 12 }}>These are app-level controls, not an operating-system or browser sandbox. Use Auto only for tasks and projects you trust.</p>
-            <div className="settings-fields">
-              <SettingField label="Keep a record of model requests" path="privacy.record_model_requests" description="Stores what was sent to the model and what it returned for each reply and agent step, so a wrong or broken answer can be diagnosed. Kept on this computer only, limited to the most recent 300 requests. Records can contain file contents the assistant read."><input type="checkbox" className="switch" checked={s.privacy?.record_model_requests !== false} onChange={(event) => set(['privacy', 'record_model_requests'], event.target.checked)} /></SettingField>
-            </div>
-          </section>
-
-          <details className="settings-section settings-expert" data-settings-title="Expert tuning" ref={expert} open={expertOpen || expertMatches} onToggle={(event) => { if (!query.trim()) setExpertOpen(event.currentTarget.open); }}>
-            <summary><Icon name="chevronRight" size={15} className="chev" /><span>Expert tuning</span><span className="settings-expert-caption">Context, sampling and task limits</span></summary>
-            <p className="settings-section-intro">Optional overrides for specific models and workflows. Hardware stays automatic unless you change it above.</p>
-            <div className="settings-fields">
-              <SettingField label="Context size" path="inference.context_size" description={<><span>The window to ask for. Applies on the next model load; the setting below decides what happens when it does not fit memory.</span>{contextSupportWarning(Number(s.inference?.context_size), models, s.general?.default_model) && <span className="settings-context-warning" role="status">{contextSupportWarning(Number(s.inference?.context_size), models, s.general?.default_model)}</span>}</>}><Num obj={s.inference} k="context_size" set={(value) => set(['inference', 'context_size'], value)} /></SettingField>
-              <SettingField label="When the context size does not fit" path="runtime.context_fit" description="A model plus a context cache that big may not fit the GPU. Fit it automatically keeps the whole model on the GPU by loading a smaller window, which is faster. Use my size as written keeps the window and lets part of the model run on the CPU, which is slower. Either way the loaded window and the reason are shown in the context meter."><select value={s.runtime?.context_fit === 'requested' ? 'requested' : 'fit'} onChange={(event) => set(['runtime', 'context_fit'], event.target.value)}><option value="fit">Fit it to memory (faster)</option><option value="requested">Use my size as written (slower)</option></select></SettingField>
-              <SettingField label="Temperature" path="inference.temperature"><Num obj={s.inference} k="temperature" set={(value) => set(['inference', 'temperature'], value)} /></SettingField>
-              <SettingField label="Top-p" path="inference.top_p"><Num obj={s.inference} k="top_p" set={(value) => set(['inference', 'top_p'], value)} /></SettingField>
-              <SettingField label="Top-k" path="inference.top_k"><Num obj={s.inference} k="top_k" set={(value) => set(['inference', 'top_k'], value)} /></SettingField>
-              <SettingField label="Repeat penalty" path="inference.repeat_penalty"><Num obj={s.inference} k="repeat_penalty" set={(value) => set(['inference', 'repeat_penalty'], value)} /></SettingField>
-              <SettingField label="Recent messages kept after compaction" path="memory.compaction_keep_turns"><Num obj={s.memory} k="compaction_keep_turns" set={(value) => set(['memory', 'compaction_keep_turns'], value)} /></SettingField>
-              <SettingField label="Maximum search results" path="search.max_results"><Num obj={s.search} k="max_results" set={(value) => set(['search', 'max_results'], value)} /></SettingField>
-              <SettingField label="Search timeout (seconds)" path="search.timeout_secs"><Num obj={s.search} k="timeout_secs" set={(value) => set(['search', 'timeout_secs'], value)} /></SettingField>
-            </div>
-            <p className="settings-capability-note" style={{ marginBottom: 12 }}>Older, inactive preferences remain in your saved configuration. They are not shown as controls because the app does not apply them.</p>
-          </details>
-
-          {(dirty || saving) && (
-            <div className="save-bar" role="status">
-              <Lamp state="caution" />
-              <span>{conflict ? 'Cannot save: an 8-bit KV cache needs Flash Attention' : 'Unsaved changes'}</span>
-              <Button variant="ghost" size="sm" disabled={saving} onClick={discard}>Discard</Button>
-              <Button size="sm" loading={saving} disabled={!!conflict} title={conflict ?? undefined} onClick={() => void save()}>Save changes</Button>
-            </div>
+      <div className="settings-page">
+        {note && <p className="settings-capability-note">{note}</p>}
+        <fieldset className="settings-readonly" disabled={readOnly}>
+          {withModels && (
+            <section className="settings-section settings-performance" data-settings-title="Model server">
+              <h2><Icon name="layers" size={16} />Model server</h2><p className="settings-section-intro">The model everyone uses, how big its context is, how it samples words, and how the hardware runs it.</p>
+              <div className="settings-fields">
+                <SettingField label="Model loaded at startup" path="general.default_model" description={<><span>Loaded when the server starts. A model already running keeps running until it is switched on the Models page.</span><span className="settings-model-status" role={modelListState === 'error' ? 'alert' : 'status'}>{modelListState === 'loading' ? 'Looking for models…' : modelListState === 'error' ? `Could not refresh models. ${modelListNotice}` : modelListNotice || (models.length === 0 ? 'No models found. Add one on the Models page, then refresh.' : s.general?.default_model && !models.some((model) => model.id === s.general.default_model) ? 'The saved model is not installed any more. Choose another.' : '')}</span></>}>
+                  <select value={s.general?.default_model ?? ''} disabled={modelListState === 'loading' && models.length === 0} onChange={(event) => set(['general', 'default_model'], event.target.value)}>{defaultModelOptions(models, s.general?.default_model ?? '', modelListState).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select>
+                  <button className="btn secondary" type="button" disabled={modelListState === 'loading'} onClick={() => void refreshModels(true)} aria-label={modelListState === 'error' ? 'Retry model discovery' : 'Refresh detected models'}>{modelListState === 'loading' ? 'Refreshing…' : modelListState === 'error' ? 'Retry' : 'Refresh'}</button>
+                </SettingField>
+                <SettingField label="Context size" path="inference.context_size" description={<><span>The window to ask for. Applies on the next model load; the next setting decides what happens when it does not fit memory.</span>{contextSupportWarning(Number(s.inference?.context_size), models, s.general?.default_model) && <span className="settings-context-warning" role="status">{contextSupportWarning(Number(s.inference?.context_size), models, s.general?.default_model)}</span>}</>}><Num obj={s.inference} k="context_size" set={(value) => set(['inference', 'context_size'], value)} /></SettingField>
+                <SettingField label="When the context size does not fit" path="runtime.context_fit" description="Fit it to memory keeps the whole model on the GPU by loading a smaller window, which is faster. Use the size as written keeps the window and lets part of the model run on the CPU, which is slower."><select value={s.runtime?.context_fit === 'requested' ? 'requested' : 'fit'} onChange={(event) => set(['runtime', 'context_fit'], event.target.value)}><option value="fit">Fit it to memory (faster)</option><option value="requested">Use the size as written (slower)</option></select></SettingField>
+                <SettingField label="Temperature" path="inference.temperature"><Num obj={s.inference} k="temperature" set={(value) => set(['inference', 'temperature'], value)} /></SettingField>
+                <SettingField label="Top-p" path="inference.top_p"><Num obj={s.inference} k="top_p" set={(value) => set(['inference', 'top_p'], value)} /></SettingField>
+                <SettingField label="Top-k" path="inference.top_k"><Num obj={s.inference} k="top_k" set={(value) => set(['inference', 'top_k'], value)} /></SettingField>
+                <SettingField label="Repeat penalty" path="inference.repeat_penalty"><Num obj={s.inference} k="repeat_penalty" set={(value) => set(['inference', 'repeat_penalty'], value)} /></SettingField>
+                <SettingField label="Performance mode" path="runtime.mode" description={<PerformanceModeNote settings={s} status={calibrationStatus} />}>
+                  <div className="settings-mode-options" role="radiogroup" aria-label="Performance mode">
+                    {MODES.map((option) => (
+                      <label key={option.value} className={`settings-mode-option${performanceMode(s) === option.value ? ' selected' : ''}`}>
+                        <input type="radio" name="performance-mode" value={option.value} checked={performanceMode(s) === option.value} onChange={() => { set(['runtime', 'mode'], option.value); set(['runtime_auto'], option.value !== 'manual'); }} />
+                        <strong>{option.label}</strong>
+                        <span>{option.description}</span>
+                      </label>
+                    ))}
+                  </div>
+                </SettingField>
+                <SettingField label="Speculative decoding" path="runtime.speculative" description="Auto drafts tokens that already appear in the context and verifies them in one step. The model still chooses every word. Replies that repeat the context (code edits, file rewrites, tool calls) finish faster; when nothing repeats it costs no measurable speed. Applies on the next model load."><select value={s.runtime?.speculative ?? 'auto'} onChange={(event) => set(['runtime', 'speculative'], event.target.value)}><option value="auto">Auto (draft from context)</option><option value="off">Off</option></select></SettingField>
+                <SettingField label="KV cache precision" path="runtime.kv_cache" description={<><span>f16 is the compatibility default. q8_0 halves cache memory, which allows a larger context on the same GPU; it measured no slower with Flash Attention on. Applies on the next model load.</span>{quantizedCacheUnavailable(s, performanceMode(s)) && <span className="settings-context-warning" role={cacheConflict(s, performanceMode(s)) ? 'alert' : 'status'}>{cacheConflict(s, performanceMode(s)) ?? QUANTIZED_CACHE_UNAVAILABLE_NOTE}</span>}</>}><select value={s.runtime?.kv_cache ?? 'f16'} onChange={(event) => set(['runtime', 'kv_cache'], event.target.value)}><option value="f16">f16 (default)</option><option value="q8_0" disabled={quantizedCacheUnavailable(s, performanceMode(s))}>q8_0 (half the cache memory{quantizedCacheUnavailable(s, performanceMode(s)) ? '; needs Flash Attention' : ''})</option></select></SettingField>
+              </div>
+              <HardwareOverrides settings={s} set={set} />
+              {policyError && <p className="settings-policy-error" role="alert">Could not read the runtime configuration. <button className="btn secondary sm" type="button" onClick={() => void refreshPolicy(s.general?.default_model)}>Retry</button></p>}
+              {policy && !policyError && <RuntimeSummary policy={policy} dirty={draft.dirty} />}
+            </section>
           )}
-        </div>
+
+          {sections.includes('search') && (
+            <section className="settings-section" data-settings-title="Web search">
+              <h2><Icon name="globe" size={16} />Web search</h2><p className="settings-section-intro">Where searches go when someone turns search on for a message. Search requests leave the company.</p>
+              <div className="settings-fields">
+                <SettingField label="Search provider" path="search.provider" description={s.search?.provider === 'custom' ? 'The saved custom provider is not implemented. Choose a supported provider to use search.' : undefined}><select value={s.search?.provider ?? 'duckduckgo'} onChange={(event) => set(['search', 'provider'], event.target.value)}><option value="duckduckgo">DuckDuckGo (no key)</option><option value="brave">Brave (API key)</option>{s.search?.provider === 'custom' && <option value="custom">Saved custom provider — unavailable</option>}</select></SettingField>
+                {s.search?.provider === 'brave' && <SettingField label="Brave API key" path="search.brave_key"><input type="password" autoComplete="off" value={s.search?.brave_key ?? ''} onChange={(event) => set(['search', 'brave_key'], event.target.value)} /></SettingField>}
+                <SettingField label="Maximum search results" path="search.max_results"><Num obj={s.search} k="max_results" set={(value) => set(['search', 'max_results'], value)} /></SettingField>
+                <SettingField label="Search timeout (seconds)" path="search.timeout_secs"><Num obj={s.search} k="timeout_secs" set={(value) => set(['search', 'timeout_secs'], value)} /></SettingField>
+              </div>
+            </section>
+          )}
+
+          {sections.includes('rules') && (
+            <section className="settings-section" data-settings-title="Rules">
+              <h2><Icon name="shield" size={16} />Rules</h2><p className="settings-section-intro">What people's work may touch. People cannot change these; a group's values replace the company's for its members.</p>
+              <div className="settings-fields">
+                <SettingField label="Most permissive mode allowed" path="agent.max_permission_mode" description="Nobody can choose a permission mode that allows more than this; a mode someone chose before counts as this one."><select value={s.agent?.max_permission_mode ?? 'auto'} onChange={(event) => set(['agent', 'max_permission_mode'], event.target.value)}>{modes.map((option) => <option key={option} value={option}>{PERMISSION_MODE_LABELS[option]}</option>)}</select></SettingField>
+                <SettingField label="Allowed project folders" path="security.allowed_dirs" description="One folder per line. When any are listed, a project must be inside one of them. Empty: any folder."><Lines value={s.security?.allowed_dirs} placeholder="D:\Projects" set={(next) => set(['security', 'allowed_dirs'], next)} /></SettingField>
+                <SettingField label="Blocked folders" path="security.blocked_dirs" description="One folder per line. No project may be inside one of these, even an allowed one."><Lines value={s.security?.blocked_dirs} placeholder="C:\Windows" set={(next) => set(['security', 'blocked_dirs'], next)} /></SettingField>
+                <SettingField label="Internet access" path="network.policy" description="On request: web search when someone turns it on for a message. Selected sites: only the trusted addresses below. Off: nothing leaves the company."><select value={s.network?.policy ?? 'ask'} onChange={(event) => set(['network', 'policy'], event.target.value)}><option value="ask">On request</option><option value="selected">Selected sites only</option><option value="disabled">Off</option></select></SettingField>
+                {s.network?.policy === 'selected' && <SettingField label="Trusted sites" path="network.trusted_hosts" description="One address per line; a site covers its subdomains."><Lines value={s.network?.trusted_hosts} placeholder="api.search.brave.com" set={(next) => set(['network', 'trusted_hosts'], next)} /></SettingField>}
+                <SettingField label="Largest file attachment (MB)" path="files.max_attach_mb" description="1 to 50."><Num obj={s.files} k="max_attach_mb" set={(value) => set(['files', 'max_attach_mb'], value)} /></SettingField>
+                <SettingField label="Largest image attachment (MB)" path="files.max_image_mb" description="1 to 50."><Num obj={s.files} k="max_image_mb" set={(value) => set(['files', 'max_image_mb'], value)} /></SettingField>
+                <SettingField label="Longest command (minutes)" path="agent.command_timeout_secs" description="How long a command or project check may run before it is stopped."><input type="number" min={1} value={Math.round((s.agent?.command_timeout_secs ?? 1800) / 60)} onChange={(event) => set(['agent', 'command_timeout_secs'], Math.max(1, Number(event.target.value)) * 60)} /></SettingField>
+              </div>
+            </section>
+          )}
+
+          {sections.includes('privacy') && (
+            <section className="settings-section" data-settings-title="Privacy and logging">
+              <h2><Icon name="lock" size={16} />Privacy and logging</h2><p className="settings-section-intro">What the server keeps about the work done on it. The audit records are kept either way.</p>
+              <div className="settings-fields">
+                <SettingField label="Keep a record of model requests" path="privacy.record_model_requests" description="Stores what was sent to the model and what it returned for each reply and agent step, so a wrong or broken answer can be diagnosed. Limited to the most recent 300 requests. Records can contain file contents the assistant read."><input type="checkbox" className="switch" checked={s.privacy?.record_model_requests !== false} onChange={(event) => set(['privacy', 'record_model_requests'], event.target.checked)} /></SettingField>
+                <SettingField label="Mask secrets in the logs" path="privacy.log_redaction" description="Bearer tokens, API keys, passwords in addresses and password= values are written as *** in the server's log files (and so in a logs zip)."><input type="checkbox" className="switch" checked={s.privacy?.log_redaction !== false} onChange={(event) => set(['privacy', 'log_redaction'], event.target.checked)} /></SettingField>
+              </div>
+            </section>
+          )}
+        </fieldset>
+        {draft.dirty && !readOnly && <SaveBar saving={draft.saving} blocked={conflict ? 'Cannot save: an 8-bit KV cache needs Flash Attention' : null} onSave={() => void save()} onDiscard={draft.discard} />}
       </div>
     </div>
   </div></FieldsContext.Provider>;

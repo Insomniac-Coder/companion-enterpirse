@@ -577,6 +577,13 @@ Source of truth: `Local_LLM_PC_Companion_Design.md` (§§1–107).
   `Caller.address`/`device` come from `ConnectInfo` (the server runs with
   `into_make_service_with_connect_info`) and the User-Agent. A failed audit write is logged and
   does not fail the request.
+- Settings screens follow the kinds: Companion's Settings dialog (`SettingsDialog.tsx`) shows only
+  personal fields (`PersonalSettings.tsx`); the dashboard's service pages (`ServiceSettings` in
+  `SettingsPanel.tsx`) show the rest, and People's defaults shows the personal sections for the company
+  or a group, with locks. `settings_levels::tests::each_screen_shows_the_fields_of_its_kind` reads both
+  screens, so a field cannot appear on the wrong side. `PUT /api/settings` saves only the caller's own
+  unlocked personal choices, platform admins included; company values change only through
+  `PUT /api/admin/settings/company` (on a laptop, one person, everything is the company's).
 - Two apps, one set of parts (task 9): `frontend/index.html` is Companion (`src/App.tsx`, the
   person's own work) and `frontend/admin/index.html` the dashboard (`src/admin/`: people, company and
   group settings, audit records, and the models, runtime and resources screens that left the user

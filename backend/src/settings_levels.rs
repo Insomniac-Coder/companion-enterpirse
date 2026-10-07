@@ -33,10 +33,11 @@ pub enum Kind {
     Machine,
 }
 
-const PERSONAL: [&str; 21] = [
+/// What people choose in Companion's Settings (`PersonalSettings.tsx`); the dashboard sets their
+/// company and group defaults. Sampling and the startup model are the model server's (machine).
+const PERSONAL: [&str; 16] = [
     "agent.permission_mode",
     "general.theme",
-    "general.default_model",
     "general.language",
     "appearance.",
     "keyboard.",
@@ -48,10 +49,6 @@ const PERSONAL: [&str; 21] = [
     "memory.compaction_keep_turns",
     "memory.compact_at_pct",
     "memory.share_across_modes",
-    "inference.temperature",
-    "inference.top_p",
-    "inference.top_k",
-    "inference.repeat_penalty",
     "search.autonomous",
     "workspace.confirm_outside_copy",
     "workspace.default_dir",
@@ -262,14 +259,13 @@ pub async fn sort_changes(
     if !state.auth.sign_in_required() {
         return Ok((changed, Vec::new()));
     }
+    // A person's own choices only, admins included (their own Settings is not where company values
+    // change: that is the dashboard, `PUT /api/admin/settings/company`). Locked fields are refused.
     let locks = locks_for(state.storage.pool(), &caller.id).await.map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
-    let admin = caller.has(PLATFORM_ADMIN);
-    let (mut company, mut own, mut refused) = (Vec::new(), Vec::new(), Vec::new());
+    let (company, mut own, mut refused) = (Vec::new(), Vec::new(), Vec::new());
     for (path, leaf) in changed {
         match (kind(&path), locked(&locks, &path)) {
             (Kind::Personal, None) => own.push((path, leaf)),
-            (_, Some(lock)) if lock.group.is_some() => refused.push(path),
-            _ if admin => company.push((path, leaf)),
             _ => refused.push(path),
         }
     }
@@ -326,13 +322,8 @@ pub async fn fields(State(state): State<AppState>, Extension(caller): Extension<
                 .collect(),
         ));
     }
-    let (_, mut fields) = effective(&state, &caller.id).await.map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
-    // A platform admin's changes to company fields go to the company's settings, a group's lock aside.
-    if caller.has(PLATFORM_ADMIN) {
-        for field in fields.values_mut() {
-            field.editable = field.editable || field.locked_by.as_deref().is_none_or(|by| by == "company");
-        }
-    }
+    // A person's own view, admins included: company values are set on the dashboard, not here.
+    let (_, fields) = effective(&state, &caller.id).await.map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
     Ok(Json(fields))
 }
 
@@ -503,10 +494,33 @@ mod tests {
         sqlx::query("INSERT INTO setting_locks (path, group_id, reason) VALUES ($1, $2, $3)").bind(path).bind(group).bind(reason).execute(state.storage.pool()).await.unwrap();
     }
 
+    /// Companion's Settings shows only what people choose; the dashboard's service pages never show
+    /// it. Read from the two screens themselves, so a field moved on screen cannot drift from its kind.
+    #[test]
+    fn each_screen_shows_the_fields_of_its_kind() {
+        let screen = |file: &str| std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../frontend/src/components").join(file)).unwrap();
+        let paths = |text: &str| -> Vec<String> {
+            regex::Regex::new(r#"path="([a-z_]+\.[a-z_]+)""#).unwrap().captures_iter(text).map(|found| found[1].to_string()).collect()
+        };
+        let personal = paths(&screen("PersonalSettings.tsx"));
+        assert!(personal.len() >= 10, "{personal:?}");
+        for path in &personal {
+            assert_eq!(kind(path), Kind::Personal, "{path} is in Companion's Settings, so a person must be able to choose it");
+        }
+        let service = paths(&screen("SettingsPanel.tsx"));
+        assert!(service.len() >= 15, "{service:?}");
+        for path in &service {
+            assert_ne!(kind(path), Kind::Personal, "{path} is on the dashboard's service pages, so it must not be a person's own");
+        }
+    }
+
     #[test]
     fn every_field_is_personal_policy_or_machine() {
         assert_eq!(kind("appearance.theme"), Kind::Personal);
-        assert_eq!(kind("inference.temperature"), Kind::Personal);
+        assert_eq!(kind("agent.permission_mode"), Kind::Personal);
+        assert_eq!(kind("memory.compact_at_pct"), Kind::Personal);
+        assert_eq!(kind("inference.temperature"), Kind::Machine, "sampling is the model's, set on the dashboard");
+        assert_eq!(kind("general.default_model"), Kind::Machine, "the admin decides which model runs");
         assert_eq!(kind("security.allowed_dirs"), Kind::Policy);
         assert_eq!(kind("files.max_attach_mb"), Kind::Policy);
         assert_eq!(kind("hardware.gpu_layers"), Kind::Machine);
@@ -571,9 +585,18 @@ mod tests {
         let body: Value = serde_json::from_slice(&axum::body::to_bytes(refused.into_body(), 100_000).await.unwrap()).unwrap();
         assert!(body["error"].as_str().unwrap().contains("files.max_attach_mb"), "{body}");
 
-        // A platform admin changes the company's value, for everyone.
-        assert_eq!(status(&app, call("PUT", "/api/settings", &boss, Some(bigger))).await, StatusCode::OK);
+        // A platform admin's own Settings change only their own choices; the company's values change
+        // on the dashboard.
+        assert_eq!(status(&app, call("PUT", "/api/settings", &boss, Some(bigger))).await, StatusCode::FORBIDDEN);
+        assert_eq!(status(&app, call("PUT", "/api/admin/settings/company", &boss, Some(json!({ "settings": { "files": { "max_attach_mb": 40 } } })))).await, StatusCode::OK);
         assert_eq!(json(&app, call("GET", "/api/settings", &bob, None)).await["files"]["max_attach_mb"], 40);
+        // A company lock binds the admin's own choices too.
+        lock(&state, "appearance.density", None, "house style").await;
+        let mut compact = json(&app, call("GET", "/api/settings", &boss, None)).await;
+        compact["appearance"]["density"] = json!("compact");
+        assert_eq!(status(&app, call("PUT", "/api/settings", &boss, Some(compact))).await, StatusCode::FORBIDDEN);
+        let boss_fields = json(&app, call("GET", "/api/settings/fields", &boss, None)).await;
+        assert_eq!((boss_fields["appearance.density"]["editable"].as_bool(), boss_fields["appearance.density"]["locked_by"].as_str()), (Some(false), Some("company")));
         // And sets a company default for a personal field through the company endpoint.
         assert_eq!(status(&app, call("PUT", "/api/admin/settings/company", &boss, Some(json!({ "settings": { "reasoning": { "default_on": true } } })))).await, StatusCode::OK);
         assert_eq!(json(&app, call("GET", "/api/settings", &bob, None)).await["reasoning"]["default_on"], true);

@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import MessageView from './components/MessageView';
 import PrepareBanner from './components/PrepareBanner';
-import SettingsPanel from './components/SettingsPanel';
+import SettingsDialog, { type SettingsSectionId } from './components/SettingsDialog';
 import Toasts, { pushToast, type Toast } from './components/Toasts';
 import { ContextGauge } from './components/ContextBar';
-import ToolsPage from './components/ToolsPage';
 import DiffModal from './components/DiffModal';
 import ShareDialog, { type ShareOptions } from './components/ShareDialog';
 import RecoveryBanner from './components/RecoveryBanner';
@@ -30,7 +29,7 @@ import { currentActivitySnapshot, parseActivityStart, visibleWorkActivity } from
 import { groupActivity, groupSessionsByProject, lastSessionKey, projectGroupOpen, projectPick, projectRemoval, type ProjectGroup } from './services/projectSessions';
 import { availablePermissionModes, codeSessionsReadOnly, firstLoadNotice, READ_ONLY_MODE_REASON } from './services/tooling';
 import { initialHealth, modelStoppedDetail, nextHealth, RECHECK_MS, shouldRecheck, type RuntimeHealth } from './services/runtimeHealth';
-import { APPROVE_PLAN_MESSAGE, autoTitle, cappedPermissionMode, machineState, type MachineActivity, matchesShortcut, modesWithin, nextPermissionMode, PERMISSION_MODE_SETTLE_MS, PERMISSION_MODES, PermissionModeSaver, selectAvailableModel, shouldStartAgent, updateMessage, WORKBENCH_DESTINATIONS } from './services/workbench';
+import { APPROVE_PLAN_MESSAGE, autoTitle, cappedPermissionMode, machineState, type MachineActivity, matchesShortcut, modesWithin, nextPermissionMode, PERMISSION_MODE_SETTLE_MS, PERMISSION_MODES, PermissionModeSaver, selectAvailableModel, shouldStartAgent, updateMessage } from './services/workbench';
 import { Button, Dialog, IconButton, Kbd, Lamp, Notice, PopDivider, PopItem, PopLabel, Popover, Toggle } from './ui/primitives';
 import { Icon, type IconName } from './ui/Icon';
 import {
@@ -49,13 +48,7 @@ import {
 type Msg = { id: string; role: 'user' | 'assistant' | 'tool'; text: string; time: string; activities?: AgentEvent[] };
 
 type Theme = 'dark' | 'light' | 'system';
-type PageId = 'tools' | 'settings';
 type Perf = { tps: number | null; timing?: OutputTiming | null; legacy: boolean; model?: string };
-
-const PAGE_META: Record<PageId, { title: string; description: string; icon: IconName }> = {
-  tools: { title: 'Tools and plugins', description: 'Every action Companion can take for you, the approval each needs, and the plugins you can run', icon: 'wrench' },
-  settings: { title: 'Settings', description: 'Appearance, assistant behaviour, search and performance', icon: 'sliders' },
-};
 
 const PRIORITIES = [
   { id: 'background', label: 'Background' },
@@ -88,8 +81,8 @@ export default function App({ me }: { me?: Me }) {
   const initials = (me?.sign_in && me.name ? me.name : 'You').split(/\s+/).map((part) => part[0]).join('').slice(0, 2).toUpperCase();
   // The person's attachment limits (company or group), checked here before an upload.
   const [attachLimits, setAttachLimits] = useState<{ max_attach_mb: number; max_image_mb: number } | undefined>(undefined);
-  const destinations = WORKBENCH_DESTINATIONS;
-  const [tab, setTab] = useState<'chat' | PageId>('chat');
+  // Settings is a dialog, as in ChatGPT and Claude; null when it is closed.
+  const [settingsSection, setSettingsSection] = useState<SettingsSectionId | null>(null);
   const [mode, setMode] = useState<'chat' | 'code'>(() => (localStorage.getItem('companion.mode') as any) || 'chat');
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteShortcut, setPaletteShortcut] = useState('ctrl+k');
@@ -529,7 +522,7 @@ export default function App({ me }: { me?: Me }) {
     const observer = new ResizeObserver(update);
     observer.observe(dock);
     return () => observer.disconnect();
-  }, [tab]);
+  }, []);
 
   useEffect(() => {
     if (!modelId) {
@@ -614,7 +607,6 @@ export default function App({ me }: { me?: Me }) {
       const nextMode = (conv?.mode || 'chat') as 'chat' | 'code';
       setMode(nextMode);
       if (nextMode !== mode) setRightTab(nextMode === 'code' ? 'activity' : 'context');
-      setTab('chat');
       localStorage.setItem(`companion.last.${nextMode}`, id);
       if (conv?.mode === 'code') {
         // The picker follows the session: its own project, or none for a session without one.
@@ -642,7 +634,6 @@ export default function App({ me }: { me?: Me }) {
 
   function switchMode(nextMode: 'chat' | 'code') {
     setMode(nextMode);
-    setTab('chat');
     setMobileNav(false);
     setRightTab(nextMode === 'code' ? 'activity' : 'context');
     const remembered = localStorage.getItem(`companion.last.${nextMode}`);
@@ -692,7 +683,6 @@ export default function App({ me }: { me?: Me }) {
       setConvId(c.id);
       setHistoryLoading(false);
       setFocusRun(null);
-      setTab('chat');
       setMobileNav(false);
       setInput('');
       localStorage.setItem(`companion.last.${mode}`, c.id);
@@ -1188,11 +1178,12 @@ export default function App({ me }: { me?: Me }) {
   const paletteActions: QuickAction[] = [
     { id: 'new', group: 'Actions', icon: 'plus', label: mode === 'code' ? 'New task' : 'New chat', detail: mode === 'code' ? 'Start a code session in the current project' : 'Start a fresh conversation', run: () => void newChat() },
     { id: 'project', group: 'Actions', icon: 'folderPlus', label: 'Open a project', detail: 'Choose the files your coding agent can access', run: () => setProjectLauncherOpen(true) },
-    { id: 'panel', group: 'Actions', icon: 'panelRight', label: rightOpen ? 'Hide inspector' : 'Show inspector', detail: 'Activity, files and context beside the conversation', run: () => { setTab('chat'); setRightOpen((open) => !open); } },
+    { id: 'panel', group: 'Actions', icon: 'panelRight', label: rightOpen ? 'Hide inspector' : 'Show inspector', detail: 'Activity, files and context beside the conversation', run: () => setRightOpen((open) => !open) },
     ...(['dark', 'light', 'system'] as Theme[]).filter((value) => value !== theme).map((value) => ({ id: `theme-${value}`, group: 'Actions', icon: (value === 'dark' ? 'moon' : value === 'light' ? 'sun' : 'monitor') as IconName, label: value === 'system' ? 'Match system theme' : `Use ${value} theme`, detail: `Current theme: ${theme}`, run: () => setTheme(value) })),
     { id: 'mode-chat', group: 'Go to', icon: 'chat', label: 'Chat', detail: 'Conversations', run: () => switchMode('chat') },
     { id: 'mode-code', group: 'Go to', icon: 'code', label: 'Code', detail: 'Project sessions', run: () => switchMode('code') },
-    ...destinations.map(({ id, label }) => ({ id, group: 'Go to', icon: PAGE_META[id].icon, label, detail: PAGE_META[id].description, run: () => { setTab(id); setMobileNav(false); } })),
+    { id: 'settings', group: 'Go to', icon: 'settings', label: 'Settings', detail: 'Appearance, chats, memory, permission mode and your account', run: () => { setSettingsSection('general'); setMobileNav(false); } },
+    { id: 'tools', group: 'Go to', icon: 'wrench', label: 'Tools and plugins', detail: 'Every action Companion can take for you, and the plugins you can run', run: () => { setSettingsSection('tools'); setMobileNav(false); } },
     ...convs.map((conversation) => ({ id: conversation.id, group: 'Sessions', icon: (conversation.mode === 'code' ? 'code' : 'chat') as IconName, label: conversation.title || 'Untitled', detail: conversation.mode === 'code' ? `Code session${workspaces.find((w) => w.id === conversation.workspace) ? ` · ${workspaces.find((w) => w.id === conversation.workspace)!.name}` : ''}` : 'Conversation', run: () => void selectConv(conversation.id) })),
   ];
 
@@ -1306,7 +1297,7 @@ export default function App({ me }: { me?: Me }) {
   }
 
   return (
-    <div className={`shell${rail ? ' rail' : ''}${rightOpen && tab === 'chat' ? '' : ' no-right'}${mobileNav ? ' mobile-nav' : ''}`}>
+    <div className={`shell${rail ? ' rail' : ''}${rightOpen ? '' : ' no-right'}${mobileNav ? ' mobile-nav' : ''}`}>
       {paletteOpen && <CommandPalette onClose={() => setPaletteOpen(false)} actions={paletteActions} />}
       {mobileNav && <button type="button" className="nav-scrim" aria-label="Close navigation" onClick={() => setMobileNav(false)} />}
       <a href="#composer" className="skip-link" onClick={(e) => { e.preventDefault(); composerRef.current?.focus(); }}>
@@ -1336,9 +1327,8 @@ export default function App({ me }: { me?: Me }) {
               <IconButton icon="plus" label={mode === 'code' ? 'New task' : 'New chat'} tipSide="right" onClick={() => void newChat()} />
               <IconButton icon="search" label="Search" tipSide="right" onClick={() => setPaletteOpen(true)} />
               <div className="sb-modes-rail" role="group" aria-label="Work mode">
-                <IconButton icon="chat" label="Chat" pressed={mode === 'chat' && tab === 'chat'} tipSide="right" onClick={() => switchMode('chat')} />
-                <IconButton icon="code" label="Code" pressed={mode === 'code' && tab === 'chat'} tipSide="right" onClick={() => switchMode('code')} />
-                <IconButton icon="wrench" label="Tools and plugins" pressed={tab === 'tools'} tipSide="right" onClick={() => setTab(tab === 'tools' ? 'chat' : 'tools')} />
+                <IconButton icon="chat" label="Chat" pressed={mode === 'chat'} tipSide="right" onClick={() => switchMode('chat')} />
+                <IconButton icon="code" label="Code" pressed={mode === 'code'} tipSide="right" onClick={() => switchMode('code')} />
               </div>
             </>
           ) : (
@@ -1354,9 +1344,6 @@ export default function App({ me }: { me?: Me }) {
                 <button type="button" role="tab" aria-selected={mode === 'chat'} onClick={() => switchMode('chat')} title="Chats (Ctrl 1)"><Icon name="chat" size={15} />Chats<span className="sb-count">{convs.filter((c) => (c.mode || 'chat') === 'chat').length}</span></button>
                 <button type="button" role="tab" aria-selected={mode === 'code'} onClick={() => switchMode('code')} title="Code tasks (Ctrl 2)"><Icon name="code" size={15} />Code tasks<span className="sb-count">{convs.filter((c) => c.mode === 'code').length}</span></button>
               </div>
-              <button type="button" className="sb-workspace-page" aria-current={tab === 'tools' ? 'page' : undefined} onClick={() => { setTab(tab === 'tools' ? 'chat' : 'tools'); setMobileNav(false); }}>
-                <Icon name="wrench" size={15} />Tools<span className="sb-count">{registry.length || ''}</span>
-              </button>
               {mode === 'code' && (
                 <div className="project-switch">
                   <button
@@ -1392,7 +1379,6 @@ export default function App({ me }: { me?: Me }) {
                   recovery={recovery}
                   onResume={(id) => {
                     refreshConvs(id);
-                    setTab('chat');
                     notify('info', 'Session restored. The loaded model will rebuild context when you send a message.');
                   }}
                   onDiscard={(id) => discardStale(id, loadedModel).then(() => {
@@ -1432,7 +1418,7 @@ export default function App({ me }: { me?: Me }) {
           <div className="sb-person" title={me?.sign_in ? me.email || me.name : 'This PC\u2019s one person'}>
             <span className="sb-person-initial" aria-hidden="true">{initials}</span>
             {!rail && <span className="sb-person-name">{me?.sign_in && me.name ? me.name : 'You'}</span>}
-            <IconButton icon="sliders" label="Settings" size="sm" pressed={tab === 'settings'} tipSide={rail ? 'right' : 'top'} onClick={() => { setTab(tab === 'settings' ? 'chat' : 'settings'); setMobileNav(false); }} />
+            <IconButton icon="settings" label="Settings" size="sm" pressed={settingsSection !== null} tipSide={rail ? 'right' : 'top'} onClick={() => { setSettingsSection('general'); setMobileNav(false); }} />
             {me?.sign_in && <IconButton icon="power" label={`Sign out ${me.name}`} size="sm" tipSide={rail ? 'right' : 'top'} onClick={() => { void signOut().then(() => { window.location.href = '/'; }, () => notify('error', 'Sign-out did not finish. Try again.')); }} />}
           </div>
         </nav>
@@ -1494,10 +1480,8 @@ export default function App({ me }: { me?: Me }) {
             <Lamp state={machine.state} pulse={machine.state === 'live'} />
           </div>
           <div className="head-title">
-            {tab === 'chat' && <span className="head-crumb" aria-hidden="true">{mode === 'code' ? 'Code tasks' : 'Chats'}<span className="sep">/</span></span>}
-            {tab !== 'chat' ? (
-              <h1>{PAGE_META[tab].title}</h1>
-            ) : renaming?.where === 'head' && renaming.id === convId ? (
+            <span className="head-crumb" aria-hidden="true">{mode === 'code' ? 'Code tasks' : 'Chats'}<span className="sep">/</span></span>
+            {renaming?.where === 'head' && renaming.id === convId ? (
               <input
                 className="head-rename"
                 autoFocus
@@ -1518,9 +1502,7 @@ export default function App({ me }: { me?: Me }) {
               </h1>
             )}
             <div className="head-sub">
-              {tab !== 'chat' ? (
-                <span>{PAGE_META[tab].description}</span>
-              ) : mode === 'code' ? (
+              {mode === 'code' ? (
                 headWorkspace ? (
                   <>
                     <Icon name="folder" size={13} />
@@ -1540,8 +1522,7 @@ export default function App({ me }: { me?: Me }) {
           <span className="boundary-mark" title={me?.sign_in ? 'Your conversations, files and the model all stay on the company\u2019s own servers.' : 'Your conversations, files and the model all stay on this PC.'}>
             <Icon name="shieldCheck" size={14} />{boundary}
           </span>
-          {tab === 'chat' && (
-            <div className="head-actions">
+          <div className="head-actions">
               {mode === 'code' && activeConv?.workspace && (
                 <>
                   <ProjectActions
@@ -1573,8 +1554,7 @@ export default function App({ me }: { me?: Me }) {
                 </Popover>
               </span>
               <IconButton icon="panelRight" label={rightOpen ? 'Hide inspector' : 'Show inspector'} pressed={rightOpen} tipSide="bottom-end" onClick={() => setRightOpen((v) => !v)} />
-            </div>
-          )}
+          </div>
         </header>
 
         {backendUp === false && (
@@ -1596,12 +1576,11 @@ export default function App({ me }: { me?: Me }) {
         {permOpen && (
           <PermissionsModal
             onClose={() => setPermOpen(false)}
-            onOpenSettings={() => setTab('settings')}
+            onOpenSettings={() => setSettingsSection('agents')}
           />
         )}
 
-        {tab === 'chat' && (
-          <>
+        <>
             {showShare && convId && (
               <ShareDialog
                 targets={convs.filter((c) => c.id !== convId).map((c) => ({ id: c.id, label: `${c.mode === 'code' ? 'Code' : 'Chat'} · ${c.title}` }))}
@@ -1853,16 +1832,12 @@ export default function App({ me }: { me?: Me }) {
                 </div>
               </div>
             </div>
-          </>
-        )}
-
-        {tab === 'tools' && <ToolsPage registry={registry} wsId={wsId} notify={notify} onRefresh={() => void refreshRegistry()} />}
-        {tab === 'settings' && <SettingsPanel setToasts={setToasts} me={me} />}
+        </>
 
         {diffWs && <DiffModal wsId={diffWs} onClose={() => setDiffWs(null)} />}
       </div>
 
-      {rightOpen && tab === 'chat' && (
+      {rightOpen && (
         <RightPanel mode={mode} tab={rightTab} onTab={setRightTab} onClose={() => setRightOpen(false)}>
           <RightPanelTabs
             tab={rightTab}
@@ -1887,6 +1862,19 @@ export default function App({ me }: { me?: Me }) {
             onAgentActiveChange={(active) => { if (active && !agentBusy && conversationRef.current === convId) refreshAgentActivity.current(); }}
           />
         </RightPanel>
+      )}
+
+      {settingsSection && (
+        <SettingsDialog
+          section={settingsSection}
+          onSection={setSettingsSection}
+          onClose={() => setSettingsSection(null)}
+          me={me}
+          setToasts={setToasts}
+          registry={registry}
+          wsId={wsId}
+          onRefreshTools={() => void refreshRegistry()}
+        />
       )}
 
       {confirmState && (

@@ -394,3 +394,31 @@
 .admin-group-bar label { display: inline-flex; align-items: center; gap: 8px; }
 .admin-group-bar input { width: 6rem; }
 .admin-json { margin: 0; padding: 12px; border-radius: 8px; background: var(--code-bg); color: var(--text-2); font-size: 12px; overflow: auto; max-height: 60vh; }
+
+/* ---- Companion's Settings dialog ---- */
+.settings-dialog.dialog { max-width: 940px; }
+.settings-dialog .dialog-body { padding: 0; overflow: hidden; }
+.settings-dialog-body { display: grid; grid-template-columns: 200px minmax(0, 1fr); height: min(620px, 70dvh); border-top: 1px solid var(--line); }
+.settings-dialog-body .settings-nav { position: static; padding: 10px 8px; border-right: 1px solid var(--line); overflow-y: auto; }
+.settings-dialog-content { min-height: 0; overflow-y: auto; padding: 18px 24px 24px; }
+.settings-dialog-content .settings-section { padding: 0; border: 0; background: none; box-shadow: none; }
+.settings-dialog .dialog-foot .save-bar { position: static; margin: 0; padding: 0; border: 0; background: none; box-shadow: none; width: 100%; }
+.settings-dialog-leave { display: flex; align-items: center; gap: 8px; width: 100%; color: var(--text-2); font-size: 13px; }
+.settings-dialog-leave span { flex: 1; }
+.tools-panels { display: flex; flex-direction: column; gap: 14px; }
+@media (max-width: 720px) {
+  .settings-dialog-body { grid-template-columns: 1fr; grid-template-rows: auto minmax(0, 1fr); height: 76dvh; }
+  .settings-dialog-body .settings-nav { flex-direction: row; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+  .settings-dialog-body .settings-nav a { flex: none; }
+}
+
+/* ---- Dashboard settings: read-only for auditors, a lock beside each field ---- */
+.settings-readonly { min-width: 0; margin: 0; padding: 0; border: 0; display: flex; flex-direction: column; gap: 14px; }
+.lock-ctl { flex: none; display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 7px; border-radius: 6px; color: var(--text-4); font-size: 12px; white-space: nowrap; }
+.lock-ctl:hover { background: var(--hover); color: var(--text-2); }
+.lock-ctl.locked { color: var(--caution); box-shadow: inset 0 0 0 1px var(--caution-line); }
+.lock-ctl.asking { gap: 6px; padding: 0; }
+.lock-ctl.asking input { width: 13rem; height: 28px; padding: 0 8px; border-radius: 7px; border: 1px solid var(--line-2); background: var(--raised); color: var(--text); font: inherit; font-size: 12.5px; }
+.admin-group-bar select { height: 30px; padding: 0 8px; border-radius: 7px; border: 1px solid var(--line-2); background: var(--raised); color: var(--text); font: inherit; font-size: 13px; }
+.dashboard-nav .sb-section { padding: 14px 10px 4px; }
+.dashboard-nav .sb-section:first-child { padding-top: 4px; }

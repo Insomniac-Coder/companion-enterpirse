@@ -426,16 +426,20 @@ Each setting is one of three kinds:
 
 | Kind | Who sets it | Examples |
 | --- | --- | --- |
-| Personal | the company's default, a group's, then each person's own choice | theme, density, shortcuts, reasoning default, sampling, compaction, search consent |
-| Policy | the company, or a group for its members; never a person | allowed and blocked folders, network rule, attachment limits, command time limit |
-| Machine | the company only (everyone shares one model server) | context size, hardware, runtime, search provider and key, logging |
+| Personal | the company's default, a group's, then each person's own choice | theme, density, reasoning default, compaction, permission mode, agent web searches, shortcuts |
+| Policy | the company, or a group for its members; never a person | allowed and blocked folders, internet access, attachment limits, command time limit, highest permission mode |
+| Machine | the company only (everyone shares one model server) | the model loaded at startup, context size, sampling, performance, hardware, search provider and key, logging |
 
-A platform admin can **lock** a personal or policy field for the whole company, a team admin for their
-group; the field then shows as locked, with the reason, and nobody below can change it. When a
-person's groups disagree, the group with the lowest priority number wins. On the settings screen,
-people change their own choices; a platform admin's changes to company fields go to the company.
-The dashboard's **Company settings** page sets the company's values, each group's (and its
-priority) and the locks; the same is open to scripts through the API:
+Each app shows its own kind, as ChatGPT and Claude separate a person's settings from the admin
+console. In **Companion**, the settings button at the bottom of the sidebar opens **Settings**: General,
+Chats, Memory and context, Code and agents, Tools and plugins, Keyboard, and Account; it changes only
+that person's own choices, a platform admin's too. The **dashboard** sets the rest: **Model server**,
+**Web search**, **Rules** and **Privacy and logging**, and **People's defaults**, the company's and each
+group's defaults for the personal settings. A platform admin can **lock** a personal or policy field there
+for the whole company (a team admin for their group): it shows as locked in people's Settings, with the
+reason, and nobody below can change it, the admin's own Settings included. When a person's groups
+disagree, the group with the lowest priority number wins. A laptop install has one person and one set
+of settings, so its dashboard offers no locks. The same is open to scripts through the API:
 `GET /api/admin/settings`, `PUT /api/admin/settings/company` with `{"settings": {...}}`,
 `PUT /api/admin/settings/groups/<id>` with `{"settings": {...}, "priority": 10}`, and
 `PUT`/`DELETE /api/admin/settings/locks` with `{"path": "appearance.theme", "group_id": null, "reason": "..."}`.

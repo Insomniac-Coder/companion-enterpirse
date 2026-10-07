@@ -13,6 +13,10 @@ const result = await build({ entryPoints: [sourcePath], bundle: true, write: fal
 const loaded = { exports: {} };
 new Function('require', 'module', 'exports', result.outputFiles[0].text)(createRequire(import.meta.url), loaded, loaded.exports);
 const { SettingField, HardwareOverrides, RuntimeSummary } = loaded.exports;
+const personalPath = fileURLToPath(new URL('../src/components/PersonalSettings.tsx', import.meta.url));
+const personalBuilt = await build({ entryPoints: [personalPath], bundle: true, write: false, platform: 'node', format: 'cjs', jsx: 'automatic', external: ['react', 'react/*'], loader: { '.css': 'empty' } });
+const personal = { exports: {} };
+new Function('require', 'module', 'exports', personalBuilt.outputFiles[0].text)(createRequire(import.meta.url), personal, personal.exports);
 
 test('loaded runtime exposes CPU fallback explanation rather than only next-load settings', () => {
   const cpu = { architecture: 'test', weights_quantization: 'Q4', effective_context: 8192, cache_type_k: 'f16', cache_type_v: 'f16', threads: 0, gpu_layers: 0, batch_size: 128, flash_attention: 'off', kv_offload: 'off', notes: ['CPU mode selected automatically: no usable GPU.'] };
@@ -49,8 +53,8 @@ test('default-model select, refresh action and help stay in one accessible field
   assert.match(html, /<\/select><button type="button">Refresh<\/button><\/div>/);
 });
 
-test('every settings section contains explicit field rows, including conditional fields', () => {
-  const source = ts.createSourceFile(sourcePath, readFileSync(sourcePath, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+function fieldSections(path) {
+  const source = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   let sectionCount = 0;
   function visit(node) {
     if (ts.isJsxElement(node) && node.openingElement.attributes.properties.some((attribute) => ts.isJsxAttribute(attribute) && attribute.name.getText(source) === 'className' && attribute.initializer?.text === 'settings-fields')) {
@@ -64,8 +68,20 @@ test('every settings section contains explicit field rows, including conditional
     ts.forEachChild(node, visit);
   }
   visit(source);
-  // Six sections plus Privacy's "Keep a record of model requests" switch.
-  assert.equal(sectionCount, 7);
+  return sectionCount;
+}
+
+test('every settings section contains explicit field rows, including conditional fields', () => {
+  // The dashboard's model server, web search, rules and privacy, plus the manual hardware overrides.
+  assert.equal(fieldSections(sourcePath), 5);
+  // Companion's own: general, chats, memory and context, code and agents, keyboard.
+  assert.equal(fieldSections(personalPath), 5);
+});
+
+test('a person never chooses a permission mode above what the company allows', () => {
+  const html = renderToStaticMarkup(createElement(personal.exports.PersonalSection, { id: 'agents', s: { agent: { permission_mode: 'ask', max_permission_mode: 'accept_edits' } }, set() {} }));
+  assert.match(html, /<option value="accept_edits">/);
+  assert.match(html, /<option value="auto" disabled="">/);
 });
 
 test('hardware overrides are hidden by default and return with preserved values only in manual mode', () => {
@@ -92,14 +108,15 @@ test('runtime details separate requested configuration from measurements and uns
 });
 
 test('inactive preferences are not exposed as editable settings', () => {
-  const source = readFileSync(sourcePath, 'utf8');
-  for (const key of ['allowed_dirs', 'blocked_dirs', 'max_attach_mb', 'max_image_mb', 'output_dir', 'log_redaction', 'telemetry', 'server_port', 'kv_cache_type', 'log_level', 'confirm_outside_copy', 'default_dir', 'command_timeout_secs']) {
+  const source = readFileSync(sourcePath, 'utf8') + readFileSync(personalPath, 'utf8');
+  // Saved but never applied: showing them would promise something the app does not do.
+  for (const key of ['output_dir', 'telemetry', 'server_port', 'kv_cache_type', 'log_level', 'confirm_outside_copy', 'default_dir', 'share_across_modes', 'ocr_enabled']) {
     assert.equal(source.includes(`'${key}'`), false, `${key} must not be editable`);
   }
-  // Automatic compaction is applied by the backend (chat before a reply, the
-  // agent between steps), so its switch and threshold are real settings.
-  assert.match(source, /set\(\['memory', 'auto_compact'\]/);
-  assert.match(source, /set\(\['memory', 'compact_at_pct'\]/);
-  assert.match(source, /Older, inactive preferences remain/);
+  // Applied, and so real settings: compaction (chat before a reply, the agent between steps), and
+  // the rules the dashboard sets (folders, attachments, the command limit, log masking).
+  for (const key of ['auto_compact', 'compact_at_pct', 'allowed_dirs', 'blocked_dirs', 'max_attach_mb', 'command_timeout_secs', 'log_redaction']) {
+    assert.ok(source.includes(`'${key}'`), `${key} has a control`);
+  }
   assert.match(source, /saved custom provider is not implemented/);
 });

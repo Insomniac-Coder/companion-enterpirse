@@ -178,12 +178,6 @@ export function validatedPanelWidth(value: unknown): number {
   return Number.isFinite(width) && width >= 320 ? Math.min(640, width) : 400;
 }
 /** One source for utility navigation and keyboard search. */
-/** The user app's pages beside the conversation. Models, resources and the runtime are the
- *  dashboard's (src/admin/), a separate tool for admins. */
-export const WORKBENCH_DESTINATIONS = [
-  { id: 'tools', label: 'Tools and plugins' },
-  { id: 'settings', label: 'Settings' },
-] as const;
 
 export type MachineActivity = 'idle' | 'generating' | 'agent' | 'waiting';
 

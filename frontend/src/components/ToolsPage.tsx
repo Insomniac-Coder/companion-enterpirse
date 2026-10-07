@@ -12,11 +12,11 @@ function risk(value: string): { tone: 'neutral' | 'warn' | 'err'; label: string 
   return { tone: 'neutral', label: 'Read-only' };
 }
 
+/** The tools and plugins a person can use, in Companion's Settings. */
 export default function ToolsPage({ registry, wsId, notify, onRefresh }: { registry: ToolDescriptor[]; wsId: string; notify: Notify; onRefresh: () => void }) {
   const counts = registry.reduce((acc, tool) => { acc[risk(tool.risk).tone] += 1; return acc; }, { neutral: 0, warn: 0, err: 0 });
   return (
-    <div className="page">
-      <div className="page-inner">
+    <div className="tools-panels">
         <div className="panel">
           <Section
             title="Tool registry"
@@ -41,7 +41,6 @@ export default function ToolsPage({ registry, wsId, notify, onRefresh }: { regis
           </Section>
         </div>
         <PluginsCard wsId={wsId} notify={notify} />
-      </div>
     </div>
   );
 }

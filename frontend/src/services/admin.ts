@@ -180,12 +180,16 @@ export const GRANTABLE_ROLES = [
 
 /** The dashboard's pages, and who sees each: a platform admin all, an auditor the reading ones. */
 export const DASHBOARD_PAGES = [
-  { id: 'people', label: 'People and groups', icon: 'users', auditor: true },
-  { id: 'settings', label: 'Company settings', icon: 'sliders', auditor: true },
-  { id: 'audit', label: 'Audit records', icon: 'list', auditor: true },
-  { id: 'models', label: 'Models', icon: 'layers', auditor: false },
-  { id: 'system', label: 'Runtime and diagnostics', icon: 'gauge', auditor: false },
-  { id: 'resources', label: 'Resources', icon: 'activity', auditor: false },
+  { id: 'people', label: 'People and groups', icon: 'users', auditor: true, group: 'People' },
+  { id: 'defaults', label: 'People’s defaults', icon: 'sliders', auditor: true, group: 'People' },
+  { id: 'rules', label: 'Rules', icon: 'shield', auditor: true, group: 'People' },
+  { id: 'models', label: 'Models', icon: 'layers', auditor: false, group: 'Models' },
+  { id: 'model-server', label: 'Model server', icon: 'cpu', auditor: false, group: 'Models' },
+  { id: 'system', label: 'Runtime and diagnostics', icon: 'gauge', auditor: false, group: 'Models' },
+  { id: 'resources', label: 'Resources', icon: 'activity', auditor: false, group: 'Models' },
+  { id: 'search', label: 'Web search', icon: 'globe', auditor: true, group: 'Service' },
+  { id: 'privacy', label: 'Privacy and logging', icon: 'lock', auditor: true, group: 'Service' },
+  { id: 'audit', label: 'Audit records', icon: 'list', auditor: true, group: 'Service' },
 ] as const;
 
 export type DashboardPage = (typeof DASHBOARD_PAGES)[number]['id'];

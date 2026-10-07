@@ -2,14 +2,14 @@
 // manages people and roles, company and group settings with their locks, models and the model
 // server; an auditor reads people, settings and the audit records. Shares its parts (src/ui,
 // src/services, the settings screen) with the user app.
-import { useCallback, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useState } from 'react';
 import Toasts, { pushToast, type Toast } from '../components/Toasts';
 import Rig from './Rig';
 import ModelsPage from './ModelsPage';
 import RuntimePage from './RuntimePage';
 import ResourcesPanel from './ResourcesPanel';
 import PeoplePage from './PeoplePage';
-import CompanySettingsPage from './CompanySettingsPage';
+import { PeopleDefaultsPage, ServiceSettingsPage } from './SettingsPages';
 import AuditPage from './AuditPage';
 import {
   agentRuns, deleteModel, inferenceStart, inferenceStatus, listDownloads, listModels, loadModel, stopAgent, systemInfo, unloadModels,
@@ -27,7 +27,11 @@ type Confirm = { title: string; body: string; action: string; icon?: IconName; o
 
 const DESCRIPTIONS: Record<DashboardPage, string> = {
   people: 'Who uses Companion, their groups, and the roles that let them run it',
-  settings: 'The company’s values, each group’s, and the settings nobody may change',
+  defaults: 'What people start with in Companion’s Settings, for everyone or a group, and what they may not change',
+  rules: 'What people’s work may touch: folders, internet access, attachments, commands, permission modes',
+  'model-server': 'The model everyone uses: its context, sampling and how the hardware runs it',
+  search: 'Where web searches go',
+  privacy: 'What the server keeps about the work done on it',
   audit: 'Who did what, from where, with which model, and how it was allowed',
   models: 'Load, inspect and add the models everyone uses',
   system: 'The model server, health checks and speed',
@@ -243,11 +247,14 @@ export default function AdminApp({ me }: { me?: Me }) {
           </div>
         </div>
         <nav className="sb-list dashboard-nav" aria-label="Dashboard pages">
-          {pages.map((item) => (
-            <button type="button" key={item.id} className="sb-link" aria-current={page === item.id ? 'page' : undefined} onClick={() => go(item.id)}>
-              <Icon name={item.icon as IconName} size={16} />
-              <span>{item.label}</span>
-            </button>
+          {pages.map((item, index) => (
+            <Fragment key={item.id}>
+              {(index === 0 || pages[index - 1].group !== item.group) && <div className="sb-section">{item.group}</div>}
+              <button type="button" className="sb-link" aria-current={page === item.id ? 'page' : undefined} onClick={() => go(item.id)}>
+                <Icon name={item.icon as IconName} size={16} />
+                <span>{item.label}</span>
+              </button>
+            </Fragment>
           ))}
         </nav>
         <nav className="sb-utility" aria-label="Leave the dashboard">
@@ -295,7 +302,11 @@ export default function AdminApp({ me }: { me?: Me }) {
           </div>
         </header>
         {page === 'people' && <PeoplePage canChange={admin} me={me} notify={notify} />}
-        {page === 'settings' && <CompanySettingsPage canChange={admin} setToasts={setToasts} notify={notify} />}
+        {page === 'defaults' && <PeopleDefaultsPage canChange={admin} signIn={!!me?.sign_in} setToasts={setToasts} notify={notify} />}
+        {page === 'rules' && <ServiceSettingsPage key="rules" section="rules" canChange={admin} signIn={!!me?.sign_in} setToasts={setToasts} notify={notify} />}
+        {page === 'model-server' && admin && <ServiceSettingsPage key="models" section="models" canChange={admin} signIn={!!me?.sign_in} setToasts={setToasts} notify={notify} />}
+        {page === 'search' && <ServiceSettingsPage key="search" section="search" canChange={admin} signIn={!!me?.sign_in} setToasts={setToasts} notify={notify} />}
+        {page === 'privacy' && <ServiceSettingsPage key="privacy" section="privacy" canChange={admin} signIn={!!me?.sign_in} setToasts={setToasts} notify={notify} />}
         {page === 'audit' && <AuditPage notify={notify} />}
         {page === 'models' && admin && (
           <ModelsPage
